@@ -1,0 +1,16 @@
+enabled: true
+name: mlp
+requires_flatten: true
+checkpoint: "runs/train_nids/ciciomt2024/mlp/baseline/20261007_224108_eb383c02/checkpoints/mlp_seed1/nids.pt"
+epochs: 5
+training:
+  epochs: 5
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  adversarial_training: false
+  defense_mode: none
+  pgd_epsilon: 0.04
+  pgd_alpha: null
+  pgd_steps: 10
+  trades_beta: 6.0

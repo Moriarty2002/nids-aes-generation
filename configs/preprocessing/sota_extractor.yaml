@@ -1,0 +1,5 @@
+name: sota_extractor
+params:
+  normalize: true
+input: data/input.pcap
+output: data/processed_features.npz

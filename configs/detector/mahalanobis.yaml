@@ -1,0 +1,7 @@
+enabled: true
+name: mahalanobis
+params:
+  covariance_ridge: 1.0e-5
+  score_batch_size: 1024
+# If null, workflow loads the detector next to model.checkpoint for each seed.
+checkpoint: null

@@ -1,0 +1,7 @@
+name: square
+epsilon: 0.03
+max_queries: 5
+p_init: 0.8
+targeted: false
+target_label: null
+variant: "eps${attack.epsilon}_steps${attack.steps}"

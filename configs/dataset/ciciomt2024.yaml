@@ -1,0 +1,23 @@
+name: ciciomt2024
+params:
+  path: ${hydra:runtime.cwd}/data/ciciomt2024.parquet
+  id_column: Index
+  fields: [PL, IAT, DIR, WIN, FLG, TTL]
+  label_column: LABEL
+  benign_string: benign
+  task_mode: auto
+  # Selected automatically from model.requires_flatten/model.name at runtime.
+  flatten: null
+  max_length: null
+  feat_pad_column: FEAT_PAD
+  include_padding_indicator: false
+  padding_indicator_name: FEAT_PAD_MASK
+  strict_feat_pad: true
+  truncate: true
+  pad_values:
+    PL: 0.0
+    IAT: 0.0
+    DIR: -1.0
+    WIN: -1.0
+    FLG: -1.0
+    TTL: 0.0

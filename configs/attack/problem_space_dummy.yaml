@@ -1,0 +1,4 @@
+name: problem_space_dummy
+byte_delta: 4
+max_packets: null
+variant: "maxpkts${attack.max_injected_packets}"

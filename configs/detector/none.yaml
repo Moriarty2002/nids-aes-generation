@@ -1,0 +1,6 @@
+enabled: false
+name: mahalanobis
+params:
+  covariance_ridge: 1.0e-5
+  score_batch_size: 1024
+checkpoint: null

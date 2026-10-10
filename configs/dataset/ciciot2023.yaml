@@ -1,0 +1,7 @@
+name: ciciot2023
+params:
+  path: data/ciciot2023.csv
+  label_column: label
+  drop_columns: []
+  multiclass: true
+  normalization_path: null

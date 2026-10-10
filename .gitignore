@@ -1,3 +1,11 @@
+# Custom
+.venv/
+runs/
+outputs/
+data/*.npz
+data/*.parquet
+data/*.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

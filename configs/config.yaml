@@ -1,0 +1,35 @@
+defaults:
+  - dataset: ciciomt2024
+  - model: mlp
+  - attack: pgd
+  - preprocessing: sota_extractor
+  - detector: none
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+action: evaluate_attack
+gpu: cpu
+gpu_partitions: [cpu]
+seeds: [1, 2, 3, 4, 5]
+parallel_workers: 5
+
+evaluation:
+  benign_label: 0
+  # In multi-class mode, an evasion is successful only when the target predicts
+  # this label; confusing one attack class with another is not an evasion.
+  strict_multiclass: true
+  c_fp: 1.0
+  c_fn: 10.0
+  strict_constraints: false
+# Dynamic run directory naming
+
+output_dir: >-
+  runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
+
+hydra:
+  output_subdir: null  # Completely disables the creation of the .hydra folder
+  run:
+    dir: .             # Prevents Hydra from creating timestamped directories
+  job:
+    chdir: false       # Keeps relative data paths intact
