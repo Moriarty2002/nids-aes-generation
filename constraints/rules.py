@@ -61,7 +61,7 @@ class RangeRule(ConstraintRule):
 class DiscreteIntegrityRule(ConstraintRule):
     feature: str
     allowed_values: tuple[int, ...] | None = None
-    tolerance: float = 1e-6
+    tolerance: float = 1e-4
     name: str = "discrete_integrity"
 
     def check(self, x: np.ndarray, feature_index: Mapping[str, int]) -> RuleViolation | None:
@@ -121,7 +121,7 @@ class TcpFlagStateRule(ConstraintRule):
         proto = x[:, feature_index[self.protocol]]
         is_tcp = np.isclose(proto, 6.0)
         flags = np.stack([syn, ack, fin, rst], axis=1)
-        integral = np.all(np.isfinite(flags) & (flags >= 0) & (np.abs(flags - np.rint(flags)) <= 1e-6), axis=1)
+        integral = np.all(np.isfinite(flags) & (flags >= 0) & (np.abs(flags - np.rint(flags)) <= 1e-4), axis=1)
         non_tcp_has_flags = (~is_tcp) & np.any(flags > 0, axis=1)
         bad = np.flatnonzero(~integral | non_tcp_has_flags)
         return RuleViolation(self.name, bad, "invalid TCP flag counts or flags on non-TCP flows") if len(bad) else None

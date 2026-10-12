@@ -539,16 +539,15 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
     )
 
     valid_mask = getattr(dataset, "valid_mask", None)
-    if isinstance(attack_model, PyTorchModelWrapper):
-        y_attack: Any = torch.as_tensor(y_np, dtype=torch.long, device=attack_model.device)
-        attack_features: Any = (
-            torch.as_tensor(attack_input, dtype=torch.float32, device=attack_model.device)
-            if not issubclass(attack_cls, ProblemSpaceAttack)
-            else None
-        )
-    else:
-        y_attack = y_np
-        attack_features = np.asarray(attack_input, dtype=np.float32) if not issubclass(attack_cls, ProblemSpaceAttack) else None
+    
+    # Keep features and labels as NumPy arrays on the CPU.
+    # EvaluationEngine will slice them, and the individual Attack strategies will move the slices to the GPU dynamically per-batch.
+    y_attack = y_np
+    attack_features = (
+        np.asarray(attack_input, dtype=np.float32) 
+        if not issubclass(attack_cls, ProblemSpaceAttack) 
+        else None
+    )
 
     output = engine.run(
         x_target,
