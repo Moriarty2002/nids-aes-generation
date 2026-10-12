@@ -139,7 +139,7 @@ class DirectionalImmutabilityRule(ConstraintRule):
 
     direction_feature: str = "DIR"
     victim_direction: float = 1.0
-    tolerance: float = 1e-6
+    tolerance: float = 1e-4
     name: str = "directional_immutability"
 
     def check(

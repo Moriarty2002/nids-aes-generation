@@ -97,6 +97,26 @@ def _batched_predict(
     return np.concatenate(predictions), max(elapsed, np.finfo(np.float64).eps)
 
 
+def _batched_detector_score(
+    detector: BaseDetector,
+    model: ModelWrapper,
+    x: Any,
+    batch_size: int,
+) -> np.ndarray:
+    """Score inputs through the detector in bounded batches to prevent OOM."""
+    n_samples = len(x)
+    scores: list[np.ndarray] = []
+    for start in range(0, n_samples, batch_size):
+        batch_scores = detector.score(
+            _slice_batch(x, start, min(start + batch_size, n_samples)),
+            model
+        )
+        scores.append(np.asarray(batch_scores, dtype=np.float64).reshape(-1))
+    if not scores:
+        return np.empty(0, dtype=np.float64)
+    return np.concatenate(scores)
+
+
 def _violation_counts(gate_result: Any) -> dict[str, float]:
     """Count rejected samples per concrete gatekeeper rule."""
     counter: Counter[str] = Counter()
@@ -203,13 +223,21 @@ class EvaluationEngine:
         query_batches: list[np.ndarray] = []
         first_metadata: dict[str, Any] = {}
         actual_feature_names: tuple[str, ...] = tuple(feature_names)
+        
         for start in range(0, n_samples, self.batch_size):
             stop = min(start + self.batch_size, n_samples)
+            
+            # Prevent deterministic cross-batch noise correlations
+            batch_kwargs = dict(effective_attack_kwargs)
+            if batch_kwargs.get("seed") is not None:
+                batch_kwargs["seed"] = int(batch_kwargs["seed"]) + start
+                
             batch_result = self.attack.generate(
                 _slice_batch(target_input, start, stop),
                 _slice_batch(y, start, stop),
-                **effective_attack_kwargs,
+                **batch_kwargs,
             )
+            
             if not first_metadata:
                 first_metadata = dict(batch_result.metadata)
             if batch_result.success_mask is not None:
@@ -232,7 +260,6 @@ class EvaluationEngine:
                 adversarial_batches.append(
                     self._convert_attack_space_to_target(x_adv_source, actual_feature_names)
                 )
-            # Do not retain the per-batch autograd tensor after conversion.
             del batch_result
 
         x_adv_target = (
@@ -261,12 +288,12 @@ class EvaluationEngine:
         if self.detector is not None:
             if not isinstance(self.target_model, PyTorchModelWrapper):
                 raise TypeError("Configured detectors require a PyTorchModelWrapper target model")
-            detector_clean_scores = np.asarray(
-                self.detector.score(x_target, self.target_model), dtype=np.float64
-            ).reshape(-1)
-            detector_adversarial_scores = np.asarray(
-                self.detector.score(x_adv_target, self.target_model), dtype=np.float64
-            ).reshape(-1)
+            detector_clean_scores = _batched_detector_score(
+                self.detector, self.target_model, x_target, self.batch_size
+            )
+            detector_adversarial_scores = _batched_detector_score(
+                self.detector, self.target_model, x_adv_target, self.batch_size
+            )
             if len(detector_clean_scores) != n_samples or len(detector_adversarial_scores) != n_samples:
                 raise ValueError("Detector must return exactly one score per clean/adversarial sample")
 
