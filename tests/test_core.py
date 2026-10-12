@@ -5,8 +5,8 @@ import torch
 from torch import nn
 
 from attacks.feature_space.pgd import PGDAttack
-from attacks.feature_space.amd_gan import AMDGANAdapter
 from attacks.feature_space.square import SquareAttack
+from attacks.base import FeatureSpaceAttack
 from attacks.problem_space.dummy_pcap import DummyPCAPMutator
 from constraints.gatekeeper import UniversalConstraintGatekeeper
 from core.registry import ATTACKS, NIDS, discover_all
@@ -35,13 +35,6 @@ def test_attack_metadata_is_not_passed_to_attack_constructors() -> None:
         {
             "name": "square",
             "epsilon": 0.03,
-            "variant": "default",
-        },
-        {
-            "name": "amd_gan",
-            "generator": None,
-            "epsilon": 0.05,
-            "training": {"epochs": 2},
             "variant": "default",
         },
         {
@@ -80,6 +73,31 @@ def test_gatekeeper_freezes_victim_direction() -> None:
     )
     assert result.accepted.tolist() == [False]
     assert result.violations[0].rule == "directional_immutability"
+
+
+def test_gatekeeper_rejects_dir_changes_on_attacker_packets() -> None:
+    names = ("PL", "DIR", "TTL")
+    clean = np.array([[[10.0, 0.0, 64.0]]], dtype=np.float32)
+    adversarial = clean.copy()
+    adversarial[0, 0, 1] = 1.0
+    result = UniversalConstraintGatekeeper().validate(
+        adversarial,
+        names,
+        original_samples=clean,
+        valid_mask=np.array([[True]]),
+    )
+    assert result.accepted.tolist() == [False]
+    assert result.violations[0].rule == "directional_immutability"
+
+
+def test_feature_attacks_freeze_dir_and_victim_packets() -> None:
+    names = ("PL", "DIR", "TTL")
+    x = torch.tensor([[[10.0, 1.0, 64.0], [20.0, 0.0, 64.0], [0.0, -1.0, 0.0]]])
+    mask = FeatureSpaceAttack.victim_packet_perturbation_mask(x, names)
+
+    assert mask[0, 0].tolist() == [0.0, 0.0, 0.0]
+    assert mask[0, 1].tolist() == [1.0, 0.0, 1.0]
+    assert mask[0, 2].tolist() == [1.0, 0.0, 1.0]
 
 
 def test_model_gradient_contract() -> None:

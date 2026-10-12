@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
-from attacks.base import BaseAttack, ProblemSpaceAttack
+from attacks.base import BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
 from constraints.gatekeeper import UniversalConstraintGatekeeper
 from core.exceptions import ConfigurationError
 from core.registry import ATTACKS, DATASETS, DETECTORS, NIDS, PREPROCESSORS
@@ -371,7 +371,7 @@ def _instantiate_attack(
     attack_cls = ATTACKS.get(attack_name)
     params = {key: value for key, value in attack_cfg.items() if key not in {"name", "params", "variant", "training"}}
     params.update(dict(attack_cfg.get("params", {})))
-    if attack_name == "pgd":
+    if issubclass(attack_cls, FeatureSpaceAttack):
         params.setdefault("feature_names", feature_names)
 
     if target_label is not None:

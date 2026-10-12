@@ -25,6 +25,7 @@ class SquareAttack(FeatureSpaceAttack):
     p_init: float = 0.8
     targeted: bool = False
     target_label: int | None = None
+    feature_names: tuple[str, ...] = ()
 
     attack_name = "square"
     query_based = True
@@ -43,6 +44,12 @@ class SquareAttack(FeatureSpaceAttack):
         rng = np.random.default_rng(int(kwargs.get("seed", 0)))
         adv = x0.astype(np.float32, copy=True)
         n, d = adv.shape
+        perturbation_mask = self.victim_packet_perturbation_mask(
+            torch.as_tensor(x0),
+            self.feature_names,
+            normalization_mean=kwargs.get("normalization_mean"),
+            normalization_std=kwargs.get("normalization_std"),
+        ).cpu().numpy()
         queries = np.zeros(n, dtype=np.int64)
         base_pred, base_prob = self._scores(adv)
         if self.targeted and self.target_label is None:
@@ -57,7 +64,11 @@ class SquareAttack(FeatureSpaceAttack):
             p = max(1.0 / d, self.p_init * (1.0 - _ / max(self.max_queries, 1)))
             for i in np.flatnonzero(active):
                 width = max(1, int(round(p * d)))
-                cols = rng.choice(d, size=width, replace=False)
+                mutable_cols = np.flatnonzero(perturbation_mask[i])
+                if not len(mutable_cols):
+                    continue
+                width = min(width, len(mutable_cols))
+                cols = rng.choice(mutable_cols, size=width, replace=False)
                 proposal = adv[i].copy()
                 proposal[cols] += rng.choice((-1.0, 1.0), size=width).astype(np.float32) * self.epsilon
                 proposal = np.clip(proposal, x0[i] - self.epsilon, x0[i] + self.epsilon)

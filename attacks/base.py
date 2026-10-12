@@ -75,15 +75,14 @@ class FeatureSpaceAttack(BaseAttack):
         normalization_mean: Sequence[float] | np.ndarray | torch.Tensor | None = None,
         normalization_std: Sequence[float] | np.ndarray | torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return a float mask that freezes every feature of victim packets.
+        """Return a float mask for the features an endpoint attacker may edit.
 
         ``DIR == 1`` identifies victim-to-attacker packets in the physical
         feature schema.  Attack inputs are usually z-score normalized, so the
         direction channel is denormalized before comparison when statistics
-        are supplied.  The returned tensor has the same shape as ``x`` and is
-        zero at victim packet positions, allowing it to be multiplied into
-        both random initialization and every projected update.  Both sequence
-        tensors ``(N, T, F)`` and flattened tensors ``(N, T*F)`` are supported.
+        are supplied.  DIR is always immutable, and every feature is immutable
+        on victim packets. Both sequence tensors ``(N, T, F)`` and flattened
+        tensors ``(N, T*F)`` are supported.
         """
         if x.ndim not in {2, 3}:
             raise ValueError(f"Directional masking requires a 2-D or 3-D tensor, got {tuple(x.shape)}")
@@ -134,10 +133,11 @@ class FeatureSpaceAttack(BaseAttack):
                 )
             direction = direction * direction_std + direction_mean
 
-        victim = torch.isclose(direction, torch.ones_like(direction), atol=1e-5, rtol=0.0)
-        mask = (~victim).unsqueeze(-1).expand(*victim.shape, feature_count).reshape_as(
-            x.reshape(x.shape[0], -1, feature_count)
-        )
+        victim = torch.isclose(direction, torch.ones_like(direction), atol=1e-4, rtol=0.0)
+        mask = (~victim).unsqueeze(-1).expand(*victim.shape, feature_count).clone()
+        # Direction is part of the traffic metadata, not an attacker-controlled
+        # feature, so it must remain unchanged for every packet.
+        mask[..., direction_index] = 0.0
         return mask.reshape_as(x) if reshape_back else mask
 
 

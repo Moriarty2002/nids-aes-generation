@@ -129,7 +129,7 @@ class TcpFlagStateRule(ConstraintRule):
 
 @dataclass(frozen=True)
 class DirectionalImmutabilityRule(ConstraintRule):
-    """Reject adversarial changes to packets sent by the victim endpoint.
+    """Reject DIR changes and edits to packets sent by the victim endpoint.
 
     A non-MitM attacker can generate or modify its own outbound packets, but
     cannot alter the victim's responses while they traverse the network. This
@@ -158,13 +158,19 @@ class DirectionalImmutabilityRule(ConstraintRule):
         # before the immutability check runs.
         direction = original[:, feature_index[self.direction_feature]]
         victim = np.isclose(direction, self.victim_direction, atol=self.tolerance, rtol=0.0)
-        changed = np.any(~np.isclose(x - original, 0.0, atol=self.tolerance, rtol=0.0), axis=1)
-        bad = np.flatnonzero(victim & changed)
+        direction_changed = ~np.isclose(
+            x[:, feature_index[self.direction_feature]] - direction,
+            0.0,
+            atol=self.tolerance,
+            rtol=0.0,
+        )
+        packet_changed = np.any(~np.isclose(x - original, 0.0, atol=self.tolerance, rtol=0.0), axis=1)
+        bad = np.flatnonzero(direction_changed | (victim & packet_changed))
         return (
             RuleViolation(
                 self.name,
                 bad,
-                "all victim-direction packet features must remain unchanged",
+                "DIR must remain unchanged and all victim-direction packet features must remain unchanged",
             )
             if len(bad)
             else None

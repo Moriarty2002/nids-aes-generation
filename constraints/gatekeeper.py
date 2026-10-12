@@ -67,13 +67,15 @@ class UniversalConstraintGatekeeper:
             raise ValueError(f"Constraints require a 2-D or 3-D batch, received shape {x.shape}")
         physical = x
         original_physical = None
+        
         if original_samples is not None:
             original = self._to_numpy(original_samples).astype(np.float32, copy=False)
             if original.shape != x.shape:
                 raise ValueError("original_samples must have the same shape as samples")
             original_physical = original
+            
         if self.normalization_mean is not None or self.normalization_std is not None:
-            if self.normalization_mean is None or self.normalization_std is None:
+            if self.normalization_mean is None or self.normalization_std is None:   
                 raise ValueError("normalization_mean and normalization_std must be configured together")
             expected = x.shape[-1] if x.ndim == 3 else x.shape[1]
             if len(self.normalization_mean) != expected or len(self.normalization_std) != expected:
@@ -83,25 +85,24 @@ class UniversalConstraintGatekeeper:
                 original_physical = (
                     original_physical * self.normalization_std + self.normalization_mean
                 )
+                
         rule_features = physical
         original_rule_features = original_physical
         rule_mask = None if valid_mask is None else self._to_numpy(valid_mask)
-        if (
-            physical.ndim == 2
-            and rule_mask is not None
-            and rule_mask.ndim == 2
-            and len(feature_names) > 0
-            and physical.shape[1] == rule_mask.shape[1] * len(feature_names)
-        ):
-            # Flattened ciciomt2024 samples retain their packet mask.
-            # Reconstruct (N,T,F) only for post-generation constraint checking.
-            sequence_mask = rule_mask.astype(bool, copy=False)
-            rule_features = physical.reshape(sequence_mask.shape[0], sequence_mask.shape[1], len(feature_names))
+        
+        feature_count = len(feature_names)
+        if physical.ndim == 2 and feature_count > 0 and physical.shape[1] > feature_count and physical.shape[1] % feature_count == 0:
+            timesteps = physical.shape[1] // feature_count
+            rule_features = physical.reshape(physical.shape[0], timesteps, feature_count)
             if original_physical is not None:
                 original_rule_features = original_physical.reshape(
-                    sequence_mask.shape[0], sequence_mask.shape[1], len(feature_names)
+                    original_physical.shape[0], timesteps, feature_count
                 )
-            rule_mask = sequence_mask
+            if rule_mask is not None and rule_mask.ndim == 2:
+                rule_mask = rule_mask.astype(bool, copy=False)
+            else:
+                rule_mask = np.ones((physical.shape[0], timesteps), dtype=bool)
+
         accepted, violations = self.rules.evaluate(
             rule_features,
             feature_names,
