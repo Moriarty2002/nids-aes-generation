@@ -535,6 +535,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         strict_constraints=strict_constraints,
         strict_multiclass=strict_multiclass,
         detector=detector,
+        batch_size=int(evaluation_cfg.get("batch_size", 256)),
     )
 
     valid_mask = getattr(dataset, "valid_mask", None)

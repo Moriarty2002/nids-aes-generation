@@ -1,6 +1,7 @@
 from .gatekeeper import GatekeeperResult, UniversalConstraintGatekeeper
 from .rules import (
     ConstraintRule,
+    DirectionalImmutabilityRule,
     DiscreteIntegrityRule,
     FlowDurationRule,
     NonNegativeRule,
@@ -15,6 +16,7 @@ __all__ = [
     "UniversalConstraintGatekeeper",
     "GatekeeperResult",
     "ConstraintRule",
+    "DirectionalImmutabilityRule",
     "RuleSet",
     "NonNegativeRule",
     "RangeRule",

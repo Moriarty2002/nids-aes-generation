@@ -128,6 +128,50 @@ class TcpFlagStateRule(ConstraintRule):
 
 
 @dataclass(frozen=True)
+class DirectionalImmutabilityRule(ConstraintRule):
+    """Reject adversarial changes to packets sent by the victim endpoint.
+
+    A non-MitM attacker can generate or modify its own outbound packets, but
+    cannot alter the victim's responses while they traverse the network. This
+    differential rule compares adversarial and clean feature rows and marks a
+    sample invalid when any feature changes on a physical ``DIR == 1`` row.
+    """
+
+    direction_feature: str = "DIR"
+    victim_direction: float = 1.0
+    tolerance: float = 1e-6
+    name: str = "directional_immutability"
+
+    def check(
+        self,
+        x: np.ndarray,
+        feature_index: Mapping[str, int],
+        *,
+        original: np.ndarray | None = None,
+    ) -> RuleViolation | None:
+        if original is None or self.direction_feature not in feature_index:
+            return None
+        if original.shape != x.shape:
+            raise ValueError("Directional immutability requires matching clean and adversarial shapes")
+        # Use the clean direction label to establish packet ownership. Using
+        # the adversarial DIR value would let an attack relabel a victim row
+        # before the immutability check runs.
+        direction = original[:, feature_index[self.direction_feature]]
+        victim = np.isclose(direction, self.victim_direction, atol=self.tolerance, rtol=0.0)
+        changed = np.any(~np.isclose(x - original, 0.0, atol=self.tolerance, rtol=0.0), axis=1)
+        bad = np.flatnonzero(victim & changed)
+        return (
+            RuleViolation(
+                self.name,
+                bad,
+                "all victim-direction packet features must remain unchanged",
+            )
+            if len(bad)
+            else None
+        )
+
+
+@dataclass(frozen=True)
 class RuleSet:
     rules: tuple[ConstraintRule, ...]
 
@@ -151,6 +195,7 @@ class RuleSet:
                 DiscreteIntegrityRule("DIR", (-1, 0, 1)),
                 RangeRule("WIN", -1, 65535),
                 DiscreteIntegrityRule("FLG", tuple([-1] + list(range(0, 256)))),
+                DirectionalImmutabilityRule(),
             )
         )
 
@@ -160,6 +205,7 @@ class RuleSet:
         feature_names: Sequence[str],
         *,
         valid_mask: np.ndarray | None = None,
+        original: np.ndarray | None = None,
     ) -> tuple[np.ndarray, list[RuleViolation]]:
         """Evaluate all rules and map packet-level failures to sample indices.
 
@@ -168,6 +214,7 @@ class RuleSet:
         """
         if x.ndim == 2:
             flat = x
+            original_flat = None if original is None else original
             sample_index = np.arange(len(x), dtype=np.int64)
             valid_flat = np.ones(len(x), dtype=bool)
         elif x.ndim == 3:
@@ -175,6 +222,12 @@ class RuleSet:
             if len(feature_names) != f:
                 raise ValueError(f"Expected {f} feature names for sequence data, got {len(feature_names)}")
             flat = x.reshape(n * t, f)
+            if original is not None:
+                if original.shape != x.shape:
+                    raise ValueError("Original and adversarial sequence shapes must match")
+                original_flat = original.reshape(n * t, f)
+            else:
+                original_flat = None
             sample_index = np.repeat(np.arange(n, dtype=np.int64), t)
             if valid_mask is None:
                 valid_flat = np.ones(n * t, dtype=bool)
@@ -190,7 +243,10 @@ class RuleSet:
         invalid_samples = np.zeros(len(x), dtype=bool)
         violations: list[RuleViolation] = []
         for rule in self.rules:
-            checked = rule.check(flat, mapping)
+            if isinstance(rule, DirectionalImmutabilityRule):
+                checked = rule.check(flat, mapping, original=original_flat)
+            else:
+                checked = rule.check(flat, mapping)
             if checked is None:
                 continue
             checked_positions = checked.indices[valid_flat[checked.indices]]

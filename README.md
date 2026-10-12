@@ -431,6 +431,8 @@ python main.py \
 Evaluates a trained model against an evasion attack. 
 * To evaluate a **NIDS**, simply point `model.checkpoint` to the `nids.pt` generated during a TRADES/PGD training run. 
 * If multi-class Attack Classification (AC) is detected, the attack automatically executes targeted optimization toward the Benign class.
+  
+(`evaluation.batch_size` bounds PGD autograd, target inference, and post-generation constraint validation memory. Reduce it for large sequence datasets or constrained CPU/RAM environments; it does not change sample ordering or the reported metrics.)
 
 #### Evaluating Evasion & Enabling the Detector
 To test the attack and simultaneously evaluate the inference-time detector's ability to flag the adversarial traffic, enable the detector during the `evaluate_attack` action. The framework will automatically locate and load the `detector.pt` state saved next to the target NIDS checkpoint.
@@ -445,10 +447,12 @@ python main.py \
   model=mlp \
   model.checkpoint="runs/train_nids/<dataset>/<model>/baseline/<TIMESTAMP>/checkpoints/mlp_seed{seed}/nids.pt" \
   dataset=ciciot2023 \
+  evaluation.batch_size=256 \
   detector.enabled=true \
   detector.name=mahalanobis \
   seeds=[1,2,3,4,5]
 ```
+
 * **Output Artifacts (in `runs/evaluate_attack/...`):**
   * `summary.json` & `seed_metrics.csv`: Tabular raw metrics and statistical aggregates, including `detection_auroc` (which scores the detector's ability to mathematically separate clean baseline traffic from adversarial traffic).
   * `reports/cm_seed_<seed>_adversarial.pdf`: Global normalized confusion matrix covering all evaluated traffic.
@@ -563,7 +567,7 @@ This framework builds upon the foundational research and open-source implementat
   * **Original Repository:** [https://github.com/pokaxpoka/deep_Mahalanobis_detector](https://github.com/pokaxpoka/deep_Mahalanobis_detector)
   * *Adapted for the reactive inference-time `MahalanobisDetector` plugin to evaluate detection AUROC on NIDS penultimate features.*
 
-* **Recommended lecture:**
+* **Recommended reading:**
   * **Paper:** Adversarial Robustness of Deep Learning-Based Intrusion Detection Systems: A Systematic Literature Review of Attacks, Defenses, Datasets, and Open Challenges - Winanto et al., IEEE Access 2026
   * **Original Repository:** [https://github.com/pokaxpoka/deep_Mahalanobis_detector](https://github.com/pokaxpoka/deep_Mahalanobis_detector)
   * *Adapted for the reactive inference-time `MahalanobisDetector` plugin to evaluate detection AUROC on NIDS penultimate features.*

@@ -47,7 +47,12 @@ class PGDAttack(FeatureSpaceAttack):
         if self.target_label is not None:
             self.targeted = True
 
-    def _projection(self, x0: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    def _projection(
+        self,
+        x0: torch.Tensor,
+        delta: torch.Tensor,
+        perturbation_mask: torch.Tensor,
+    ) -> torch.Tensor:
         delta = delta.clamp(-self.epsilon, self.epsilon)
 
         if self.clip_min is not None or self.clip_max is not None:
@@ -63,15 +68,19 @@ class PGDAttack(FeatureSpaceAttack):
             delta = torch.clamp(x0 + delta, min=lower_value, max=upper_value) - x0
 
         if self.feature_names and self.immutable_features:
-            mutable = torch.ones(x0.shape[-1], dtype=torch.bool, device=x0.device)
+            feature_count = len(self.feature_names)
+            if x0.ndim == 3 and x0.shape[-1] != feature_count:
+                raise ValueError("x0 feature width does not match feature_names")
+            if x0.ndim == 2 and x0.shape[-1] % feature_count:
+                raise ValueError("flattened x0 width is not divisible by feature_names")
+            mutable = torch.ones(feature_count, dtype=x0.dtype, device=x0.device)
             for name in self.immutable_features:
                 if name in self.feature_names:
-                    mutable[self.feature_names.index(name)] = False
-            # Broadcasting across sequence dimensions keeps immutable feature
-            # channels fixed for both flat and (N,T,F) tensors.
-            delta = delta * mutable
+                    mutable[self.feature_names.index(name)] = 0.0
+            channel_mask = mutable.expand(x0.reshape(x0.shape[0], -1, feature_count).shape)
+            delta = delta * channel_mask.reshape_as(delta)
 
-        return delta
+        return delta * perturbation_mask
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Generate bounded adversarial features using projected gradients."""
@@ -102,6 +111,14 @@ class PGDAttack(FeatureSpaceAttack):
         if effective_targeted and effective_target_label is None:
             raise ValueError("target_label is required for targeted PGD")
         target_label = int(effective_target_label) if effective_target_label is not None else None
+        normalization_mean = kwargs.get("normalization_mean")
+        normalization_std = kwargs.get("normalization_std")
+        perturbation_mask = self.victim_packet_perturbation_mask(
+            x0,
+            self.feature_names,
+            normalization_mean=normalization_mean,
+            normalization_std=normalization_std,
+        )
 
         if effective_targeted:
             assert target_label is not None
@@ -129,7 +146,7 @@ class PGDAttack(FeatureSpaceAttack):
 
         delta = torch.empty_like(x0)
         delta.uniform_(-self.epsilon, self.epsilon, generator=generator)
-        delta = self._projection(x0, delta).detach()
+        delta = self._projection(x0, delta, perturbation_mask).detach()
 
         # Deliberately no gatekeeper, rule projection, or protocol validation is
         # called here. PGD is a pure differentiable optimizer; realizability is
@@ -149,7 +166,7 @@ class PGDAttack(FeatureSpaceAttack):
             with torch.no_grad():
                 direction = -1.0 if effective_targeted else 1.0
                 delta.add_(direction * self.alpha * grad.sign())
-                delta.copy_(self._projection(x0, delta))
+                delta.copy_(self._projection(x0, delta, perturbation_mask))
             delta = delta.detach()
 
         adv = x0 + delta

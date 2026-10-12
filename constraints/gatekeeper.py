@@ -36,8 +36,8 @@ class UniversalConstraintGatekeeper:
     ) -> None:
         self.rules = rules or RuleSet.default()
         self.strict = bool(strict)
-        self.normalization_mean = None if normalization_mean is None else np.asarray(normalization_mean, dtype=np.float64)
-        self.normalization_std = None if normalization_std is None else np.asarray(normalization_std, dtype=np.float64)
+        self.normalization_mean = None if normalization_mean is None else np.asarray(normalization_mean, dtype=np.float32)
+        self.normalization_std = None if normalization_std is None else np.asarray(normalization_std, dtype=np.float32)
 
     @staticmethod
     def _to_numpy(value: Any) -> np.ndarray:
@@ -51,12 +51,27 @@ class UniversalConstraintGatekeeper:
         feature_names: Sequence[str],
         *,
         valid_mask: np.ndarray | torch.Tensor | None = None,
+        original_samples: np.ndarray | torch.Tensor | None = None,
     ) -> GatekeeperResult:
-        """Validate generated samples after converting them to physical units."""
-        x = self._to_numpy(samples).astype(np.float64, copy=False)
+        """Validate generated samples after converting them to physical units.
+
+        ``original_samples`` is the clean baseline in the same feature space.
+        It enables differential threat-model rules, notably the rule that
+        victim response packets must be byte-for-byte immutable for a
+        non-Man-in-the-Middle attacker.
+        """
+        # Keep validation at float32; the rules use tolerances and do not need
+        # a second full-size float64 copy of the adversarial batch.
+        x = self._to_numpy(samples).astype(np.float32, copy=False)
         if x.ndim not in {2, 3}:
             raise ValueError(f"Constraints require a 2-D or 3-D batch, received shape {x.shape}")
         physical = x
+        original_physical = None
+        if original_samples is not None:
+            original = self._to_numpy(original_samples).astype(np.float32, copy=False)
+            if original.shape != x.shape:
+                raise ValueError("original_samples must have the same shape as samples")
+            original_physical = original
         if self.normalization_mean is not None or self.normalization_std is not None:
             if self.normalization_mean is None or self.normalization_std is None:
                 raise ValueError("normalization_mean and normalization_std must be configured together")
@@ -64,7 +79,12 @@ class UniversalConstraintGatekeeper:
             if len(self.normalization_mean) != expected or len(self.normalization_std) != expected:
                 raise ValueError("Normalization statistics do not match sample dimensionality")
             physical = x * self.normalization_std + self.normalization_mean
+            if original_physical is not None:
+                original_physical = (
+                    original_physical * self.normalization_std + self.normalization_mean
+                )
         rule_features = physical
+        original_rule_features = original_physical
         rule_mask = None if valid_mask is None else self._to_numpy(valid_mask)
         if (
             physical.ndim == 2
@@ -77,8 +97,17 @@ class UniversalConstraintGatekeeper:
             # Reconstruct (N,T,F) only for post-generation constraint checking.
             sequence_mask = rule_mask.astype(bool, copy=False)
             rule_features = physical.reshape(sequence_mask.shape[0], sequence_mask.shape[1], len(feature_names))
+            if original_physical is not None:
+                original_rule_features = original_physical.reshape(
+                    sequence_mask.shape[0], sequence_mask.shape[1], len(feature_names)
+                )
             rule_mask = sequence_mask
-        accepted, violations = self.rules.evaluate(rule_features, feature_names, valid_mask=rule_mask)
+        accepted, violations = self.rules.evaluate(
+            rule_features,
+            feature_names,
+            valid_mask=rule_mask,
+            original=original_rule_features,
+        )
         rate = float(accepted.mean()) if len(accepted) else 1.0
         return GatekeeperResult(
             accepted=accepted,

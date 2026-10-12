@@ -13,6 +13,7 @@ from core.registry import ATTACKS, NIDS, discover_all
 from evaluator.metrics import attack_success_rate, attack_success_mask, classification_metrics
 from models.wrapper import PyTorchModelWrapper, SklearnModelWrapper
 from workflow import _instantiate_attack
+from evaluator.engine import EvaluationEngine
 
 
 def test_discovery_registers_components() -> None:
@@ -63,6 +64,22 @@ def test_gatekeeper_rejects_invalid_flow() -> None:
     result = UniversalConstraintGatekeeper().validate(x, names)
     assert result.accepted.tolist() == [True, False]
     assert result.realizability_rate == 0.5
+
+
+def test_gatekeeper_freezes_victim_direction() -> None:
+    names = ("PL", "DIR", "TTL")
+    clean = np.array([[[10.0, 1.0, 64.0], [20.0, 0.0, 64.0]]], dtype=np.float32)
+    adversarial = clean.copy()
+    adversarial[0, 0, 0] += 5.0
+    adversarial[0, 1, 0] += 5.0
+    result = UniversalConstraintGatekeeper().validate(
+        adversarial,
+        names,
+        original_samples=clean,
+        valid_mask=np.array([[True, True]]),
+    )
+    assert result.accepted.tolist() == [False]
+    assert result.violations[0].rule == "directional_immutability"
 
 
 def test_model_gradient_contract() -> None:

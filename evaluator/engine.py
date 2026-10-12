@@ -67,6 +67,36 @@ def _timed_predict(model: ModelWrapper, x: Any) -> tuple[np.ndarray, float]:
     return predictions, max(elapsed, np.finfo(np.float64).eps)
 
 
+def _slice_batch(value: Any, start: int, stop: int) -> Any:
+    """Slice array-like batch inputs without changing their container type."""
+    if isinstance(value, (np.ndarray, torch.Tensor)):
+        return value[start:stop]
+    if isinstance(value, (list, tuple)):
+        return value[start:stop]
+    raise TypeError(f"Cannot batch value of type {type(value).__name__}")
+
+
+def _batched_predict(
+    model: ModelWrapper,
+    x: Any,
+    batch_size: int,
+) -> tuple[np.ndarray, float]:
+    """Predict in bounded batches and return predictions in input order."""
+    n_samples = len(x)
+    predictions: list[np.ndarray] = []
+    elapsed = 0.0
+    for start in range(0, n_samples, batch_size):
+        batch_predictions, batch_elapsed = _timed_predict(
+            model,
+            _slice_batch(x, start, min(start + batch_size, n_samples)),
+        )
+        predictions.append(batch_predictions)
+        elapsed += batch_elapsed
+    if not predictions:
+        return np.empty(0, dtype=np.int64), np.finfo(np.float64).eps
+    return np.concatenate(predictions), max(elapsed, np.finfo(np.float64).eps)
+
+
 def _violation_counts(gate_result: Any) -> dict[str, float]:
     """Count rejected samples per concrete gatekeeper rule."""
     counter: Counter[str] = Counter()
@@ -108,6 +138,7 @@ class EvaluationEngine:
         strict_constraints: bool | None = None,
         strict_multiclass: bool = True,
         detector: BaseDetector | None = None,
+        batch_size: int = 256,
     ) -> None:
         self.target_model = target_model
         self.attack_model = attack_model or target_model
@@ -124,6 +155,9 @@ class EvaluationEngine:
         self.strict_constraints = gatekeeper.strict if strict_constraints is None else bool(strict_constraints)
         self.strict_multiclass = bool(strict_multiclass)
         self.detector = detector
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.batch_size = int(batch_size)
 
     def run(
         self,
@@ -140,8 +174,10 @@ class EvaluationEngine:
         y_np = _as_numpy(y).astype(np.int64, copy=False)
         x_target = x
 
-        # Baseline target-model inference is the primary operational-speed metric.
-        baseline_pred, baseline_elapsed = _timed_predict(self.target_model, x_target)
+        # Keep model inference and attack autograd bounded for large datasets.
+        baseline_pred, baseline_elapsed = _batched_predict(
+            self.target_model, x_target, self.batch_size
+        )
         if len(baseline_pred) != len(y_np):
             raise ValueError("Target baseline predictions and labels have different lengths")
 
@@ -157,20 +193,62 @@ class EvaluationEngine:
             target_input = x if attack_input is None else attack_input
 
         # Crucially, the gatekeeper is not available to the attack at any point.
-        attack_result = self.attack.generate(target_input, y, **dict(attack_kwargs or {}))
+        effective_attack_kwargs = dict(attack_kwargs or {})
+        if self.attack_normalization is not None and not isinstance(self.attack, ProblemSpaceAttack):
+            effective_attack_kwargs.setdefault("normalization_mean", self.attack_normalization.mean)
+            effective_attack_kwargs.setdefault("normalization_std", self.attack_normalization.std)
 
-        if attack_result.raw_adversarial is not None:
-            if self.preprocessor is None:
-                raise RuntimeError("Problem-space evaluation requires a preprocessor")
-            processed = self.preprocessor.transform(attack_result.raw_adversarial)
-            x_adv_target = np.asarray(processed.features, dtype=np.float32)
-            actual_feature_names = tuple(processed.feature_names)
-        else:
-            if attack_result.adversarial is None:
-                raise RuntimeError("Feature-space attack returned neither adversarial nor raw_adversarial data")
-            x_adv_source = _as_numpy(attack_result.adversarial).astype(np.float32, copy=False)
-            actual_feature_names = tuple(attack_result.feature_names or feature_names)
-            x_adv_target = self._convert_attack_space_to_target(x_adv_source, actual_feature_names)
+        adversarial_batches: list[np.ndarray] = []
+        success_batches: list[np.ndarray] = []
+        query_batches: list[np.ndarray] = []
+        first_metadata: dict[str, Any] = {}
+        actual_feature_names: tuple[str, ...] = tuple(feature_names)
+        for start in range(0, n_samples, self.batch_size):
+            stop = min(start + self.batch_size, n_samples)
+            batch_result = self.attack.generate(
+                _slice_batch(target_input, start, stop),
+                _slice_batch(y, start, stop),
+                **effective_attack_kwargs,
+            )
+            if not first_metadata:
+                first_metadata = dict(batch_result.metadata)
+            if batch_result.success_mask is not None:
+                success_batches.append(_as_numpy(batch_result.success_mask))
+            if batch_result.queries is not None:
+                query_batches.append(np.asarray(batch_result.queries))
+            if batch_result.raw_adversarial is not None:
+                if self.preprocessor is None:
+                    raise RuntimeError("Problem-space evaluation requires a preprocessor")
+                processed = self.preprocessor.transform(batch_result.raw_adversarial)
+                adversarial_batches.append(np.asarray(processed.features, dtype=np.float32))
+                actual_feature_names = tuple(processed.feature_names)
+            else:
+                if batch_result.adversarial is None:
+                    raise RuntimeError(
+                        "Feature-space attack returned neither adversarial nor raw_adversarial data"
+                    )
+                x_adv_source = _as_numpy(batch_result.adversarial).astype(np.float32, copy=False)
+                actual_feature_names = tuple(batch_result.feature_names or feature_names)
+                adversarial_batches.append(
+                    self._convert_attack_space_to_target(x_adv_source, actual_feature_names)
+                )
+            # Do not retain the per-batch autograd tensor after conversion.
+            del batch_result
+
+        x_adv_target = (
+            np.concatenate(adversarial_batches, axis=0)
+            if adversarial_batches
+            else np.empty_like(_as_numpy(x_target), dtype=np.float32)
+        )
+        if not adversarial_batches:
+            raise ValueError("Evaluation requires at least one sample")
+        attack_result = AttackResult(
+            adversarial=x_adv_target,
+            success_mask=np.concatenate(success_batches) if success_batches else None,
+            queries=np.concatenate(query_batches) if query_batches else None,
+            feature_names=actual_feature_names,
+            metadata=first_metadata,
+        )
 
         if len(x_adv_target) != n_samples:
             raise ValueError(f"Attack produced {len(x_adv_target)} samples for a batch of {n_samples} labels")
@@ -194,15 +272,22 @@ class EvaluationEngine:
 
         # Strict architectural boundary: this is the first and only gatekeeper
         # call, so attacks cannot optimize against post-generation rules.
-        gate = self.gatekeeper.validate(x_adv_target, actual_feature_names, valid_mask=valid_mask)
+        gate = self.gatekeeper.validate(
+            x_adv_target,
+            actual_feature_names,
+            valid_mask=valid_mask,
+            original_samples=x_target,
+        )
         accepted = np.asarray(gate.accepted, dtype=bool)
         score_mask = accepted.copy() if self.strict_constraints else np.ones(n_samples, dtype=bool)
 
         adversarial_pred_full = np.full(n_samples, -1, dtype=np.int64)
         if np.any(score_mask):
-            adversarial_pred_full[score_mask] = np.asarray(
-                self.target_model.predict(x_adv_target[score_mask]), dtype=np.int64
-            )
+            adversarial_pred_full[score_mask] = _batched_predict(
+                self.target_model,
+                x_adv_target[score_mask],
+                self.batch_size,
+            )[0]
 
         y_score = y_np[score_mask]
         base_score = baseline_pred[score_mask]

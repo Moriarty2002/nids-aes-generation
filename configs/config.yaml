@@ -15,6 +15,8 @@ seeds: [1, 2, 3, 4, 5]
 parallel_workers: 5
 
 evaluation:
+  # Bounds PGD, inference, and post-generation validation memory.
+  batch_size: 256
   benign_label: 0
   # In multi-class mode, an evasion is successful only when the target predicts
   # this label; confusing one attack class with another is not an evasion.
