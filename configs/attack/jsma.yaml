@@ -1,0 +1,16 @@
+name: jsma
+# Independent NIDS-oriented Jacobian-based Saliency Map Attack adaptation.
+# The workflow injects evaluation.benign_label (normally 0) when evaluating.
+targeted: true
+target_label: null
+theta: 0.1
+max_perturbed_features: null
+max_perturbation_ratio: 0.1
+max_iterations: null
+jacobian_batch_size: 4
+direction: auto
+clip_min: null
+clip_max: null
+immutable_features: []
+saliency_epsilon: 1.0e-12
+variant: "theta${attack.theta}_l0${attack.max_perturbation_ratio}"

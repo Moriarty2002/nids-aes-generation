@@ -1,0 +1,15 @@
+name: cw
+# C&W is targeted by default in this case, the workflow injects Benign (0).
+targeted: true
+target_label: null
+confidence: 0.0
+learning_rate: 0.01
+max_steps: 2
+binary_search_steps: 2
+initial_const: 0.01
+abort_early: true
+abort_check_every: 3
+clip_min: null
+clip_max: null
+immutable_features: []
+variant: "steps${attack.max_steps}_bs${attack.binary_search_steps}_c${attack.initial_const}"

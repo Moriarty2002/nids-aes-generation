@@ -21,11 +21,7 @@ class RegisteredComponent(Generic[T]):
 
 
 class ComponentRegistry(Generic[T]):
-    """Thread-safe plugin registry used by Hydra configuration names.
-
-    Import-time decorators populate the registry; discovery is therefore
-    performed explicitly in both the parent and spawned workers before lookup.
-    """
+    """Thread-safe named registry with duplicate protection and discovery support."""
 
     def __init__(self, category: str) -> None:
         self.category = category
@@ -33,7 +29,6 @@ class ComponentRegistry(Generic[T]):
         self._items: dict[str, RegisteredComponent[T]] = {}
 
     def register(self, name: str, component: T) -> T:
-        """Register a component while rejecting conflicting duplicate names."""
         normalized = name.strip().lower().replace("-", "_")
         if not normalized:
             raise RegistryError(f"Cannot register empty {self.category} name")
@@ -42,13 +37,26 @@ class ComponentRegistry(Generic[T]):
         record = RegisteredComponent(normalized, component, module, qualname)
         with self._lock:
             previous = self._items.get(normalized)
-            if previous is not None and previous.component is not component:
+            if previous is not None and previous.component is not component:            
+                # Check if the previous component is the same as the current one, even if they are imported from different modules.
+                same_imported_plugin = (
+                    self.canonical_module(previous.module) == self.canonical_module(module)
+                    and previous.qualname == qualname
+                )
+                # If the previous component is the same as the current one, return the existing component instead of raising an error.
+                if same_imported_plugin:
+                    return component
                 raise DuplicateRegistrationError(
                     f"{self.category!r} name {normalized!r} is already registered by "
                     f"{previous.module}.{previous.qualname}"
                 )
             self._items[normalized] = record
         return component
+
+    def canonical_module(self, module_name: str) -> str:
+        """Return the canonical module name for a given module name."""
+        prefix = ""
+        return module_name[len(prefix):] if module_name.startswith(prefix) else module_name
 
     def decorator(self, name: str | None = None) -> Callable[[T], T]:
         def _decorator(component: T) -> T:
@@ -60,7 +68,6 @@ class ComponentRegistry(Generic[T]):
         return _decorator
 
     def get(self, name: str) -> T:
-        """Resolve a configured name and report available alternatives on failure."""
         normalized = name.strip().lower().replace("-", "_")
         with self._lock:
             record = self._items.get(normalized)
@@ -119,7 +126,7 @@ def _iter_submodules(package: ModuleType) -> Iterable[str]:
 
 
 def discover_modules(package_names: Iterable[str]) -> tuple[str, ...]:
-    """Import plugin packages so their decorators can populate registries."""
+    """Import packages and all descendants; decorators register components at import time."""
     imported: list[str] = []
     for package_name in package_names:
         package = importlib.import_module(package_name)

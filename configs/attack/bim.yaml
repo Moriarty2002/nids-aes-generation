@@ -1,0 +1,10 @@
+name: bim
+epsilon: 0.01
+alpha: 0.002
+steps: 10
+targeted: false
+target_label: null
+clip_min: null
+clip_max: null
+immutable_features: []
+variant: "eps${attack.epsilon}_alpha${attack.alpha}_steps${attack.steps}"

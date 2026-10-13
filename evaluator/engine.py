@@ -286,7 +286,16 @@ class EvaluationEngine:
         detector_clean_scores: np.ndarray | None = None
         detector_adversarial_scores: np.ndarray | None = None
         if self.detector is not None:
-            if not isinstance(self.target_model, PyTorchModelWrapper):
+            # Structural wrapper check also supports an installation that has
+            # imported the same module both as ``models.wrapper`` and ``models.wrapper``.
+            capabilities = getattr(self.target_model, "capabilities", None)
+            is_pytorch_wrapper = (
+                getattr(capabilities, "model_family", None) == "pytorch"
+                and hasattr(self.target_model, "model")
+                and hasattr(self.target_model, "device")
+                and callable(getattr(self.target_model, "extract_features", None))
+            )
+            if not is_pytorch_wrapper:
                 raise TypeError("Configured detectors require a PyTorchModelWrapper target model")
             detector_clean_scores = _batched_detector_score(
                 self.detector, self.target_model, x_target, self.batch_size

@@ -24,8 +24,16 @@ evaluation:
   c_fp: 1.0
   c_fn: 10.0
   strict_constraints: false
-# Dynamic run directory naming
 
+surrogate_model:
+  # The surrogate model is used to generate adversarial examples for the target model.
+  # It is not used for evaluation, and it is not required to be a good model.
+  enabled: false
+  name: mlp
+  pretrained: true
+  checkpoint: null
+
+# Dynamic run directory naming
 output_dir: >-
   runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
 
