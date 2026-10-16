@@ -1,16 +1,11 @@
-enabled: true
+defaults:
+  - training: default
+
 name: mlp
 requires_flatten: true
 checkpoint: null
-epochs: 5
 training:
   epochs: 5
-  batch_size: 256
-  lr: 0.001
-  weight_decay: 0.0001
-  adversarial_training: false
-  defense_mode: none
-  pgd_epsilon: 0.04
   pgd_alpha: null
+  pgd_epsilon: 0.04
   pgd_steps: 10
-  trades_beta: 6.0
