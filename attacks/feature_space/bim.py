@@ -117,7 +117,9 @@ class BIMAttack(FeatureSpaceAttack):
                         validate_target_label(logits, target_label)
                     loss = classification_loss(logits, objective_labels)
                     objective = -loss if targeted else loss
-                    gradient = torch.autograd.grad(objective, delta, only_inputs=True)[0]
+                    gradient = torch.autograd.grad(
+                        objective, delta, only_inputs=True, retain_graph=False, create_graph=False
+                    )[0].detach()
 
                     with torch.no_grad():
                         delta = delta + float(self.alpha) * gradient.sign()
@@ -133,12 +135,20 @@ class BIMAttack(FeatureSpaceAttack):
                             clip_max=self.clip_max,
                             feature_names=self.feature_names,
                         )
+                    logits = logits.detach()
+                    loss = loss.detach()
+                    objective = objective.detach()
+                    del logits, loss, objective, gradient
+                    delta = delta.detach()
 
                 with torch.no_grad():
                     adversarial = (x0 + delta.detach()).detach()
                     adv_logits = model_module(adversarial)
                     predictions = predicted_labels(adv_logits)
                     success = predictions.eq(objective_labels) if targeted else predictions.ne(labels)
+                    adv_logits = adv_logits.detach()
+                    predictions = predictions.detach()
+                    del adv_logits, predictions
         finally:
             for module, was_training in module_modes:
                 module.training = was_training

@@ -225,8 +225,19 @@ class CWL2Attack(FeatureSpaceAttack):
                         if self.abort_early and (step + 1) % self.abort_check_every == 0:
                             current_loss = float(objective.detach().cpu())
                             if current_loss > previous_loss * 0.9999:
+                                logits = logits.detach()
+                                objective = objective.detach()
+                                del logits, scores, margin, per_sample_l2_sq, per_sample_objective
                                 break
                             previous_loss = current_loss
+                        logits = logits.detach()
+                        scores = scores.detach()
+                        margin = margin.detach()
+                        per_sample_l2_sq = per_sample_l2_sq.detach()
+                        per_sample_objective = per_sample_objective.detach()
+                        objective = objective.detach()
+                        gradient = gradient.detach()
+                        del logits, scores, margin, per_sample_l2_sq, per_sample_objective, objective, gradient
 
                     # Evaluate the post-optimizer state too, so the final Adam update
                     # in each binary-search round is not silently skipped.
@@ -247,6 +258,9 @@ class CWL2Attack(FeatureSpaceAttack):
                             best_l2_sq[improved] = final_l2_sq[improved]
                             best_adversarial[improved] = final_adversarial[improved]
                         fallback_adversarial = final_adversarial.detach()
+                        final_logits = final_logits.detach()
+                        final_predictions = final_predictions.detach()
+                        del final_logits, final_predictions, final_delta, final_l2_sq
 
                     if search_step + 1 < self.binary_search_steps:
                         upper_const = torch.where(round_success, torch.minimum(upper_const, constants), upper_const)
@@ -273,6 +287,9 @@ class CWL2Attack(FeatureSpaceAttack):
                     )
                     final_delta = adversarial - x0
                     final_l2 = final_delta.reshape(batch_size, -1).norm(p=2, dim=1)
+                    final_logits = final_logits.detach()
+                    final_predictions = final_predictions.detach()
+                    del final_logits, final_predictions, final_delta
         finally:
             restore_saved_modes(saved_modes)
 

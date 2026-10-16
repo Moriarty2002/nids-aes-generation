@@ -5,6 +5,7 @@ defaults:
   - preprocessing: sota_extractor
   - detector: none
   - _self_
+  - optional surrogate_model: null
   - override hydra/job_logging: disabled
   - override hydra/hydra_logging: disabled
 
@@ -14,9 +15,26 @@ gpu_partitions: [cpu]
 seeds: [1, 2, 3, 4, 5]
 parallel_workers: 5
 
+attack:
+  params:
+    discrete_projection: false
+
+# Optional transfer-attack source. Set enabled=true and fill name/checkpoint to generate
+# adversarial examples against this model while evaluating only against model.*.
+# It is not used for evaluation, and it is not required to be a good model.
+surrogate_model:
+  enabled: false
+  name: null
+  num_classes: 2
+  checkpoint: null
+  params: {}
+  epochs: 5
+
 evaluation:
-  # Bounds PGD, inference, and post-generation validation memory.
+  # Bounds attacks, inference, and post-generation validation memory.
   batch_size: 256
+  # Optional deterministic per-seed cap applied before normalization.
+  max_samples: null
   benign_label: 0
   # In multi-class mode, an evasion is successful only when the target predicts
   # this label; confusing one attack class with another is not an evasion.
@@ -24,14 +42,6 @@ evaluation:
   c_fp: 1.0
   c_fn: 10.0
   strict_constraints: false
-
-surrogate_model:
-  # The surrogate model is used to generate adversarial examples for the target model.
-  # It is not used for evaluation, and it is not required to be a good model.
-  enabled: false
-  name: mlp
-  pretrained: true
-  checkpoint: null
 
 # Dynamic run directory naming
 output_dir: >-

@@ -1,0 +1,7 @@
+enabled: true
+name: jmila_surrogate
+num_classes: 2
+checkpoint: null
+params:
+  hidden_dims: [1024, 512, 256, 128, 64, 32]
+  dropout: 0.3

@@ -168,6 +168,14 @@ class DeepFoolAttack(FeatureSpaceAttack):
                         proposed_delta = candidate.detach() + step_delta - x0
                         proposed_delta = project_box_delta(x0, proposed_delta * mask, mask, lower, upper)
                         adversarial = (x0 + proposed_delta * mask).detach()
+                    logits = logits.detach()
+                    scores = scores.detach()
+                    grad_target = grad_target.detach()
+                    grad_source = grad_source.detach()
+                    normal = normal.detach()
+                    normal_sq = normal_sq.detach()
+                    step_delta = step_delta.detach()
+                    del logits, scores, grad_target, grad_source, normal, normal_sq, step_delta
             # Final prediction is still in eval mode; do not allow a caller's
             # training-mode state to update BatchNorm or activate Dropout here.
             with torch.no_grad():
@@ -175,6 +183,9 @@ class DeepFoolAttack(FeatureSpaceAttack):
                 predictions = input_predictions(final_logits)
                 success = predictions.eq(int(target_label)) & labels.ne(int(target_label))
                 distance = (adversarial - x0).reshape(len(x0), -1).norm(p=2, dim=1)
+                final_logits = final_logits.detach()
+                predictions = predictions.detach()
+                del final_logits, predictions
         finally:
             restore_saved_modes(saved_modes)
 

@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from core.registry import register_detector
-from models.wrapper import PyTorchModelWrapper
+from models.wrapper import ModelWrapper, PyTorchModelWrapper
 from .base import BaseDetector
 
 
@@ -48,7 +48,7 @@ class MahalanobisDetector(BaseDetector):
     @staticmethod
     def _features_to_numpy(features: torch.Tensor) -> np.ndarray:
         if not isinstance(features, torch.Tensor):
-            raise TypeError("PyTorchModelWrapper.extract_features must return a Tensor")
+            raise TypeError("ModelWrapper.extract_features must return a Tensor")
         values = features.detach().to(dtype=torch.float64).cpu().numpy()
         if values.ndim != 2:
             raise ValueError(f"Expected 2-D flattened penultimate features, got {values.shape}")
@@ -56,77 +56,53 @@ class MahalanobisDetector(BaseDetector):
             raise ValueError("Penultimate features contain NaN or infinite values")
         return values
 
-    def fit(self, dataloader: DataLoader, wrapper: PyTorchModelWrapper) -> "MahalanobisDetector":
-        """Estimate class means and one tied empirical covariance on training data.
+    def fit(self, dataloader: DataLoader, wrapper: ModelWrapper) -> "MahalanobisDetector":
+        """Estimate class means and one tied empirical covariance on training data using the wrapper-specific feature extractor.
 
         Call this only after the target model has finished its selected training
         procedure (including PGD or TRADES when enabled), so statistics correspond
-        to the actual defended representation used at inference. Two passes keep
-        the complete training representation out of memory.
+        to the actual defended representation used at inference.
         """
-        class_counts: dict[int, int] = {}
-        class_sums: dict[int, np.ndarray] = {}
-        feature_dim: int | None = None
-        was_training = wrapper.model.training
-        wrapper.model.eval()
+        feature_batches: list[np.ndarray] = []
+        label_batches: list[np.ndarray] = []
+        # PyTorch wrappers require temporary eval mode to freeze BatchNorm and
+        # dropout. sklearn estimators have no train/eval state, but implement the
+        # same polymorphic extract_features contract and need no special path.
+        pytorch_wrapper = isinstance(wrapper, PyTorchModelWrapper)
+        was_training = wrapper.model.training if pytorch_wrapper else False
+        if pytorch_wrapper:
+            wrapper.model.eval()
         try:
             with torch.no_grad():
                 for batch in dataloader:
                     if not isinstance(batch, (tuple, list)) or len(batch) < 2:
                         raise ValueError("Detector fit expects batches shaped as (x, y)")
                     x_batch, y_batch = batch[0], batch[1]
-                    features = self._features_to_numpy(wrapper.extract_features(x_batch))
+                    feature_batches.append(self._features_to_numpy(wrapper.extract_features(x_batch)))
                     if isinstance(y_batch, torch.Tensor):
                         labels = y_batch.detach().cpu().numpy()
                     else:
                         labels = np.asarray(y_batch)
-                    labels = labels.reshape(-1).astype(np.int64, copy=False)
-                    if len(features) != len(labels):
-                        raise ValueError("Feature and label counts differ during detector fitting")
-                    if feature_dim is None:
-                        feature_dim = int(features.shape[1])
-                    elif features.shape[1] != feature_dim:
-                        raise ValueError("Feature dimensions differ during detector fitting")
-                    for label in np.unique(labels):
-                        label_int = int(label)
-                        selected = features[labels == label_int]
-                        class_counts[label_int] = class_counts.get(label_int, 0) + len(selected)
-                        if label_int in class_sums:
-                            class_sums[label_int] += selected.sum(axis=0)
-                        else:
-                            class_sums[label_int] = selected.sum(axis=0)
+                    label_batches.append(labels.reshape(-1).astype(np.int64, copy=False))
         finally:
-            wrapper.model.train(was_training)
+            if pytorch_wrapper:
+                wrapper.model.train(was_training)
 
-        if not class_counts or feature_dim is None:
+        if not feature_batches:
             raise ValueError("Cannot fit MahalanobisDetector: training DataLoader is empty")
-        class_labels = np.array(sorted(class_counts), dtype=np.int64)
-        means = np.vstack([class_sums[int(label)] / class_counts[int(label)] for label in class_labels])
-        class_index = {int(label): index for index, label in enumerate(class_labels)}
-        covariance_accumulator = np.zeros((feature_dim, feature_dim), dtype=np.float64)
-        total_samples = 0
-        wrapper.model.eval()
-        try:
-            with torch.no_grad():
-                for batch in dataloader:
-                    x_batch, y_batch = batch[0], batch[1]
-                    features = self._features_to_numpy(wrapper.extract_features(x_batch))
-                    if isinstance(y_batch, torch.Tensor):
-                        labels = y_batch.detach().cpu().numpy()
-                    else:
-                        labels = np.asarray(y_batch)
-                    labels = labels.reshape(-1).astype(np.int64, copy=False)
-                    batch_means = means[
-                        np.fromiter((class_index[int(label)] for label in labels), dtype=np.int64)
-                    ]
-                    residuals = features - batch_means
-                    covariance_accumulator += residuals.T @ residuals
-                    total_samples += len(residuals)
-        finally:
-            wrapper.model.train(was_training)
+        features = np.concatenate(feature_batches, axis=0)
+        labels = np.concatenate(label_batches, axis=0)
+        if len(features) != len(labels):
+            raise ValueError("Feature and label counts differ during detector fitting")
+        class_labels = np.unique(labels)
+        if class_labels.size < 1:
+            raise ValueError("Cannot fit MahalanobisDetector without observed classes")
 
+        means = np.vstack([features[labels == label].mean(axis=0) for label in class_labels])
+        class_index = {int(label): index for index, label in enumerate(class_labels)}
+        residuals = features - means[np.fromiter((class_index[int(label)] for label in labels), dtype=np.int64)]
         # MLE tied covariance: pool residuals from all classes and divide by N.
-        covariance = covariance_accumulator / max(total_samples, 1)
+        covariance = (residuals.T @ residuals) / max(len(residuals), 1)
         covariance = (covariance + covariance.T) * 0.5
         if self.covariance_ridge:
             covariance += self.covariance_ridge * np.eye(covariance.shape[0], dtype=np.float64)
@@ -136,16 +112,12 @@ class MahalanobisDetector(BaseDetector):
         self.class_means_ = means.astype(np.float64, copy=False)
         self.covariance_ = covariance.astype(np.float64, copy=False)
         self.precision_ = precision.astype(np.float64, copy=False)
-        self.feature_dim_ = feature_dim
-        self.n_fit_samples_ = total_samples
+        self.feature_dim_ = int(features.shape[1])
+        self.n_fit_samples_ = int(len(features))
         return self
 
-    def score(self, x: Any, wrapper: PyTorchModelWrapper) -> np.ndarray:
-        """Return nearest-class Mahalanobis distance, with larger values anomalous.
-
-        Inputs are scored in bounded chunks so detector telemetry does not
-        require materializing every penultimate activation simultaneously.
-        """
+    def score(self, x: Any, wrapper: ModelWrapper) -> np.ndarray:
+        """Return nearest-class squared Mahalanobis distance (higher = anomaly)."""
         if self.class_means_ is None or self.precision_ is None or self.class_labels_ is None:
             raise RuntimeError("MahalanobisDetector must be fitted or loaded before score()")
         if isinstance(x, torch.Tensor):
@@ -155,23 +127,28 @@ class MahalanobisDetector(BaseDetector):
             if x.ndim < 2:
                 raise ValueError(f"Expected batch-shaped input, got {x.shape}")
             n_samples = int(x.shape[0])
-        score_chunks: list[np.ndarray] = []
+        feature_chunks: list[np.ndarray] = []
         for start in range(0, n_samples, self.score_batch_size):
             x_chunk = x[start : start + self.score_batch_size]
             with torch.no_grad():
-                features = self._features_to_numpy(wrapper.extract_features(x_chunk))
-            if features.shape[1] != self.feature_dim_:
-                raise ValueError(
-                    f"Feature dimension mismatch: detector was fit on {self.feature_dim_}, "
-                    f"got {features.shape[1]}"
-                )
-            diff = features[:, None, :] - self.class_means_[None, :, :]
+                feature_chunks.append(self._features_to_numpy(wrapper.extract_features(x_chunk)))
+        if not feature_chunks:
+            return np.empty((0,), dtype=np.float64)
+        features = np.concatenate(feature_chunks, axis=0)
+        if features.shape[1] != self.feature_dim_:
+            raise ValueError(
+                f"Feature dimension mismatch: detector was fit on {self.feature_dim_}, got {features.shape[1]}"
+            )
+        distances: list[np.ndarray] = []
+        assert self.class_means_ is not None and self.precision_ is not None
+        for means_chunk_start in range(0, len(features), self.score_batch_size):
+            z = features[means_chunk_start : means_chunk_start + self.score_batch_size]
+            # Broadcast to (batch, classes, dimensions), then compute d' Sigma^-1 d.
+            diff = z[:, None, :] - self.class_means_[None, :, :]
             projected = diff @ self.precision_
             mahalanobis_sq = np.sum(projected * diff, axis=-1)
-            score_chunks.append(np.sqrt(np.clip(mahalanobis_sq, 0.0, None)).min(axis=1))
-        if not score_chunks:
-            return np.empty((0,), dtype=np.float64)
-        return np.concatenate(score_chunks).astype(np.float64, copy=False)
+            distances.append(np.sqrt(np.clip(mahalanobis_sq, 0.0, None)).min(axis=1))
+        return np.concatenate(distances).astype(np.float64, copy=False)
 
     def state_dict(self) -> dict[str, Any]:
         if self.class_labels_ is None or self.class_means_ is None or self.covariance_ is None or self.precision_ is None:

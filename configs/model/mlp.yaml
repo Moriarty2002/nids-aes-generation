@@ -1,7 +1,7 @@
 enabled: true
 name: mlp
 requires_flatten: true
-checkpoint: "runs/train_nids/ciciomt2024/mlp/baseline/20261007_224108_eb383c02/checkpoints/mlp_seed1/nids.pt"
+checkpoint: null
 epochs: 5
 training:
   epochs: 5

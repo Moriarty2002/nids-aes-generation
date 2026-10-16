@@ -109,7 +109,9 @@ class FGSMAttack(FeatureSpaceAttack):
                 loss = classification_loss(logits, objective_labels)
                 # Maximizing -CE(target) is equivalent to minimizing CE(target).
                 objective = -loss if targeted else loss
-                gradient = torch.autograd.grad(objective, x_leaf, only_inputs=True)[0]
+                gradient = torch.autograd.grad(
+                    objective, x_leaf, only_inputs=True, retain_graph=False, create_graph=False
+                )[0].detach()
 
                 with torch.no_grad():
                     # FGSM starts from delta=0: no random initialization.
@@ -128,6 +130,12 @@ class FGSMAttack(FeatureSpaceAttack):
                     adv_logits = model_module(adversarial)
                     predictions = predicted_labels(adv_logits)
                     success = predictions.eq(objective_labels) if targeted else predictions.ne(labels)
+                    logits = logits.detach()
+                    loss = loss.detach()
+                    objective = objective.detach()
+                    adv_logits = adv_logits.detach()
+                    predictions = predictions.detach()
+                    del logits, loss, objective, adv_logits, predictions, gradient, x_leaf
         finally:
             # Restore each submodule's exact prior mode (including custom mixed modes).
             for module, was_training in module_modes:

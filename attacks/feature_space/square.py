@@ -39,6 +39,10 @@ class SquareAttack(FeatureSpaceAttack):
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Search locally around each sample until success or query exhaustion."""
+        with torch.no_grad():
+            return self._generate_no_grad(x, y, **kwargs)
+
+    def _generate_no_grad(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         x0 = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, dtype=np.float32)
         labels = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
         rng = np.random.default_rng(int(kwargs.get("seed", 0)))

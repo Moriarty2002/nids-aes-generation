@@ -1,0 +1,26 @@
+# Random Forest target. This default is the clean sklearn baseline.
+# Enable empirical adversarial training by composing:
+name: random_forest
+num_classes: 2
+requires_flatten: true
+checkpoint: null
+
+params:
+  n_estimators: 4
+  max_depth: 2
+  max_features: null
+  min_samples_split: 23
+  min_samples_leaf: 5
+  min_impurity_decrease: 1.211795e-5
+  bootstrap: true
+  class_weight: null
+  n_jobs: 1
+  random_state: null # workflow injects the per-seed value
+
+training:
+  strategy: sklearn
+  defense_mode: none
+  batch_size: 128
+  # Empty unless an override group is composed; EAT settings live in
+  # configs/model/training/empirical_at.yaml.
+  empirical_at: {}

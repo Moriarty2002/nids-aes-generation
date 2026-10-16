@@ -61,12 +61,7 @@ class SequenceParquetDataset(BaseDataset):
         normalization_path: str | Path | None = None,
         id_column: str | None = "Index",
     ) -> None:
-        """Load and canonicalize all flows once for deterministic worker access.
-
-        The dataset keeps the padded canonical array and lazily materializes
-        raw/normalized views. This avoids repeated Parquet parsing while
-        keeping derived arrays out of memory until a workflow requests them.
-        """
+        """Load/canonicalize flows and lazily materialize derived feature arrays."""
         super().__init__(None)
         self.path = Path(path)
         self.fields = tuple(str(field) for field in fields)
@@ -111,6 +106,9 @@ class SequenceParquetDataset(BaseDataset):
 
         self.lengths = np.empty(len(frame), dtype=np.int64)
         self._canonical, self.valid_mask = self._pad_sequences(frame)
+        # Keep shape metadata separately so _canonical can be released after the
+        # workflow creates its one retained normalized evaluation matrix.
+        self._canonical_shape = tuple(int(value) for value in self._canonical.shape)
         self._labels = self._load_labels(frame[self.label_column])
         self.normalization = self._load_normalization(self.normalization_path) if self.normalization_path else None
         self._raw_cache: np.ndarray | None = None
@@ -125,17 +123,21 @@ class SequenceParquetDataset(BaseDataset):
 
     @property
     def sequence_shape(self) -> tuple[int, int]:
-        return int(self._canonical.shape[1]), int(self._canonical.shape[2])
+        return int(self._canonical_shape[1]), int(self._canonical_shape[2])
 
     @property
     def tensor_shape(self) -> tuple[int, ...]:
         if self.flatten:
-            return (len(self), self._canonical.shape[1] * len(self.feature_names))
-        return tuple(self._canonical.shape[:-1]) + (len(self.feature_names),)
+            return (len(self), self._canonical_shape[1] * len(self.feature_names))
+        return (len(self), self._canonical_shape[1], len(self.feature_names))
 
     def raw_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         """Return cached features and a copy of labels for safe caller use."""
         if self._raw_cache is None:
+            if self._canonical is None:
+                raise RuntimeError(
+                    "Raw feature storage has been released. Create normalized data before calling release_raw_features()."
+                )
             features = self._canonical
             if self.include_padding_indicator:
                 pad_channel = 1.0 - self.valid_mask.astype(np.float32)[..., None]
@@ -145,6 +147,17 @@ class SequenceParquetDataset(BaseDataset):
             else:
                 self._raw_cache = features.astype(np.float32, copy=False)
         return self._raw_cache, self._labels.copy()
+
+    def release_raw_features(self) -> None:
+        """Release canonical/raw/normalized feature matrices after evaluation setup.
+
+        Labels, sample IDs, lengths, valid_mask and shape metadata remain available.
+        After calling this method, raw_arrays()/normalized_arrays()/__getitem__ are
+        intentionally unavailable because their backing feature storage is gone.
+        """
+        self._raw_cache = None
+        self._normalized_cache = None
+        self._canonical = None
 
     def fit_normalization(
         self,
@@ -252,8 +265,6 @@ class SequenceParquetDataset(BaseDataset):
         if series.isna().any():
             raise ValueError(f"Label column {self.label_column!r} contains missing values")
 
-        # Parquet may store stringified numeric labels as object dtype. Treat a
-        # fully numeric column as numeric before falling back to string labels.
         numeric = pd.to_numeric(series, errors="coerce")
         is_numeric = not numeric.isna().any()
         if is_numeric:
@@ -283,9 +294,6 @@ class SequenceParquetDataset(BaseDataset):
         if any(not value for value in values):
             raise ValueError("String labels cannot be empty")
 
-        # LabelEncoder supplies deterministic canonical class discovery. Its
-        # alphabetical index is deliberately NOT exposed as the benchmark label:
-        # Benign is always remapped to zero for attack-evasion evaluation.
         encoder = LabelEncoder()
         encoder.fit(values)
         encoder_classes = [str(value) for value in encoder.classes_.tolist()]

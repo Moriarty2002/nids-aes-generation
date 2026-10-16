@@ -444,6 +444,25 @@ class JSMAAttack(FeatureSpaceAttack):
                             current_delta = (adv_chunk - clean_chunk) * mask_chunk
                             adv_chunk = (clean_chunk + current_delta).detach()
                             features_selected_total[batch_start:batch_stop] = selected.sum(dim=1)
+                        logits = logits.detach()
+                        scores = scores.detach()
+                        current_predictions = current_predictions.detach()
+                        jacobian = jacobian.detach()
+                        target_gradient = target_gradient.detach()
+                        other_gradient = other_gradient.detach()
+                        del (
+                            logits,
+                            scores,
+                            current_predictions,
+                            jacobian,
+                            target_gradient,
+                            other_gradient,
+                            alpha,
+                            beta,
+                            inc_saliency,
+                            dec_saliency,
+                            current,
+                        )
                         iteration_count += 1
 
                     adv_flat_all[batch_start:batch_stop] = adv_chunk
@@ -463,6 +482,9 @@ class JSMAAttack(FeatureSpaceAttack):
                 delta = (adversarial - x0).reshape(batch_size, -1)
                 actual_l0 = (delta.abs() > self.saliency_epsilon).sum(dim=1)
                 mean_l0 = float(actual_l0.float().mean().detach().cpu()) if batch_size else 0.0
+                final_logits = final_logits.detach()
+                final_predictions = final_predictions.detach()
+                del final_logits, final_predictions, delta
         finally:
             restore_saved_modes(saved_modes)
 

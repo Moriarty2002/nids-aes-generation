@@ -195,11 +195,16 @@ class RuleSet:
                 TcpFlagStateRule(),
                 # Sequence-style flow fields. Padding values are ignored when the
                 # gatekeeper receives the dataset's valid packet mask.
+                # Independent Gatekeeper oracle: these integrality rules are always
+                # enforced, regardless of whether an attack uses lattice projection.
                 NonNegativeRule("PL"),
+                DiscreteIntegrityRule("PL", name="discrete_packet_length"),
                 NonNegativeRule("IAT"),
                 RangeRule("TTL", 0, 255),
+                DiscreteIntegrityRule("TTL", tuple(range(0, 256)), name="discrete_ttl_integrity"),
                 DiscreteIntegrityRule("DIR", (-1, 0, 1)),
                 RangeRule("WIN", -1, 65535),
+                DiscreteIntegrityRule("WIN", name="discrete_window_integrity"),
                 DiscreteIntegrityRule("FLG", tuple([-1] + list(range(0, 256)))),
                 DirectionalImmutabilityRule(),
             )

@@ -162,28 +162,39 @@ class PGDAttack(FeatureSpaceAttack):
             else:
                 loss = torch.nn.functional.cross_entropy(logits, target)
 
-            grad = torch.autograd.grad(loss, delta, only_inputs=True, retain_graph=False)[0]
+            grad = torch.autograd.grad(loss, delta, only_inputs=True, retain_graph=False)[0].detach()
             with torch.no_grad():
                 direction = -1.0 if effective_targeted else 1.0
                 delta.add_(direction * self.alpha * grad.sign())
                 delta.copy_(self._projection(x0, delta, perturbation_mask))
+                logits = logits.detach()
+                loss = loss.detach()
+                logits.zero_()
+                loss.zero_()
+                grad.zero_()
             delta = delta.detach()
+            del logits, loss, grad
 
-        adv = x0 + delta
+        adv = (x0 + delta).detach()
         with torch.no_grad():
             logits = model.model(adv)
             if logits.ndim == 1 or logits.shape[-1] == 1:
                 pred = (torch.sigmoid(logits) >= 0.5).long().view(-1)
             else:
                 pred = logits.argmax(dim=-1)
+            logits = logits.detach()
+            pred = pred.detach()
+            logits.zero_()
 
         # For targeted AC/AD, success is exactly prediction of the target class.
         # Untargeted mode retains the historical "not the true class" semantics.
-        success = pred.eq(target) if effective_targeted else pred.ne(labels)
+        success = (pred.eq(target) if effective_targeted else pred.ne(labels)).detach()
+        pred.zero_()
+        del logits, pred
 
         return AttackResult(
-            adversarial=adv.detach(),
-            success_mask=success.detach(),
+            adversarial=adv,
+            success_mask=success,
             queries=np.zeros(len(adv), dtype=np.int64),
             intrinsic_feasible_mask=np.ones(len(adv), dtype=bool),
             feature_names=self.feature_names or None,
