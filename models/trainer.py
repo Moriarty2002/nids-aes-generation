@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -251,6 +252,7 @@ def train_classifier(
     trades_beta: float = 6.0,
     output_dir: str | Path | None = None,
     seed: int | None = None,
+    logger: logging.Logger | None = None,
 ) -> TrainingSummary:
     """Train a NIDS with natural, PGD adversarial, or TRADES robust training.
 
@@ -270,6 +272,13 @@ def train_classifier(
         raise ValueError("PGD/TRADES require epsilon >= 0, alpha > 0, and pgd_steps >= 1")
     if trades_beta < 0:
         raise ValueError("trades_beta must be >= 0")
+    if logger:
+        logger.info(
+            "training.start framework=pytorch seed=%s epochs=%d lr=%.3g weight_decay=%.3g "
+            "defense=%s epsilon=%.4g alpha=%.4g steps=%d trades_beta=%.3g batches=%d",
+            seed, epochs, lr, weight_decay, mode, epsilon, alpha, pgd_steps,
+            trades_beta, len(train_loader),
+        )
 
     model = wrapper.model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -283,7 +292,6 @@ def train_classifier(
         curve_dir.mkdir(parents=True, exist_ok=True)
         (curve_dir / "training_curve.csv").unlink(missing_ok=True)
 
-    prefix = f"[Seed {seed}]" if seed is not None else "[Training]"
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -380,14 +388,24 @@ def train_classifier(
             "defense_mode": mode,
         })
         _write_training_curve_atomic(curve_dir, history)
-        val_text = "N/A" if val_loss is None else f"{val_loss:.4f} | Val F1: {val_f1:.4f}"
-        print(
-            f"{prefix} Epoch {epoch}/{epochs} | Defense: {mode} | Train Loss: {train_loss:.4f} | "
-            f"Train F1: {trn_f1:.4f} | Val Loss: {val_text} | LR: {current_lr:.2e}",
-            flush=True,
-        )
+        if logger:
+            logger.info(
+                "training.epoch seed=%s epoch=%d/%d defense=%s train_loss=%.5f train_acc=%.4f "
+                "train_f1=%.4f val_loss=%s val_acc=%s val_f1=%s lr=%.3e",
+                seed, epoch, epochs, mode, train_loss, trn_acc, trn_f1,
+                "n/a" if val_loss is None else f"{val_loss:.5f}",
+                "n/a" if not np.isfinite(val_acc) else f"{val_acc:.4f}",
+                "n/a" if not np.isfinite(val_f1) else f"{val_f1:.4f}",
+                current_lr,
+            )
 
     model.eval()
+    if logger:
+        logger.info(
+            "training.done seed=%s epochs=%d best_epoch=%d train_loss=%.5f val_loss=%s defense=%s",
+            seed, epochs, best_epoch, train_loss,
+            "n/a" if val_loss is None else f"{val_loss:.5f}", mode,
+        )
     return TrainingSummary(
         epochs=epochs,
         train_loss=float(train_loss),

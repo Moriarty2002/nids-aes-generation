@@ -20,7 +20,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from core.registry import discover_all
-from evaluator.logger import ExperimentReporter
+from evaluator.logger import ExperimentReporter, install_crash_handler, setup_logger
 from evaluator.statistical import aggregate_by_seed, compare_against_baseline
 from orchestrator.device import resolve_device
 from orchestrator.runner import run_seed_jobs
@@ -116,6 +116,21 @@ def _action(cfg: DictConfig) -> None:
     
     # 2. Create the unified directory manually
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_logger = setup_logger(
+        "orchestrator",
+        output_dir / "logs" / "orchestrator.log",
+    )
+    install_crash_handler(run_logger)
+    run_logger.info(
+        "run.start action=%s model=%s dataset=%s attack=%s seeds=%s workers=%d devices=%s",
+        action,
+        cfg.model.get("name"),
+        cfg.dataset.get("name"),
+        cfg.attack.get("name"),
+        seeds,
+        workers,
+        devices,
+    )
     
     # 3. Manually dump the exact Hydra config for reproducibility
     OmegaConf.save(cfg, output_dir / "config.yaml")
@@ -125,7 +140,14 @@ def _action(cfg: DictConfig) -> None:
     config_dict["output_dir"] = resolved_output_dir 
     
     # Run the multiprocessing jobs
-    seed_rows = run_seed_jobs(target=target, config=config_dict, seeds=seeds, gpus=devices, max_workers=workers)
+    seed_rows = run_seed_jobs(
+        target=target,
+        config=config_dict,
+        seeds=seeds,
+        gpus=devices,
+        max_workers=workers,
+        logger=run_logger,
+    )
     
     _write_summary(output_dir, seed_rows, seed_rows if action == "evaluate_attack" else None)
 
@@ -170,6 +192,7 @@ def _action(cfg: DictConfig) -> None:
         reporter.plot_multi_seed_curves(curve_files)
         
     print(json.dumps({"action": action, "output_dir": str(output_dir), "seed_count": len(seed_rows)}, indent=2))
+    run_logger.info("run.done action=%s output=%s seed_count=%d", action, output_dir, len(seed_rows))
 
 
 OmegaConf.register_new_resolver("uuid", lambda: uuid.uuid4().hex[:8])

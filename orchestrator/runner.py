@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import logging
 import multiprocessing as mp
 import random
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
@@ -46,7 +47,11 @@ def _invoke_dotted(target: str, config: dict[str, Any], seed: int, gpu: str) -> 
     logger = setup_logger(f"Seed_{seed}", worker_log_file)
     install_crash_handler(logger)
 
-    logger.info(f"Worker initialized on GPU/Device: {gpu}")
+    action = target.rsplit(":", 1)[-1].removesuffix("_seed")
+    logger.info(
+        "worker.start action=%s seed=%d device=%s target=%s",
+        action, seed, gpu, target,
+    )
     module_name, function_name = target.split(":", 1)
     module = importlib.import_module(module_name)
     func = getattr(module, function_name)
@@ -54,12 +59,16 @@ def _invoke_dotted(target: str, config: dict[str, Any], seed: int, gpu: str) -> 
     seed_everything(seed)
     torch.set_num_threads(1)
     discover_all()
-    configure_process_device(gpu)
+    device_info = configure_process_device(gpu)
+    logger.info(
+        "worker.ready action=%s seed=%d device=%s torch_device=%s threads=%d",
+        action, seed, gpu, device_info.torch_device, torch.get_num_threads(),
+    )
 
     try:
         # Pass the logger so workflow functions can use it
         result = func(config=config, seed=seed, gpu=gpu, logger=logger)
-        logger.info(f"Seed {seed} finished successfully.")
+        logger.info("worker.done action=%s seed=%d metrics=%s", action, seed, sorted(result))
         return {str(k): float(v) for k, v in dict(result).items()}
     except Exception as exc:
         logger.error(f"Fatal crash in seed {seed}: {exc}", exc_info=True)
@@ -79,6 +88,7 @@ def run_seed_jobs(
     seeds: Sequence[int],
     gpus: Sequence[str],
     max_workers: int | None = None,
+    logger: logging.Logger | None = None,
 ) -> list[dict[str, float | int | str]]:
     """Run independent seeds with ``spawn`` and one parent-owned progress bar.
 
@@ -101,6 +111,11 @@ def run_seed_jobs(
         for i, seed in enumerate(seeds)
     ]
     output: list[dict[str, float | int | str]] = []
+    if logger:
+        logger.info(
+            "jobs.dispatch target=%s seeds=%s workers=%d devices=%s",
+            target, list(seeds), workers, list(gpus),
+        )
 
     with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         future_to_job: dict[Future[Mapping[str, float]], SeedJob] = {
@@ -122,8 +137,23 @@ def run_seed_jobs(
                     result["seed"] = job.seed
                     result["gpu"] = job.gpu
                     output.append(result)
+                    if logger:
+                        logger.info(
+                            "jobs.seed_complete seed=%d device=%s completed=%d/%d",
+                            job.seed, job.gpu, len(output), len(jobs),
+                        )
                     progress.set_postfix_str(f"seed={job.seed}", refresh=False)
+                except Exception:
+                    if logger:
+                        logger.exception(
+                            "jobs.seed_failed seed=%d device=%s target=%s",
+                            job.seed, job.gpu, target,
+                        )
+                    raise
                 finally:
                     progress.update(1)
 
-    return sorted(output, key=lambda row: int(row["seed"]))
+    ordered = sorted(output, key=lambda row: int(row["seed"]))
+    if logger:
+        logger.info("jobs.done target=%s completed=%d/%d", target, len(ordered), len(jobs))
+    return ordered

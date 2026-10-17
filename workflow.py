@@ -463,6 +463,7 @@ def _run_empirical_at(
         trades_beta=float(surrogate_training.get("trades_beta", 6.0)),
         output_dir=surrogate_output,
         seed=seed,
+        logger=logger,
     )
     surrogate_checkpoint = surrogate_output / "nids.pt"
     torch.save(
@@ -550,6 +551,13 @@ def _run_empirical_at(
     accepted_count = 0
     attack_success_count = 0
     violation_counts: dict[str, int] = {}
+    if logger:
+        logger.info(
+            "eat.start seed=%d surrogate=%s attack=%s selected=%d batch_size=%d "
+            "target_label=%d",
+            seed, surrogate_name, attack_cls.__name__, len(selected_idx),
+            attack_batch_size, benign_label,
+        )
 
     for b_start in range(0, len(selected_idx), attack_batch_size):
         batch_indices = selected_idx[b_start : b_start + attack_batch_size]
@@ -601,6 +609,14 @@ def _run_empirical_at(
             valid_adversarial.append(x_adv[accepted].copy())
             # Keep the original malicious label when robustifying the target NIDS.
             valid_adversarial_labels.append(y_clean[accepted].copy())
+        if logger:
+            logger.info(
+                "eat.batch seed=%d batch=%d:%d generated=%d accepted=%d success=%d",
+                seed, b_start, b_start + len(batch_indices), len(x_adv),
+                int(accepted.sum()),
+                int(np.asarray(_as_numpy(result.success_mask), dtype=bool).sum())
+                if result.success_mask is not None else 0,
+            )
         del result, x_adv, x_clean
 
     if valid_adversarial:
@@ -641,14 +657,30 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
     device_info = configure_process_device(gpu)
     seed_everything(seed)
     _inject_dynamic_dataset_shape(cfg)
+    if logger:
+        logger.info(
+            "train_nids.start seed=%d device=%s model=%s dataset=%s",
+            seed, device_info.torch_device, cfg["model"]["name"], cfg["dataset"]["name"],
+        )
 
     dataset = _instantiate_dataset(cfg)
     x_raw, y_np = dataset.raw_arrays()
     y_np = np.asarray(y_np, dtype=np.int64)
+    if logger:
+        logger.info(
+            "train_nids.data_loaded seed=%d samples=%d features=%d shape=%s classes=%d",
+            seed, len(y_np), len(dataset.feature_names), tuple(x_raw.shape),
+            len(getattr(dataset, "classes", np.unique(y_np))),
+        )
     if len(y_np) < 10:
         raise ConfigurationError("Training requires at least 10 samples")
 
     train_idx, val_idx = _split_indices(y_np, seed)
+    if logger:
+        logger.info(
+            "train_nids.split seed=%d train=%d validation=%d",
+            seed, len(train_idx), len(val_idx),
+        )
     if hasattr(dataset, "valid_mask"):
         normalization = dataset.fit_normalization(
             x_raw[train_idx],
@@ -671,6 +703,13 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         num_classes=num_classes,
         seed=seed,
     )
+    if logger:
+        logger.info(
+            "train_nids.model_ready seed=%d model=%s family=%s input_shape=%s parameters=%d",
+            seed, model_cfg["name"], type(wrapper).__name__, tuple(x_tensor.shape[1:]),
+            sum(parameter.numel() for parameter in wrapper.model.parameters())
+            if isinstance(wrapper, PyTorchModelWrapper) else 0,
+        )
 
     train_ds = TensorDataset(x_tensor[train_idx], y_tensor[train_idx])
     val_ds = TensorDataset(x_tensor[val_idx], y_tensor[val_idx])
@@ -714,6 +753,13 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
     augmented_train_y: np.ndarray | None = None
     detector_train_loader = train_loader
     eat_stats: dict[str, float] = {}
+
+    if logger:
+        logger.info(
+            "train_nids.strategy seed=%d requested=%s actual=%s defense=%s detector=%s",
+            seed, requested_strategy or "auto", actual_strategy, defense_mode,
+            detector_cfg.get("name", "none") if detector_enabled else "none",
+        )
 
     if isinstance(wrapper, SklearnModelWrapper):
         if bool(tcfg.get("adversarial_training", False)):
@@ -788,6 +834,11 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             )
 
         estimator = wrapper.estimator
+        if logger:
+            logger.info(
+                "training.start framework=sklearn seed=%d model=%s samples=%d validation=%d defense=%s",
+                seed, model_cfg["name"], len(augmented_train_y), len(val_y), defense_mode,
+            )
         estimator.fit(augmented_train_x, augmented_train_y)
         # Report training metrics on the actual augmented fit set, not only on
         # the original clean subset. Validation remains clean and held out.
@@ -874,6 +925,7 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             trades_beta=float(tcfg.get("trades_beta", 6.0)),
             output_dir=checkpoint_dir,
             seed=seed,
+            logger=logger,
         )
         train_loss = float(summary.train_loss)
         validation_loss = float(summary.validation_loss or 0.0)
@@ -937,6 +989,12 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         "seed": int(seed),
     }
     torch.save(checkpoint_payload, checkpoint)
+    if logger:
+        logger.info(
+            "train_nids.checkpoint_saved seed=%d path=%s family=%s defense=%s train_loss=%.5f val_loss=%.5f",
+            seed, checkpoint, checkpoint_payload["model_family"], defense_mode,
+            train_loss, validation_loss,
+        )
     result = {
         "train_loss": float(train_loss),
         "validation_loss": float(validation_loss),
@@ -1018,6 +1076,13 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
             x_raw = x_raw[sample_indices]
             y_np = y_np[sample_indices]
     feature_names = tuple(dataset.feature_names)
+    if logger:
+        logger.info(
+            "evaluate.start seed=%d device=%s dataset=%s samples=%d features=%d attack=%s "
+            "target=%s max_samples=%s",
+            seed, device_info.torch_device, cfg["dataset"]["name"], len(y_np),
+            len(feature_names), cfg["attack"]["name"], cfg["model"]["name"], max_samples or "all",
+        )
 
     # -------------------- target model --------------------
     target_cfg = dict(cfg["model"])
@@ -1043,6 +1108,11 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         seed=seed,
     )
     _load_checkpoint(target_wrapper, target_ckpt, checkpoint_data=target_meta)
+    if logger:
+        logger.info(
+            "evaluate.target_loaded seed=%d model=%s family=%s checkpoint=%s input_shape=%s",
+            seed, target_cfg["name"], type(target_wrapper).__name__, target_ckpt, tuple(x_target.shape[1:]),
+        )
 
     # Optional inference-time detector fitted after the target model's training-time
     # defense. Detector state lives adjacent to the classifier checkpoint.
@@ -1109,6 +1179,11 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         attack_input = x_target
         attack_norm = surrogate_norm
         attack_input_is_target_normalized = True
+        if logger:
+            logger.info(
+                "evaluate.surrogate_loaded seed=%d model=%s checkpoint=%s normalization=on_demand",
+                seed, surrogate_cfg["name"], surrogate_ckpt,
+            )
 
     benign_label = int(evaluation_cfg.get("benign_label", 0))
 
@@ -1130,6 +1205,12 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
     if surrogate_wrapper is not None and getattr(attack_cls, "requires_gradients", False) and not isinstance(surrogate_wrapper, PyTorchModelWrapper):
         raise ConfigurationError(
             "Gradient-based attacks require a PyTorch surrogate_model; the configured surrogate is not differentiable."
+        )
+    if logger:
+        logger.info(
+            "evaluate.attack_ready seed=%d attack=%s params=%s model=%s problem_space=%s",
+            seed, attack_cls.__name__, {key: value for key, value in attack_params.items() if key != "feature_names"},
+            type(attack_model).__name__, issubclass(attack_cls, ProblemSpaceAttack),
         )
 
     preprocessor = None
@@ -1181,6 +1262,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         detector=detector,
         batch_size=int(evaluation_cfg.get("batch_size", 256)),
         max_samples=max_samples,
+        logger=logger,
     )
 
     valid_mask = getattr(dataset, "valid_mask", None)
@@ -1256,7 +1338,14 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         reporter.generate_confusion_matrix(seed, y_true_scored, y_pred_scored)
 
     if logger:
-        logger.info(f"Evaluation completed for seed {seed}. ASR: {metrics.get('asr', 0.0):.2%}, RR: {metrics.get('realizability_rate', 0.0):.2%}")
+        logger.info(
+            "evaluate.report_saved seed=%d asr=%.2f%% realizability=%.2f%% "
+            "scored=%d rejected=%d",
+            seed, 100.0 * metrics.get("asr", 0.0),
+            100.0 * metrics.get("realizability_rate", 0.0),
+            int(metrics.get("scored_sample_count", 0.0)),
+            int(metrics.get("rejected_sample_count", 0.0)),
+        )
 
     result_dir = Path(cfg.get("output_dir", "runs")) / "per_seed"
     _save_json(
@@ -1278,6 +1367,12 @@ def preprocess_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
     processor_cfg = dict(cfg["preprocessing"])
     processor_cls = PREPROCESSORS.get(str(processor_cfg["name"]))
     processor = processor_cls(**dict(processor_cfg.get("params", {})))
+    if logger:
+        logger.info(
+            "preprocess.start seed=%d processor=%s input=%s output=%s params=%s",
+            seed, processor_cfg["name"], processor_cfg["input"], processor_cfg["output"],
+            processor_cfg.get("params", {}),
+        )
     result = processor.transform(processor_cfg["input"], fit=True)
     output = Path(str(processor_cfg["output"]))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1288,6 +1383,11 @@ def preprocess_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         metadata=json.dumps(result.metadata),
     )
     _save_json(output.with_suffix(output.suffix + ".json"), processor.state_dict() if hasattr(processor, "state_dict") else {})
+    if logger:
+        logger.info(
+            "preprocess.done seed=%d rows=%d features=%d output=%s",
+            seed, len(result.features), result.features.shape[-1] if result.features.ndim >= 2 else 0, output,
+        )
     return {
         "rows": float(len(result.features)),
         "features": float(result.features.shape[-1] if result.features.ndim >= 2 else 0),
@@ -1301,10 +1401,14 @@ def train_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger:
     attack_name = str(cfg["attack"]["name"])
     attack_cls = ATTACKS.get(attack_name)
     train_method = getattr(attack_cls, "train", None)
+    if logger:
+        logger.info("train_attack.start seed=%d attack=%s", seed, attack_name)
     if train_method is None:
         raise ConfigurationError(
             f"Attack {attack_name!r} is generation-only. Add a concrete train(...) implementation "
             "to the plugin before using action=train_attack."
         )
     result = train_method(config=cfg, seed=seed, gpu=gpu)
+    if logger:
+        logger.info("train_attack.done seed=%d metrics=%s", seed, sorted(result))
     return {str(key): float(value) for key, value in dict(result).items()}

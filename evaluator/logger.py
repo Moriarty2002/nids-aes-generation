@@ -19,14 +19,15 @@ class FlushFileHandler(logging.FileHandler):
     """FileHandler that flushes and fsyncs every record to survive server crashes/OOMs."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        self.flush()
         try:
+            super().emit(record)
+            self.flush()
             stream = self.stream
             if stream is not None:
                 os.fsync(stream.fileno())
-        except (AttributeError, OSError):
-            pass
+        except (AttributeError, OSError, ValueError):
+            # Logging must never be the reason a worker loses its actual result.
+            self.handleError(record)
 
 
 def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO) -> logging.Logger:
@@ -43,7 +44,7 @@ def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO) -> 
         logger.handlers.clear()
 
     formatter = logging.Formatter(
-        fmt="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s",
+        fmt="[%(asctime)s] [%(levelname)s] [%(name)s] [pid=%(process)d]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -54,6 +55,7 @@ def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO) -> 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+    logger.info("logger.ready file=%s level=%s", log_path, logging.getLevelName(level))
 
     return logger
 

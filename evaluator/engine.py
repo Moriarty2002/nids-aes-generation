@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import logging
 from time import perf_counter
 from typing import Any, Mapping, Sequence
 
@@ -215,6 +216,7 @@ class EvaluationEngine:
         detector: BaseDetector | None = None,
         batch_size: int = 256,
         max_samples: int | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.target_model = target_model
         self.attack_model = attack_model or target_model
@@ -237,6 +239,7 @@ class EvaluationEngine:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = int(batch_size)
+        self.logger = logger
 
     def run(
         self,
@@ -278,8 +281,21 @@ class EvaluationEngine:
             raise ValueError("Target baseline predictions and labels have different lengths")
 
         n_samples = len(y_np)
+        if self.logger:
+            self.logger.info(
+                "evaluation.engine_start samples=%d batch_size=%d attack=%s attack_model=%s "
+                "target_model=%s strict_constraints=%s detector=%s",
+                n_samples, self.batch_size, type(self.attack).__name__,
+                type(self.attack_model).__name__, type(self.target_model).__name__,
+                self.strict_constraints, type(self.detector).__name__ if self.detector else "none",
+            )
         baseline_latency_ms = baseline_elapsed * 1000.0 / max(n_samples, 1)
         baseline_throughput = n_samples / baseline_elapsed if n_samples else 0.0
+        if self.logger:
+            self.logger.info(
+                "evaluation.baseline_done samples=%d latency_ms_per_sample=%.3f throughput=%.2f",
+                n_samples, baseline_latency_ms, baseline_throughput,
+            )
 
         if isinstance(self.attack, ProblemSpaceAttack):
             target_input = raw_traffic if raw_traffic is not None else attack_input
@@ -329,17 +345,24 @@ class EvaluationEngine:
                     _as_numpy(attack_batch_input)
                 )
 
+            expected_batch_size = stop - start
             batch_result = self.attack.generate(
                 attack_batch_input,
                 _slice_batch(y, start, stop),
                 **batch_kwargs,
             )
             del attack_batch_input
+            if self.logger:
+                self.logger.info(
+                    "evaluation.attack_batch batch=%d:%d generated=%d success=%s queries=%s",
+                    start, stop, expected_batch_size,
+                    "yes" if batch_result.success_mask is not None else "no",
+                    "yes" if batch_result.queries is not None else "no",
+                )
 
             if not first_metadata:
                 first_metadata = dict(batch_result.metadata)
 
-            expected_batch_size = stop - start
             has_success_mask = batch_result.success_mask is not None
             has_queries = batch_result.queries is not None
             if success_available is None:
@@ -600,6 +623,16 @@ class EvaluationEngine:
             metrics["detector_enabled"] = 0.0
         if self.attack_model is not self.target_model:
             metrics["transfer_attack"] = 1.0
+        if self.logger:
+            self.logger.info(
+                "evaluation.done samples=%d scored=%d accepted=%d successful=%d asr=%.2f%% "
+                "realizability=%.2f%% rejected=%d",
+                n_samples, int(metrics["scored_sample_count"]),
+                int(np.sum(accepted)), int(metrics["successful_sample_count"]),
+                100.0 * metrics.get("asr", 0.0),
+                100.0 * metrics["realizability_rate"],
+                int(metrics["rejected_sample_count"]),
+            )
 
         return EvaluationOutput(
             metrics=metrics,
