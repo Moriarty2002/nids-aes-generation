@@ -1,11 +1,11 @@
+# @package model.training
 # Shared training defaults for differentiable target models.
-epochs: 20
+strategy: pytorch
+defense_mode: none
+epochs: 4
 batch_size: 256
 lr: 0.001
 weight_decay: 0.0001
-adversarial_training: false
-defense_mode: none
-pgd_epsilon: 0.02
-pgd_alpha: 0.005
-pgd_steps: 5
-trades_beta: 6.0
+early_stopping_patience: 15
+early_stopping_min_delta: 0.0
+early_stopping_monitor: val_f1

@@ -448,6 +448,11 @@ def _run_empirical_at(
     epsilon = float(surrogate_training.get("pgd_epsilon", 0.04))
     configured_alpha = surrogate_training.get("pgd_alpha")
     alpha = epsilon / 4.0 if configured_alpha is None else float(configured_alpha)
+    early_stopping_patience_raw = surrogate_training.get("early_stopping_patience", 0)
+    early_stopping_patience = None if early_stopping_patience_raw is None else int(early_stopping_patience_raw)
+    early_stopping_min_delta = float(surrogate_training.get("early_stopping_min_delta", 0.0))
+    early_stopping_monitor = str(surrogate_training.get("early_stopping_monitor", "val_loss"))
+
     surrogate_summary = train_classifier(
         surrogate_wrapper,
         surrogate_train_loader,
@@ -455,12 +460,17 @@ def _run_empirical_at(
         epochs=int(surrogate_training.get("epochs", 5)),
         lr=float(surrogate_training.get("lr", 1e-3)),
         weight_decay=float(surrogate_training.get("weight_decay", 1e-5)),
-        adversarial_training=bool(surrogate_training.get("adversarial_training", False)),
+        adversarial_training=bool(
+            surrogate_training.get("adversarial_training", False)
+        ),
         defense_mode=str(surrogate_training.get("defense_mode", "none")),
         pgd_epsilon=epsilon,
         pgd_alpha=alpha,
         pgd_steps=int(surrogate_training.get("pgd_steps", 10)),
         trades_beta=float(surrogate_training.get("trades_beta", 6.0)),
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_monitor=early_stopping_monitor,
         output_dir=surrogate_output,
         seed=seed,
         logger=logger,
@@ -910,6 +920,12 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         pgd_epsilon = float(tcfg.get("pgd_epsilon", 0.04))
         configured_alpha = tcfg.get("pgd_alpha")
         pgd_alpha = pgd_epsilon / 4.0 if configured_alpha is None else float(configured_alpha)
+
+        early_stopping_patience_raw = tcfg.get("early_stopping_patience", 0)
+        early_stopping_patience = None if early_stopping_patience_raw is None else int(early_stopping_patience_raw)
+        early_stopping_min_delta = float(tcfg.get("early_stopping_min_delta", 0.0))
+        early_stopping_monitor = str(tcfg.get("early_stopping_monitor", "val_loss"))
+
         summary = train_classifier(
             wrapper,
             train_loader,
@@ -918,15 +934,19 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             lr=float(tcfg.get("lr", 1e-3)),
             weight_decay=float(tcfg.get("weight_decay", 1e-4)),
             adversarial_training=bool(tcfg.get("adversarial_training", False)),
-            defense_mode=(str(tcfg["defense_mode"]) if tcfg.get("defense_mode") is not None else None),
+            defense_mode=str(tcfg["defense_mode"]) if tcfg.get("defense_mode") is not None else None,
             pgd_epsilon=pgd_epsilon,
             pgd_alpha=pgd_alpha,
             pgd_steps=int(tcfg.get("pgd_steps", 10)),
             trades_beta=float(tcfg.get("trades_beta", 6.0)),
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            early_stopping_monitor=early_stopping_monitor,
             output_dir=checkpoint_dir,
             seed=seed,
             logger=logger,
         )
+
         train_loss = float(summary.train_loss)
         validation_loss = float(summary.validation_loss or 0.0)
         defense_mode = str(summary.defense_mode)

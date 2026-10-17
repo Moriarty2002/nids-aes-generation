@@ -1,35 +1,34 @@
 # configs/model/training/empirical_at.yaml
 # @package model.training
+defaults:
+  # Pulls configs/surrogate_model/jmila_surrogate.yaml into empirical_at.surrogate
+  - /surrogate_model@empirical_at.surrogate: jmila_surrogate
+  # Pulls configs/attack/trades.yaml into empirical_at.attack
+  - /attack@empirical_at.attack: trades
+  - _self_
+
 strategy: sklearn
 defense_mode: empirical_at
 batch_size: 128
 
 empirical_at:
   benign_label: 0
-  # Default AT generation mode: 'trades' or 'pgd'
-  at_mode: trades
-  surrogate:
-    name: jmila_surrogate
-    requires_flatten: true
-    params:
-      hidden_dims: [1024, 512, 256, 128, 64, 32]
-      dropout: 0.3
-    training:
-      epochs: 2 #50
-      batch_size: 128
-      lr: 0.001
-      weight_decay: 0.00001
-      defense_mode: none
-  attack:
-    name: ${..at_mode}  # Resolves dynamically to 'trades' or 'pgd'
-    params:
-      epsilon: 0.04
-      alpha: 0.01
-      steps: 10
-      trades_beta: 6.0
-      discrete_projection: true # allows to project adversarial samples back to the discrete feature space before feeding them to the target model
-      immutable_features: [DIR, FLG]
   augmentation:
-    ratio: 0.5 # Ratio of malicious training flows selected for adversarial generation.
-    # filter_realizable: true
+    ratio: 0.5
+    filter_realizable: true
     batch_size: 128
+
+  surrogate:
+    training:
+      epochs: 20
+      batch_size: 256
+      lr: 0.001
+      weight_decay: 0.0001
+      defense_mode: none
+
+  attack:
+    epsilon: 0.04
+    alpha: 0.01
+    steps: 10
+    discrete_projection: true
+    immutable_features: [DIR, FLG]

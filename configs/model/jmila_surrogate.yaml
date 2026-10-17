@@ -1,19 +1,8 @@
+enabled: true
 name: jmila_surrogate
 num_classes: 2
 requires_flatten: true
+checkpoint: null
 params:
   hidden_dims: [1024, 512, 256, 128, 64, 32]
-  # Literature-inspired starting default; tune separately per dataset/split.
   dropout: 0.3
-training:
-  strategy: pytorch
-  epochs: 50
-  batch_size: 128
-  lr: 0.001
-  weight_decay: 0.00001
-  defense_mode: none
-  adversarial_training: false
-  pgd_epsilon: 0.04
-  pgd_alpha: 0.01
-  pgd_steps: 10
-  trades_beta: 6.0

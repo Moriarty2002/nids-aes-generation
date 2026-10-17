@@ -1,11 +1,12 @@
 defaults:
   - dataset: ciciomt2024
   - model: mlp
+  - model/training: default
   - attack: pgd
   - preprocessing: sota_extractor
   - detector: none
-  - _self_
   - optional surrogate_model: null
+  - _self_
   - override hydra/job_logging: disabled
   - override hydra/hydra_logging: disabled
 
@@ -14,21 +15,6 @@ gpu: cpu
 gpu_partitions: [cpu]
 seeds: [1, 2, 3, 4, 5]
 parallel_workers: 5
-
-attack:
-  params:
-    discrete_projection: false
-
-# Optional transfer-attack source. Set enabled=true and fill name/checkpoint to generate
-# adversarial examples against this model while evaluating only against model.*.
-# It is not used for evaluation, and it is not required to be a good model.
-surrogate_model:
-  enabled: false
-  name: null
-  num_classes: 2
-  checkpoint: null
-  params: {}
-  epochs: 5
 
 evaluation:
   # Bounds attacks, inference, and post-generation validation memory.
@@ -43,7 +29,6 @@ evaluation:
   c_fn: 10.0
   strict_constraints: false
 
-# Dynamic run directory naming
 output_dir: >-
   runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
 

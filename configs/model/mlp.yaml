@@ -1,11 +1,7 @@
-defaults:
-  - training: default
-
+# configs/model/mlp.yaml
 name: mlp
 requires_flatten: true
 checkpoint: null
-training:
-  epochs: 5
-  pgd_alpha: null
-  pgd_epsilon: 0.04
-  pgd_steps: 10
+params:
+  hidden_dims: [256, 128]
+  dropout: 0.2

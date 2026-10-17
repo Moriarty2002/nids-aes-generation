@@ -1,10 +1,11 @@
 name: pgd
-epsilon: 0.01
-alpha: 0.005
-steps: 1
+epsilon: 0.04
+alpha: 0.01
+steps: 10
 targeted: false
 target_label: null
 clip_min: null
 clip_max: null
+discrete_projection: false
 immutable_features: []
-variant: "eps${attack.epsilon}_steps${attack.steps}"
+variant: "eps${.epsilon}_steps${.steps}"

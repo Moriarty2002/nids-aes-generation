@@ -1,0 +1,10 @@
+# @package model.training
+defaults:
+  - default
+  - _self_
+
+defense_mode: trades
+trades_beta: 6.0
+pgd_epsilon: 0.04
+pgd_alpha: 0.01
+pgd_steps: 10

@@ -1,0 +1,11 @@
+# @package attack
+name: trades
+epsilon: 0.04
+alpha: 0.01
+steps: 10
+trades_beta: 6.0
+targeted: false
+target_label: null
+discrete_projection: false
+immutable_features: []
+variant: "eps${.epsilon}_steps${.steps}"
