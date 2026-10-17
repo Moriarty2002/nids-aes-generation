@@ -1239,6 +1239,11 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
 
     strict_constraints = bool(evaluation_cfg.get("strict_constraints", False))
     strict_multiclass = bool(evaluation_cfg.get("strict_multiclass", True))
+    class_names = tuple(
+        str(name) for name in getattr(
+            dataset, "classes", tuple(f"Class_{i}" for i in range(target_num_classes))
+        )
+    )
     gatekeeper = UniversalConstraintGatekeeper(
         strict=strict_constraints,
         normalization_mean=target_norm.mean,
@@ -1253,6 +1258,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         attack_normalization=attack_norm,
         target_normalization=target_norm,
         class_labels=list(range(target_num_classes)),
+        class_names=class_names,
         benign_label=benign_label,
         target_label=attack_params.get("target_label"),
         c_fp=float(evaluation_cfg.get("c_fp", 1.0)),
@@ -1323,11 +1329,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
     if ExperimentReporter is not None:
         reporter = ExperimentReporter(
             run_dir=Path(cfg.get("output_dir", "runs")),
-            class_names=[
-                str(name) for name in getattr(
-                    dataset, "classes", tuple(f"Class_{i}" for i in range(target_num_classes))
-                )
-            ],
+            class_names=class_names,
         )
         y_true_scored = y_np[output.scored_mask]
         y_pred_scored = output.adversarial_predictions[output.scored_mask]

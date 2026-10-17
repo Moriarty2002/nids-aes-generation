@@ -7,6 +7,17 @@ import numpy as np
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, roc_auc_score
 
 
+def _class_metric_key(
+    prefix: str,
+    label: int,
+    class_names: Iterable[str] | None,
+) -> str:
+    """Build a stable metric key using the human-readable class when available."""
+    names = None if class_names is None else tuple(str(name) for name in class_names)
+    class_name = names[label] if names is not None and 0 <= label < len(names) else f"class_{label}"
+    return f"{prefix}_{class_name}"
+
+
 @dataclass(frozen=True)
 class ClassificationMetrics:
     mcc: float
@@ -181,10 +192,11 @@ def attack_success_rate_by_class(
     adversarial_pred: Iterable[int],
     *,
     labels: Iterable[int] | None = None,
+    class_names: Iterable[str] | None = None,
     benign_label: int = 0,
     target_label: int | None = None,
 ) -> dict[str, float]:
-    """Return ``asr_class_<label>`` using the strict target-label definition."""
+    """Return per-source-class ASR using human-readable metric keys."""
     yt = np.asarray(list(y_true), dtype=np.int64)
     base = np.asarray(list(baseline_pred), dtype=np.int64)
     adv = np.asarray(list(adversarial_pred), dtype=np.int64)
@@ -197,7 +209,7 @@ def attack_success_rate_by_class(
     result: dict[str, float] = {}
     for label in class_labels:
         class_mask = eligible & (yt == int(label))
-        result[f"asr_class_{int(label)}"] = (
+        result[_class_metric_key("asr", int(label), class_names)] = (
             float(np.mean(adv[class_mask] == desired)) if np.any(class_mask) else 0.0
         )
     return result
@@ -285,6 +297,7 @@ def evaluate_predictions(
     y_pred: Iterable[int],
     *,
     labels: Iterable[int] | None = None,
+    class_names: Iterable[str] | None = None,
     queries: Iterable[int | float] | None = None,
     success_mask: Iterable[bool] | None = None,
     query_budget: int | None = None,
@@ -344,6 +357,7 @@ def evaluate_predictions(
                 baseline,
                 yp,
                 labels=label_values,
+                class_names=class_names,
                 benign_label=benign_label,
                 target_label=target_label,
             )
@@ -353,7 +367,10 @@ def evaluate_predictions(
         effective_success = provided_success
         result["asr"] = 0.0
         class_labels = np.unique(yt) if label_values is None else np.asarray(label_values, dtype=np.int64)
-        result.update({f"asr_class_{int(label)}": 0.0 for label in class_labels})
+        result.update({
+            _class_metric_key("asr", int(label), class_names): 0.0
+            for label in class_labels
+        })
 
     result["mean_queries_to_evasion"] = mean_queries_to_success(queries, effective_success)
     if x is not None and x_adv is not None:

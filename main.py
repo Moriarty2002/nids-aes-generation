@@ -176,14 +176,10 @@ def _action(cfg: DictConfig) -> None:
             s = int(row["seed"])
             cm_path = output_dir / "reports" / f"cm_seed_{s}_adversarial.csv"
             if cm_path.exists():
-                # 2. Read with pandas to bypass the new text headers and row indices
+                # Load raw counts so the aggregate remains an average of seed counts.
                 df = pd.read_csv(cm_path, index_col=0)
                 raw_cm = df.to_numpy(dtype=float)
-                
-                # 3. Normalize the raw matrix to 0-1 range
-                row_sums = raw_cm.sum(axis=1, keepdims=True)
-                norm_cm = np.divide(raw_cm, row_sums, out=np.zeros_like(raw_cm), where=row_sums != 0)
-                cms.append(norm_cm)
+                cms.append(raw_cm)
                 
         reporter.save_aggregated_report(seed_rows, cms)
         

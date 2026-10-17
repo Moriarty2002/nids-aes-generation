@@ -167,7 +167,7 @@ class ExperimentReporter:
         y_pred: np.ndarray,
         phase: str = "adversarial",
     ) -> np.ndarray:
-        """Write CSV/PDF confusion matrices and return the plotted matrix."""
+        """Write raw-count CSV and a PDF containing raw and normalized matrices."""
         observed = np.concatenate([np.asarray(y_true), np.asarray(y_pred)])
         labels = (
             np.arange(len(self.class_names), dtype=np.int64)
@@ -181,39 +181,64 @@ class ExperimentReporter:
             cm_norm = cm_raw.astype(np.float64)
         else:
             cm_raw = confusion_matrix(y_true, y_pred, labels=labels)
-            if phase == "successful_evasions":
-                cm_norm = confusion_matrix(y_true, y_pred, labels=labels)
-            else:
-                cm_norm = confusion_matrix(y_true, y_pred, labels=labels, normalize="true")
+            cm_norm = confusion_matrix(y_true, y_pred, labels=labels, normalize="true")
         pd.DataFrame(cm_raw, index=classes, columns=classes).to_csv(
             self.reports_dir / f"cm_seed_{seed}_{phase}.csv"
         )
 
-        n_classes = len(classes)
-        plt.figure(figsize=(max(6, n_classes * 0.8), max(4, n_classes * 0.6)))
-        sns.heatmap(
+        self._save_confusion_matrix_pdf(
+            cm_raw,
             cm_norm,
-            annot=True,
-            fmt=".2f",
-            xticklabels=classes,
-            yticklabels=classes,
-            cmap="viridis",
-            cbar=True,
+            classes,
+            self.reports_dir / f"cm_seed_{seed}_{phase}.pdf",
+            f"Seed {seed} - {phase}",
         )
-        plt.ylabel("True Label")
-        plt.xlabel("Predicted Label")
-        plt.title(f"Normalized Confusion Matrix (Seed {seed} - {phase})")
-        plt.savefig(self.reports_dir / f"cm_seed_{seed}_{phase}.pdf", bbox_inches="tight")
-        plt.close()
 
         return cm_norm
+
+    @staticmethod
+    def _save_confusion_matrix_pdf(
+        cm_raw: np.ndarray,
+        cm_norm: np.ndarray,
+        classes: Sequence[str],
+        output_path: Path,
+        title: str,
+    ) -> None:
+        """Save raw-count and row-normalized heatmaps side by side."""
+        n_classes = len(classes)
+        figure, axes = plt.subplots(
+            1,
+            2,
+            figsize=(max(12, n_classes * 1.6), max(5, n_classes * 0.7)),
+            squeeze=False,
+        )
+        for axis, matrix, plot_title, fmt in (
+            (axes[0, 0], cm_raw, f"Counts ({title})", "g"),
+            (axes[0, 1], cm_norm, f"Normalized ({title})", ".2f"),
+        ):
+            sns.heatmap(
+                matrix,
+                annot=True,
+                fmt=fmt,
+                xticklabels=classes,
+                yticklabels=classes,
+                cmap="viridis",
+                cbar=True,
+                ax=axis,
+            )
+            axis.set_ylabel("True Label")
+            axis.set_xlabel("Predicted Label")
+            axis.set_title(plot_title)
+        figure.tight_layout()
+        figure.savefig(output_path, bbox_inches="tight")
+        plt.close(figure)
 
     def save_aggregated_report(
         self,
         seed_metrics: Sequence[Mapping[str, Any]],
         cms: Sequence[np.ndarray],
     ) -> None:
-        """Save mean/std metrics and the cross-seed confusion-matrix summary."""
+        """Save mean/std metrics and mean raw-count confusion matrices."""
         if not seed_metrics:
             return
 
@@ -240,28 +265,24 @@ class ExperimentReporter:
         # Mean Confusion Matrix Plot
         if cms:
             mean_cm = np.mean(np.stack(cms), axis=0)
+            row_sums = mean_cm.sum(axis=1, keepdims=True)
+            mean_cm_norm = np.divide(
+                mean_cm,
+                row_sums,
+                out=np.zeros_like(mean_cm, dtype=np.float64),
+                where=row_sums != 0,
+            )
             classes = self.class_names or [f"Class_{i}" for i in range(mean_cm.shape[0])]
             pd.DataFrame(mean_cm, index=classes, columns=classes).to_csv(
                 self.reports_dir / "cm_mean.csv", float_format="%.4f"
             )
-
-            classes = self.class_names or [f"Class_{i}" for i in range(mean_cm.shape[0])]
-            n_classes = len(classes)
-            plt.figure(figsize=(max(6, n_classes * 0.8), max(4, n_classes * 0.6)))
-            sns.heatmap(
+            self._save_confusion_matrix_pdf(
                 mean_cm,
-                annot=True,
-                fmt=".2f",
-                xticklabels=classes,
-                yticklabels=classes,
-                cmap="viridis",
-                cbar=True,
+                mean_cm_norm,
+                classes,
+                self.reports_dir / "cm_mean.pdf",
+                f"Mean Across {len(cms)} Seeds",
             )
-            plt.ylabel("True Label")
-            plt.xlabel("Predicted Label")
-            plt.title(f"Mean Normalized Confusion Matrix ({len(cms)} Seeds)")
-            plt.savefig(self.reports_dir / "cm_mean.pdf", bbox_inches="tight")
-            plt.close()
 
     def plot_multi_seed_curves(self, curve_files: Sequence[Path | str]) -> None:
         """Plots training curves with individual seed trajectories and bold mean lines."""

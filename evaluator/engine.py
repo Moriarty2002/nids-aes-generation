@@ -207,6 +207,7 @@ class EvaluationEngine:
         attack_normalization: FeatureNormalization | None = None,
         target_normalization: FeatureNormalization | None = None,
         class_labels: Sequence[int] | None = None,
+        class_names: Sequence[str] | None = None,
         benign_label: int = 0,
         target_label: int | None = None,
         c_fp: float = 1.0,
@@ -226,6 +227,7 @@ class EvaluationEngine:
         self.attack_normalization = attack_normalization
         self.target_normalization = target_normalization
         self.class_labels = None if class_labels is None else tuple(int(value) for value in class_labels)
+        self.class_names = None if class_names is None else tuple(str(value) for value in class_names)
         self.benign_label = int(benign_label)
         self.target_label = None if target_label is None else int(target_label)
         self.c_fp = float(c_fp)
@@ -564,6 +566,7 @@ class EvaluationEngine:
             y_score,
             adv_score,
             labels=metric_labels,
+            class_names=self.class_names,
             queries=queries,
             success_mask=successful,
             query_budget=(
