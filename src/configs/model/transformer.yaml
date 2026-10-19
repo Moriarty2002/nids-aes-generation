@@ -3,5 +3,5 @@ defaults:
 
 name: transformer
 requires_flatten: false
-checkpoint: "runs/checkpoints/transformer_seed{seed}/nids.pt"
+checkpoint: "../runs/checkpoints/transformer_seed{seed}/nids.pt"
 params: {d_model: 128, heads: 4, layers: 2, dropout: 0.1}

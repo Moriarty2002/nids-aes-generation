@@ -30,7 +30,7 @@ evaluation:
   strict_constraints: false
 
 output_dir: >-
-  runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
+  ../runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
 
 hydra:
   output_subdir: null  # Completely disables the creation of the .hydra folder

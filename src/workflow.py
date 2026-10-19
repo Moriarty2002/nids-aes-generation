@@ -737,7 +737,7 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin),
     )
 
-    checkpoint_dir = Path(cfg.get("output_dir", "runs")) / "checkpoints" / f"{model_cfg['name']}_seed{seed}"
+    checkpoint_dir = Path(cfg.get("output_dir", "../runs")) / "checkpoints" / f"{model_cfg['name']}_seed{seed}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     defense_mode = str(tcfg.get("defense_mode", "none") or "none").lower()
@@ -1334,7 +1334,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
     metrics["attack_generated_sample_count"] = float(len(y_np))
     metrics["surrogate_used"] = float(surrogate_wrapper is not None)
     if output.detector_clean_scores is not None and output.detector_adversarial_scores is not None:
-        detector_scores_dir = Path(cfg.get("output_dir", "runs")) / "per_seed" / "detector_scores"
+        detector_scores_dir = Path(cfg.get("output_dir", "../runs")) / "per_seed" / "detector_scores"
         detector_scores_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             detector_scores_dir / f"detector_scores_seed{seed}.npz",
@@ -1348,7 +1348,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
 
     if ExperimentReporter is not None:
         reporter = ExperimentReporter(
-            run_dir=Path(cfg.get("output_dir", "runs")),
+            run_dir=Path(cfg.get("output_dir", "../runs")),
             class_names=class_names,
         )
         y_true_scored = y_np[output.scored_mask]
@@ -1369,7 +1369,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
             int(metrics.get("rejected_sample_count", 0.0)),
         )
 
-    result_dir = Path(cfg.get("output_dir", "runs")) / "per_seed"
+    result_dir = Path(cfg.get("output_dir", "../runs")) / "per_seed"
     _save_json(
         result_dir / f"evaluate_seed_{seed}.json",
         {

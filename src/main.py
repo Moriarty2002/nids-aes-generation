@@ -111,7 +111,7 @@ def _action(cfg: DictConfig) -> None:
         raise ValueError(f"Unsupported action {action!r}")
         
     # 1. Resolve output_dir exactly once
-    resolved_output_dir = str(cfg.get("output_dir", "runs"))
+    resolved_output_dir = str(cfg.get("output_dir", "../runs"))
     output_dir = Path(resolved_output_dir)
     
     # 2. Create the unified directory manually

@@ -2,9 +2,9 @@
 .venv/
 runs/
 outputs/
-data/*.npz
-data/*.parquet
-data/*.json
+src/data/*.npz
+src/data/*.parquet
+src/data/*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

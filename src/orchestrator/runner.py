@@ -42,7 +42,7 @@ def seed_everything(seed: int) -> None:
 
 def _invoke_dotted(target: str, config: dict[str, Any], seed: int, gpu: str) -> Mapping[str, float]:
     """Import and execute one Hydra-style ``module:function`` target in a worker."""
-    out_dir = Path(config.get("output_dir", "runs"))
+    out_dir = Path(config.get("output_dir", "../runs"))
     worker_log_file = out_dir / "logs" / f"seed_{seed}.log"
     logger = setup_logger(f"Seed_{seed}", worker_log_file)
     install_crash_handler(logger)

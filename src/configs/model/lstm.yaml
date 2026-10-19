@@ -3,5 +3,5 @@ defaults:
 
 name: lstm
 requires_flatten: false
-checkpoint: "runs/checkpoints/bilstm_seed{seed}/nids.pt"
+checkpoint: "../runs/checkpoints/bilstm_seed{seed}/nids.pt"
 params: {hidden_size: 128, layers: 2, dropout: 0.2}

@@ -3,5 +3,5 @@ defaults:
 
 name: cnn
 requires_flatten: false
-checkpoint: "runs/checkpoints/cnn_seed{seed}/nids.pt"
+checkpoint: "../runs/checkpoints/cnn_seed{seed}/nids.pt"
 params: {channels: [64, 128], dropout: 0.2}

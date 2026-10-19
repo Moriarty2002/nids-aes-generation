@@ -391,7 +391,7 @@ python main.py \
   attack.epsilon=0.04 \
   attack.steps=20 \
   model=mlp \
-  model.checkpoint="runs/train_nids/ciciomt2024/mlp/baseline/<TIMESTAMP>/checkpoints/mlp_seed{seed}/nids.pt" \
+  model.checkpoint="../runs/train_nids/ciciomt2024/mlp/baseline/<TIMESTAMP>/checkpoints/mlp_seed{seed}/nids.pt" \
   dataset=ciciomt2024 \
   evaluation.batch_size=256 \
   detector.enabled=true \
