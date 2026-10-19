@@ -22,7 +22,7 @@ RF_TREES=100
 RF_MAX_FEATURES="null" # Maps to 'None' in Python
 
 echo "================================================================="
-echo " Starting SOTA NIDS Experiments on $DATASET"
+echo " Starting SOTA NIDS Training on $DATASET"
 echo " Seeds: $SEEDS"
 echo "================================================================="
 
