@@ -287,7 +287,7 @@ def train_classifier(
     train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None = None,
     *,
-    epochs: int = 20,
+    epochs: int = 50,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     adversarial_training: bool = False,

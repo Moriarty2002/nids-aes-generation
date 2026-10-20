@@ -2,7 +2,7 @@
 # Shared training defaults for differentiable target models.
 strategy: pytorch
 defense_mode: none
-epochs: 4
+epochs: 50
 batch_size: 256
 lr: 0.001
 weight_decay: 0.0001
