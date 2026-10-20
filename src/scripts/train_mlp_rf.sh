@@ -5,7 +5,7 @@ set -e
 
 # Global experiment variables
 DATASET="ciciomt2024"
-SEEDS="[42,52,62]"
+SEEDS="[42,52,62,72,82]"
 GPU="0"
 BATCH_SIZE=256
 TRADES_BETA=6.0
