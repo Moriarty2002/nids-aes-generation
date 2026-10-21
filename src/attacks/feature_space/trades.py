@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import register_attack
+from ._linf_utils import immutable_feature_mask
 
 
 @register_attack("trades")
@@ -27,7 +28,7 @@ class TRADESAttack(FeatureSpaceAttack):
         steps: int = 10,
         trades_beta: float = 6.0,
         discrete_projection: bool = True,
-        immutable_features: tuple[str, ...] = ("DIR", "FLG"),
+        immutable_features: tuple[str, ...] = (),
         **kwargs: Any,
     ) -> None:
         super().__init__(discrete_projection=discrete_projection, **kwargs)
@@ -60,9 +61,11 @@ class TRADESAttack(FeatureSpaceAttack):
             normalization_mean=kwargs.get("normalization_mean"),
             normalization_std=kwargs.get("normalization_std"),
         )
-        for idx, name in enumerate(feature_names):
-            if name.upper() in self.immutable_features:
-                mask[..., idx] = 0.0
+        mask = mask * immutable_feature_mask(
+            x_clean,
+            feature_names,
+            self.immutable_features,
+        )
 
         criterion_kl = nn.KLDivLoss(reduction="batchmean")
 

@@ -348,6 +348,9 @@ class EvaluationEngine:
                 )
 
             expected_batch_size = stop - start
+            valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
+            if valid_mask_batch is not None:
+                batch_kwargs["valid_mask"] = valid_mask_batch
             batch_result = self.attack.generate(
                 attack_batch_input,
                 _slice_batch(y, start, stop),
@@ -444,7 +447,6 @@ class EvaluationEngine:
             x_clean_batch = _slice_batch(x_target, start, stop)
             y_batch = y_np[start:stop]
             baseline_batch = baseline_pred[start:stop]
-            valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
             gate = self.gatekeeper.validate(
                 x_adv_batch,
                 first_feature_names,

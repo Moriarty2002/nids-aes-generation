@@ -1,4 +1,5 @@
 name: square
+immutable_features: ${dataset.immutable_features}
 epsilon: 0.03
 max_queries: 5
 p_init: 0.8

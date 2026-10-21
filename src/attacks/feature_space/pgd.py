@@ -10,6 +10,7 @@ from attacks.base import AttackResult, FeatureSpaceAttack
 from core.exceptions import IncompatibleThreatModelError
 from core.registry import register_attack
 from models.wrapper import PyTorchModelWrapper, ensure_gradient_compatible
+from ._linf_utils import immutable_feature_mask
 
 
 @dataclass
@@ -43,6 +44,15 @@ class PGDAttack(FeatureSpaceAttack):
             raise ValueError("alpha must be >= 0")
         if self.steps <= 0:
             raise ValueError("steps must be > 0")
+        self.feature_names = tuple(str(name).upper() for name in self.feature_names)
+        self.immutable_features = tuple(str(name).upper() for name in self.immutable_features)
+        if len(set(self.feature_names)) != len(self.feature_names):
+            raise ValueError("feature_names must not contain duplicates")
+        unknown = sorted(set(self.immutable_features).difference(self.feature_names))
+        if unknown and self.feature_names:
+            raise ValueError(
+                f"Unknown immutable feature name(s): {unknown}; available: {self.feature_names}"
+            )
         # Supplying a semantic target is sufficient to select targeted PGD;
         if self.target_label is not None:
             self.targeted = True
@@ -66,19 +76,6 @@ class PGDAttack(FeatureSpaceAttack):
             upper_value = torch.as_tensor(upper, device=x0.device, dtype=x0.dtype)
 
             delta = torch.clamp(x0 + delta, min=lower_value, max=upper_value) - x0
-
-        if self.feature_names and self.immutable_features:
-            feature_count = len(self.feature_names)
-            if x0.ndim == 3 and x0.shape[-1] != feature_count:
-                raise ValueError("x0 feature width does not match feature_names")
-            if x0.ndim == 2 and x0.shape[-1] % feature_count:
-                raise ValueError("flattened x0 width is not divisible by feature_names")
-            mutable = torch.ones(feature_count, dtype=x0.dtype, device=x0.device)
-            for name in self.immutable_features:
-                if name in self.feature_names:
-                    mutable[self.feature_names.index(name)] = 0.0
-            channel_mask = mutable.expand(x0.reshape(x0.shape[0], -1, feature_count).shape)
-            delta = delta * channel_mask.reshape_as(delta)
 
         return delta * perturbation_mask
 
@@ -118,6 +115,11 @@ class PGDAttack(FeatureSpaceAttack):
             self.feature_names,
             normalization_mean=normalization_mean,
             normalization_std=normalization_std,
+        )
+        perturbation_mask = perturbation_mask * immutable_feature_mask(
+            x0,
+            self.feature_names,
+            self.immutable_features,
         )
 
         if effective_targeted:

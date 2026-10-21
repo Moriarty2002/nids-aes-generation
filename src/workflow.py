@@ -579,6 +579,10 @@ def _run_empirical_at(
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
         }
+        batch_valid_mask = None
+        if valid_mask_full is not None:
+            batch_valid_mask = np.asarray(valid_mask_full, dtype=bool)[batch_indices]
+            batch_kwargs["valid_mask"] = batch_valid_mask
         result = attack.generate(x_clean, y_clean, **batch_kwargs)
         if result.adversarial is None or result.raw_adversarial is not None:
             raise ConfigurationError("EAT feature-space attack must return result.adversarial")
@@ -591,9 +595,6 @@ def _run_empirical_at(
         if result_names != feature_names:
             raise ConfigurationError("EAT attack output feature schema differs from the target dataset")
 
-        batch_valid_mask = None
-        if valid_mask_full is not None:
-            batch_valid_mask = np.asarray(valid_mask_full, dtype=bool)[batch_indices]
         gate = gatekeeper.validate(
             x_adv,
             feature_names,

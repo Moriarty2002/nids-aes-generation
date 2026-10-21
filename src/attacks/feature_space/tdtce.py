@@ -19,6 +19,7 @@ from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import DATASETS, NIDS, register_attack
 from models.wrapper import PyTorchModelWrapper
 from orchestrator.device import configure_process_device
+from ._linf_utils import immutable_feature_mask
 
 
 # TDTCE follows the latent-diffusion formulation described in Sui et al.,
@@ -68,7 +69,7 @@ class SparseMultiheadAttention(nn.Module):
         self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
         self.output = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, valid_mask: Tensor | None = None) -> Tensor:
         batch_size, sequence_length, _ = x.shape
         if sequence_length == 0:
             return x
@@ -94,15 +95,29 @@ class SparseMultiheadAttention(nn.Module):
         # (B, H, L, window, Dh).
         local_k = k[:, :, safe_indices, :]
         local_v = v[:, :, safe_indices, :]
+        local_valid = valid.reshape(1, sequence_length, -1).expand(batch_size, -1, -1)
+        if valid_mask is not None:
+            if valid_mask.shape != (batch_size, sequence_length):
+                raise ValueError(
+                    f"attention valid_mask must be {(batch_size, sequence_length)}, "
+                    f"got {tuple(valid_mask.shape)}"
+                )
+            local_key_valid = valid_mask[:, safe_indices]
+            local_valid = local_valid & local_key_valid
+            # Linear projection biases must not re-introduce padded values.
+            local_v = local_v * local_key_valid[:, None, :, :, None].to(local_v.dtype)
         scores = (q.unsqueeze(-2) * local_k).sum(dim=-1) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(
-            ~valid.reshape(1, 1, sequence_length, -1),
+            ~local_valid[:, None, :, :],
             torch.finfo(scores.dtype).min,
         )
         weights = torch.softmax(scores, dim=-1)
         attended = (weights.unsqueeze(-1) * local_v).sum(dim=-2)
         attended = attended.transpose(1, 2).reshape(batch_size, sequence_length, self.hidden_dim)
-        return self.output(attended)
+        output = self.output(attended)
+        if valid_mask is not None:
+            output = output * valid_mask.unsqueeze(-1).to(output.dtype)
+        return output
 
 
 class AdaLNGBlock(nn.Module):
@@ -151,13 +166,21 @@ class AdaLNGBlock(nn.Module):
         scale, shift = modulation.chunk(2, dim=-1)
         return norm(x) * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, condition: Tensor, valid_mask: Tensor | None = None
+    ) -> Tensor:
+        token_mask = None if valid_mask is None else valid_mask.unsqueeze(-1).to(x.dtype)
         attention_input = self._adaptive_norm(
             x, self.norm_attention, self.attention_modulation(condition)
         )
-        x = x + self.alpha_attention.reshape(1, 1, -1) * self.attention(attention_input)
+        x = x + self.alpha_attention.reshape(1, 1, -1) * self.attention(
+            attention_input, valid_mask=valid_mask
+        )
+        if token_mask is not None:
+            x = x * token_mask
         mlp_input = self._adaptive_norm(x, self.norm_mlp, self.mlp_modulation(condition))
-        return x + self.alpha_mlp.reshape(1, 1, -1) * self.mlp(mlp_input)
+        x = x + self.alpha_mlp.reshape(1, 1, -1) * self.mlp(mlp_input)
+        return x if token_mask is None else x * token_mask
 
 
 class TDiTBackbone(nn.Module):
@@ -221,7 +244,13 @@ class TDiTBackbone(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.output_projection = nn.Linear(hidden_dim, latent_dim * patch_size)
 
-    def forward(self, latent_tokens: Tensor, timesteps: Tensor, labels: Tensor) -> Tensor:
+    def forward(
+        self,
+        latent_tokens: Tensor,
+        timesteps: Tensor,
+        labels: Tensor,
+        valid_mask: Tensor | None = None,
+    ) -> Tensor:
         if latent_tokens.ndim != 3 or latent_tokens.shape[-1] != self.latent_dim:
             raise ValueError(
                 "TDiTBackbone expects latent tokens shaped (batch, sequence, latent_dim); "
@@ -233,11 +262,25 @@ class TDiTBackbone(nn.Module):
         if len(timesteps) != batch_size or len(labels) != batch_size:
             raise ValueError("latent tokens, timesteps, and labels must have matching batch sizes")
 
+        if valid_mask is not None:
+            if valid_mask.shape != (batch_size, sequence_length):
+                raise ValueError(
+                    f"TDiT valid_mask must be {(batch_size, sequence_length)}, "
+                    f"got {tuple(valid_mask.shape)}"
+                )
+            valid_mask = valid_mask.to(device=latent_tokens.device, dtype=torch.bool)
+            latent_tokens = latent_tokens * valid_mask.unsqueeze(-1).to(latent_tokens.dtype)
+
         pad_length = (-sequence_length) % self.patch_size
         if pad_length:
             latent_tokens = F.pad(latent_tokens, (0, 0, 0, pad_length))
+            if valid_mask is not None:
+                valid_mask = F.pad(valid_mask, (0, pad_length), value=False)
         padded_length = latent_tokens.shape[1]
         token_count = padded_length // self.patch_size
+        patch_valid_mask = (
+            None if valid_mask is None else valid_mask.reshape(batch_size, token_count, self.patch_size).any(dim=-1)
+        )
         patch_tokens = latent_tokens.reshape(
             batch_size, token_count, self.patch_size * self.latent_dim
         )
@@ -251,13 +294,18 @@ class TDiTBackbone(nn.Module):
         )
         condition = time_embedding + self.class_embedding(labels.long())
 
+        if patch_valid_mask is not None:
+            hidden = hidden * patch_valid_mask.unsqueeze(-1).to(hidden.dtype)
         for block in self.blocks:
-            hidden = block(hidden, condition)
+            hidden = block(hidden, condition, valid_mask=patch_valid_mask)
 
         output = self.output_projection(self.final_norm(hidden))
         output = output.reshape(batch_size, token_count, self.patch_size, self.latent_dim)
         output = output.reshape(batch_size, padded_length, self.latent_dim)
-        return output[:, :sequence_length]
+        output = output[:, :sequence_length]
+        if valid_mask is not None:
+            output = output * valid_mask[:, :sequence_length].unsqueeze(-1).to(output.dtype)
+        return output
 
 
 class TrafficVAE(nn.Module):
@@ -330,7 +378,7 @@ class TrafficVAE(nn.Module):
         return reconstruction, mean, log_variance, latent
 
 
-class _NormalizedArrayDataset(Dataset[tuple[Tensor, Tensor]]):
+class _NormalizedArrayDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     """Normalize raw samples lazily, avoiding a second full-corpus feature matrix."""
 
     def __init__(
@@ -340,23 +388,77 @@ class _NormalizedArrayDataset(Dataset[tuple[Tensor, Tensor]]):
         indices: np.ndarray,
         mean: np.ndarray,
         std: np.ndarray,
+        valid_mask: np.ndarray | None = None,
     ) -> None:
         self.features = features
         self.labels = labels
         self.indices = np.asarray(indices, dtype=np.int64)
         self.mean = mean.astype(np.float32, copy=False)
         self.std = np.clip(std.astype(np.float32, copy=False), 1e-12, None)
+        self.valid_mask = None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
 
     def __len__(self) -> int:
         return int(len(self.indices))
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
         sample_index = int(self.indices[index])
         raw_sample = np.asarray(self.features[sample_index], dtype=np.float32)
         normalized = (raw_sample - self.mean) / self.std
         features = torch.as_tensor(np.asarray(normalized, dtype=np.float32))
         label = torch.tensor(int(self.labels[sample_index]), dtype=torch.long)
-        return features, label
+        if self.valid_mask is None:
+            packet_mask = torch.ones(features.shape[-2] if features.ndim == 3 else 1, dtype=torch.bool)
+        else:
+            packet_mask = torch.as_tensor(self.valid_mask[sample_index], dtype=torch.bool)
+        return features, label, packet_mask
+
+
+def _expanded_valid_mask(valid_mask: Tensor, reference: Tensor) -> Tensor:
+    """Expand a (B,T) packet mask to a tensor used by a TDTCE loss."""
+    if valid_mask.ndim != 2 or valid_mask.shape[0] != reference.shape[0]:
+        raise ValueError("valid_mask must have shape (batch, sequence_length)")
+    if reference.ndim == 3:
+        if reference.shape[1] == 1 and valid_mask.shape[1] != 1:
+            return valid_mask.any(dim=1).view(-1, 1, 1).expand_as(reference)
+        if reference.shape[1] != valid_mask.shape[1]:
+            raise ValueError("valid_mask sequence length does not match tensor")
+        return valid_mask.unsqueeze(-1).expand_as(reference)
+    if reference.ndim == 2:
+        if reference.shape[1] % valid_mask.shape[1]:
+            raise ValueError("Flattened tensor width is not divisible by valid_mask sequence length")
+        return valid_mask.repeat_interleave(reference.shape[1] // valid_mask.shape[1], dim=1)
+    raise ValueError(f"Unsupported loss tensor rank {reference.ndim}")
+
+
+def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
+    try:
+        expanded = mask.to(dtype=values.dtype).expand_as(values)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Mask shape {tuple(mask.shape)} cannot broadcast to loss shape {tuple(values.shape)}"
+        ) from exc
+    return (values * expanded).sum() / expanded.sum().clamp_min(1.0)
+
+
+def _canonical_feature_names(names: Any) -> tuple[str, ...]:
+    return tuple(str(name).upper() for name in names)
+
+
+def _validate_immutable_features(
+    feature_names: tuple[str, ...],
+    immutable_features: tuple[str, ...],
+) -> tuple[str, ...]:
+    canonical_names = _canonical_feature_names(feature_names)
+    canonical_immutable = _canonical_feature_names(immutable_features)
+    if len(set(canonical_names)) != len(canonical_names):
+        raise ValueError("TDTCE feature_names must not contain duplicates")
+    unknown = sorted(set(canonical_immutable).difference(canonical_names))
+    if unknown:
+        raise ValueError(
+            f"Unknown TDTCE immutable feature name(s): {unknown}; "
+            f"available: {canonical_names}"
+        )
+    return canonical_immutable
 
 
 def _estimate_benign_mahalanobis(
@@ -364,6 +466,7 @@ def _estimate_benign_mahalanobis(
     benign_indices: np.ndarray,
     mean: np.ndarray,
     std: np.ndarray,
+    valid_mask: np.ndarray | None = None,
     *,
     batch_size: int,
     full_covariance_max_dim: int,
@@ -381,28 +484,74 @@ def _estimate_benign_mahalanobis(
         raise ValueError("Invalid Mahalanobis estimation parameters")
 
     dimension = int(np.prod(raw_features.shape[1:]))
+    if valid_mask is not None:
+        mask = np.asarray(valid_mask, dtype=bool)
+        if raw_features.ndim == 2:
+            if mask.shape[0] != raw_features.shape[0] or mask.shape[1] < 1:
+                raise ValueError("valid_mask has an incompatible sample or sequence dimension")
+            if dimension % mask.shape[1]:
+                raise ValueError(
+                    "Flattened feature width must be divisible by valid_mask sequence length"
+                )
+            # Repeats each packet-validity bit across that packet's F features.
+            coordinate_mask = np.repeat(mask, dimension // mask.shape[1], axis=1)
+        elif mask.shape != raw_features.shape[:2]:
+            raise ValueError(
+                "valid_mask must have shape (sample_count, sequence_length) "
+                "for sequence Mahalanobis estimation"
+            )
+        else:
+            feature_count = raw_features.shape[-1]
+            coordinate_mask = np.repeat(mask, feature_count, axis=1)
+    else:
+        coordinate_mask = None
     use_full = dimension <= full_covariance_max_dim
     sum_x = np.zeros(dimension, dtype=np.float64)
     sum_x2 = np.zeros(dimension, dtype=np.float64)
+    coordinate_counts = np.zeros(dimension, dtype=np.float64)
     sum_outer = np.zeros((dimension, dimension), dtype=np.float64) if use_full else None
+    pair_counts = np.zeros((dimension, dimension), dtype=np.float64) if use_full else None
+    pair_sum = np.zeros((dimension, dimension), dtype=np.float64) if use_full else None
     count = 0
 
     for start in range(0, len(benign_indices), batch_size):
         idx = benign_indices[start : start + batch_size]
         normalized = (np.asarray(raw_features[idx], dtype=np.float32) - mean) / std
         flattened = normalized.reshape(len(idx), dimension).astype(np.float64, copy=False)
-        sum_x += flattened.sum(axis=0)
-        sum_x2 += np.square(flattened).sum(axis=0)
+        batch_coordinate_mask = (
+            np.ones_like(flattened, dtype=np.float64)
+            if coordinate_mask is None
+            else coordinate_mask[idx].astype(np.float64, copy=False)
+        )
+        masked_flattened = flattened * batch_coordinate_mask
+        sum_x += masked_flattened.sum(axis=0)
+        sum_x2 += np.square(masked_flattened).sum(axis=0)
+        coordinate_counts += batch_coordinate_mask.sum(axis=0)
         if sum_outer is not None:
-            sum_outer += flattened.T @ flattened
+            sum_outer += masked_flattened.T @ masked_flattened
+            assert pair_counts is not None
+            pair_counts += batch_coordinate_mask.T @ batch_coordinate_mask
+            assert pair_sum is not None
+            pair_sum += masked_flattened.T @ batch_coordinate_mask
         count += len(flattened)
 
-    benign_mean = sum_x / max(count, 1)
-    denominator = max(count - 1, 1)
-    variances = np.maximum((sum_x2 - (sum_x * sum_x) / max(count, 1)) / denominator, ridge)
+    safe_coordinate_counts = np.maximum(coordinate_counts, 1.0)
+    benign_mean = sum_x / safe_coordinate_counts
+    variances = np.maximum(
+        (sum_x2 - (sum_x * sum_x) / safe_coordinate_counts)
+        / np.maximum(coordinate_counts - 1.0, 1.0),
+        ridge,
+    )
 
     if sum_outer is not None:
-        covariance = (sum_outer - np.outer(sum_x, sum_x) / max(count, 1)) / denominator
+        assert pair_counts is not None
+        assert pair_sum is not None
+        safe_pair_counts = np.maximum(pair_counts, 1.0)
+        covariance = (
+            sum_outer
+            - ((pair_sum * pair_sum.T) / safe_pair_counts)
+        ) / np.maximum(pair_counts - 1.0, 1.0)
+        covariance[pair_counts < 2.0] = 0.0
         covariance.flat[:: dimension + 1] += ridge
         covariance_inverse = np.linalg.pinv(covariance, hermitian=True)
         if not np.all(np.isfinite(covariance_inverse)):
@@ -564,15 +713,23 @@ def _mahalanobis_loss(
     benign_mean: Tensor,
     covariance_inverse: Tensor,
     covariance_mode: str,
+    valid_mask: Tensor | None = None,
 ) -> Tensor:
     flattened = features.reshape(features.shape[0], -1)
     difference = flattened - benign_mean.reshape(1, -1)
     if covariance_mode == "full":
         transformed = difference @ covariance_inverse
-        distances = (transformed * difference).sum(dim=-1)
+        contributions = transformed * difference
     else:
-        distances = (difference.square() * covariance_inverse.reshape(1, -1)).sum(dim=-1)
-    return distances.mean()
+        contributions = difference.square() * covariance_inverse.reshape(1, -1)
+    if valid_mask is not None:
+        if flattened.shape[1] % valid_mask.shape[1]:
+            raise ValueError("Flattened Mahalanobis features are incompatible with valid_mask")
+        feature_width = flattened.shape[1] // valid_mask.shape[1]
+        contribution_mask = valid_mask.repeat_interleave(feature_width, dim=1)
+        contributions = contributions * contribution_mask.to(dtype=contributions.dtype)
+        return contributions.sum() / contribution_mask.sum().clamp_min(1.0)
+    return contributions.sum(dim=-1).mean()
 
 
 @dataclass
@@ -645,6 +802,7 @@ class TDTCEAttack(FeatureSpaceAttack):
             raise ValueError("gradient_clip_norm must be positive")
         if self.latent_dim is None:
             self.latent_dim = max(8, self.hidden_dim // 2)
+        self.immutable_features = tuple(str(name).upper() for name in self.immutable_features)
 
     @staticmethod
     def _diffusion_schedule(
@@ -685,7 +843,8 @@ class TDTCEAttack(FeatureSpaceAttack):
                 "epsilon", "timesteps", "hidden_dim", "num_blocks", "patch_size",
                 "adaln_mode", "learning_rate", "epochs", "batch_size", "latent_dim",
                 "num_heads", "attention_window", "dropout", "weight_rec", "weight_kl",
-                "weight_adv", "weight_pre", "weight_mahal", "targeted", "target_label",
+                "weight_adv", "weight_pre", "weight_mahal",                 "targeted", "target_label",
+                "immutable_features",
                 "mahalanobis_full_cov_max_dim", "mahalanobis_ridge", "gradient_clip_norm",
             )
             if name in attack_cfg
@@ -709,10 +868,19 @@ class TDTCEAttack(FeatureSpaceAttack):
             )
 
         feature_names = tuple(str(name) for name in getattr(dataset, "feature_names", ()))
+        canonical_feature_names = _canonical_feature_names(feature_names)
+        immutable_features = _validate_immutable_features(
+            canonical_feature_names,
+            settings.immutable_features,
+        )
         checkpoint_feature_names = tuple(
             str(name) for name in classifier_checkpoint.get("feature_names", feature_names)
         )
-        if feature_names and checkpoint_feature_names and feature_names != checkpoint_feature_names:
+        if (
+            canonical_feature_names
+            and checkpoint_feature_names
+            and canonical_feature_names != _canonical_feature_names(checkpoint_feature_names)
+        ):
             raise ValueError(
                 "TDTCE dataset feature names do not match the classifier checkpoint: "
                 f"{feature_names} != {checkpoint_feature_names}"
@@ -747,17 +915,65 @@ class TDTCEAttack(FeatureSpaceAttack):
                 "TDTCE adversarial training requires at least one non-target sample in the training split"
             )
 
+        dataset_valid_mask = getattr(dataset, "valid_mask", None)
+        if dataset_valid_mask is None and raw_features.ndim == 3:
+            raise ValueError("TDTCE sequence training requires the dataset valid_mask")
+        valid_mask = np.asarray(dataset_valid_mask, dtype=bool) if dataset_valid_mask is not None else None
+        if valid_mask is None:
+            valid_mask = np.ones((len(raw_features), 1), dtype=bool)
+        elif valid_mask.ndim != 2 or valid_mask.shape[0] != len(raw_features):
+            raise ValueError("Dataset valid_mask must have shape (sample_count, sequence_length)")
+
         benign_mean_np, covariance_inverse_np, covariance_mode = _estimate_benign_mahalanobis(
             raw_features,
             benign_indices,
             mean,
             std,
+            valid_mask=valid_mask,
             batch_size=settings.batch_size,
             full_covariance_max_dim=settings.mahalanobis_full_cov_max_dim,
             ridge=settings.mahalanobis_ridge,
         )
+        # ``feature_names`` is the canonical per-packet schema for sequence datasets.
+        # Keep the classifier's externally visible shape unchanged; only generator
+        # components see the restored (B,T,F) representation.
+        feature_count = len(canonical_feature_names) if canonical_feature_names else int(raw_features.shape[-1])
+        is_flattened_sequence = (
+            raw_features.ndim == 2
+            and feature_count > 0
+            and raw_features.shape[-1] > feature_count
+            and raw_features.shape[-1] % feature_count == 0
+        )
+        if is_flattened_sequence:
+            feature_dim = feature_count
+            sequence_length = int(raw_features.shape[-1] // feature_count)
+            if valid_mask.shape[1] != sequence_length:
+                raise ValueError(
+                    "Flattened sequence width and dataset valid_mask disagree: "
+                    f"width={raw_features.shape[-1]}, per_packet_features={feature_count}, "
+                    f"inferred_T={sequence_length}, valid_mask_T={valid_mask.shape[1]}"
+                )
+        elif raw_features.ndim == 3:
+            feature_dim = int(raw_features.shape[-1])
+            sequence_length = int(raw_features.shape[1])
+            if feature_count and feature_count != feature_dim:
+                raise ValueError(
+                    f"Per-packet feature_names has {feature_count} names but tensor has {feature_dim} features"
+                )
+            if valid_mask.shape[1] != sequence_length:
+                raise ValueError("3-D sequence length and dataset valid_mask disagree")
+        else:
+            feature_dim = int(raw_features.shape[-1])
+            sequence_length = 1
+            if feature_count and feature_count != feature_dim:
+                raise ValueError(
+                    f"Tabular feature_names has {feature_count} names but tensor width is {feature_dim}"
+                )
+            if valid_mask.shape[1] != 1:
+                raise ValueError("Tabular input requires a single-token valid_mask")
+
         training_dataset = _NormalizedArrayDataset(
-            raw_features, labels, train_indices, mean, std
+            raw_features, labels, train_indices, mean, std, valid_mask
         )
         loader_generator = torch.Generator().manual_seed(int(seed))
         data_loader = DataLoader(
@@ -770,7 +986,6 @@ class TDTCEAttack(FeatureSpaceAttack):
             drop_last=False,
         )
 
-        feature_dim = int(raw_features.shape[-1])
         latent_dim = int(settings.latent_dim or max(8, settings.hidden_dim // 2))
         vae = TrafficVAE(feature_dim, latent_dim, settings.hidden_dim).to(device)
         tdit = TDiTBackbone(
@@ -798,8 +1013,10 @@ class TDTCEAttack(FeatureSpaceAttack):
         if logger:
             logger.info(
                 "tdtce.train.start seed=%d samples=%d train_samples=%d input_shape=%s "
-                "latent_dim=%d timesteps=%d batch_size=%d covariance=%s device=%s surrogate=%s",
+                "latent_dim=%d feature_dim=%d sequence_length=%d flattened_sequence=%s "
+                "timesteps=%d batch_size=%d covariance=%s device=%s surrogate=%s",
                 seed, len(labels), len(train_indices), input_shape, latent_dim,
+                feature_dim, sequence_length, is_flattened_sequence,
                 settings.timesteps, settings.batch_size, covariance_mode, device,
                 classifier_cfg.get("name", classifier_checkpoint.get("model_name", "unknown")),
             )
@@ -820,48 +1037,97 @@ class TDTCEAttack(FeatureSpaceAttack):
                 "mahal": 0.0,
             }
             samples_seen = 0
-            for x_batch, y_batch in data_loader:
+            for x_batch, y_batch, valid_mask_batch in data_loader:
                 x_batch = x_batch.to(device, dtype=torch.float32, non_blocking=True)
                 y_batch = y_batch.to(device, dtype=torch.long, non_blocking=True)
+                valid_mask_batch = valid_mask_batch.to(device, dtype=torch.bool, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
 
-                reconstruction, latent_mean, latent_log_variance, latent = vae(x_batch)
+                x_batch_generator = (
+                    x_batch.reshape(len(x_batch), sequence_length, feature_dim)
+                    if is_flattened_sequence
+                    else x_batch
+                )
+                token_valid_mask = valid_mask_batch
+                reconstruction, latent_mean, latent_log_variance, latent = vae(x_batch_generator)
+                token_mask_3d = token_valid_mask.unsqueeze(-1).to(latent.dtype)
+                # Remove padded tokens before they can enter the diffusion attention blocks.
+                latent = latent * token_mask_3d
                 sampled_timesteps = torch.randint(
                     1, settings.timesteps + 1, (len(x_batch),), device=device
                 )
-                noise = torch.randn_like(latent)
+                noise = torch.randn_like(latent) * token_mask_3d
                 alpha_bar_t = alpha_bars[sampled_timesteps - 1].reshape(-1, 1, 1)
                 noisy_latent = (
                     torch.sqrt(alpha_bar_t) * latent
                     + torch.sqrt(1.0 - alpha_bar_t) * noise
+                ) * token_mask_3d
+                predicted_noise = tdit(
+                    noisy_latent, sampled_timesteps, y_batch, valid_mask=token_valid_mask
                 )
-                predicted_noise = tdit(noisy_latent, sampled_timesteps, y_batch)
                 estimated_clean_latent = (
                     noisy_latent - torch.sqrt(1.0 - alpha_bar_t) * predicted_noise
                 ) / torch.sqrt(alpha_bar_t).clamp_min(1e-5)
-                generated = vae.decode(estimated_clean_latent, output_ndim=x_batch.ndim)
+                estimated_clean_latent = estimated_clean_latent * token_mask_3d
+                generated_generator = vae.decode(
+                    estimated_clean_latent, output_ndim=x_batch_generator.ndim
+                )
 
-                reconstruction_loss = F.mse_loss(reconstruction, x_batch)
-                kl_loss = -0.5 * (
+                reconstruction_mask = _expanded_valid_mask(token_valid_mask, reconstruction)
+                reconstruction_loss = _masked_mean(
+                    F.mse_loss(reconstruction, x_batch_generator, reduction="none"),
+                    reconstruction_mask,
+                )
+                kl_error = -0.5 * (
                     1.0 + latent_log_variance
                     - latent_mean.square()
                     - latent_log_variance.exp()
-                ).mean()
-                noise_loss = F.mse_loss(predicted_noise, noise)
+                )
+                kl_loss = _masked_mean(
+                    kl_error,
+                    _expanded_valid_mask(token_valid_mask, latent_log_variance),
+                )
+                noise_loss = _masked_mean(
+                    F.mse_loss(predicted_noise, noise, reduction="none"),
+                    _expanded_valid_mask(token_valid_mask, predicted_noise),
+                )
+
+                generated_generator = torch.where(
+                    reconstruction_mask.bool(), generated_generator, x_batch_generator
+                )
+                if immutable_features:
+                    generated_generator = torch.where(
+                        immutable_feature_mask(
+                            x_batch_generator,
+                            canonical_feature_names,
+                            immutable_features,
+                        ).bool(),
+                        x_batch_generator,
+                        generated_generator,
+                    )
+                generated_for_classifier = (
+                    generated_generator.reshape(len(x_batch), -1)
+                    if is_flattened_sequence
+                    else generated_generator
+                )
 
                 malicious_mask = y_batch != target_label
                 if bool(malicious_mask.any()):
-                    surrogate_logits = surrogate.model(generated[malicious_mask])
+                    surrogate_logits = surrogate.model(generated_for_classifier[malicious_mask])
                     adversarial_loss = _forward_targeted_loss(
                         surrogate_logits,
                         y_batch[malicious_mask],
                         target_label,
                     )
                 else:
-                    adversarial_loss = generated.sum() * 0.0
+                    adversarial_loss = generated_for_classifier.sum() * 0.0
 
                 mahalanobis_loss = _mahalanobis_loss(
-                    generated, benign_mean, covariance_inverse, covariance_mode
+                    generated_for_classifier,
+                    benign_mean,
+                    covariance_inverse,
+                    covariance_mode,
+                    valid_mask=valid_mask_batch,
                 )
                 total_loss = (
                     settings.weight_rec * reconstruction_loss
@@ -890,10 +1156,11 @@ class TDTCEAttack(FeatureSpaceAttack):
                 epoch_totals["mahal"] += float(mahalanobis_loss.detach()) * batch_n
                 samples_seen += batch_n
                 del (
-                    x_batch, y_batch, reconstruction, latent_mean, latent_log_variance,
-                    latent, noise, noisy_latent, predicted_noise, estimated_clean_latent,
-                    generated, reconstruction_loss, kl_loss, noise_loss, adversarial_loss,
-                    mahalanobis_loss, total_loss,
+                    x_batch, x_batch_generator, y_batch, reconstruction, latent_mean,
+                    latent_log_variance, latent, token_mask_3d,
+                    noise, noisy_latent, predicted_noise, estimated_clean_latent,
+                    generated_generator, generated_for_classifier, reconstruction_loss,
+                    kl_loss, noise_loss, adversarial_loss, mahalanobis_loss, total_loss,
                 )
 
             if samples_seen == 0:
@@ -922,6 +1189,10 @@ class TDTCEAttack(FeatureSpaceAttack):
             "seed": int(seed),
             "input_shape": list(input_shape),
             "feature_names": list(feature_names),
+            "feature_dim": int(feature_dim),
+            "sequence_length": int(sequence_length),
+            "is_flattened_sequence": bool(is_flattened_sequence),
+            "immutable_features": list(immutable_features),
             "num_classes": classifier_num_classes,
             "target_label": target_label,
             "normalization_mean": mean.astype(np.float32),
@@ -957,6 +1228,7 @@ class TDTCEAttack(FeatureSpaceAttack):
                 "weight_pre": settings.weight_pre,
                 "weight_mahal": settings.weight_mahal,
                 "targeted": settings.targeted,
+                "immutable_features": list(immutable_features),
             },
             "last_epoch_metrics": dict(epoch_totals),
         }
@@ -1009,10 +1281,10 @@ class TDTCEAttack(FeatureSpaceAttack):
         if checkpoint.get("attack_name") != "tdtce":
             raise ValueError(f"Checkpoint {path} is not a TDTCE generator checkpoint")
         input_shape = tuple(int(value) for value in checkpoint.get("input_shape", ()))
-        feature_dim = int(checkpoint.get("model_config", {}).get("feature_dim", 0))
+        model_cfg = dict(checkpoint.get("model_config", {}))
+        feature_dim = int(checkpoint.get("feature_dim", model_cfg.get("feature_dim", 0)))
         if not input_shape or feature_dim < 1:
             raise ValueError(f"TDTCE checkpoint has invalid architecture metadata: {path}")
-        model_cfg = dict(checkpoint["model_config"])
         num_classes = int(checkpoint["num_classes"])
         vae = TrafficVAE(
             feature_dim=feature_dim,
@@ -1088,12 +1360,50 @@ class TDTCEAttack(FeatureSpaceAttack):
                 "TDTCE input shape differs from its trained checkpoint: "
                 f"runtime={tuple(x_array.shape[1:])}, trained={expected_shape}"
             )
-        checkpoint_names = tuple(str(name) for name in self._generator_checkpoint.get("feature_names", ()))
-        if self.feature_names and checkpoint_names and tuple(self.feature_names) != checkpoint_names:
+        checkpoint_names = tuple(
+            str(name) for name in self._generator_checkpoint.get("feature_names", ())
+        )
+        # Older checkpoints saved only the flattened width as VAE feature_dim.
+        # They cannot be safely reinterpreted as sequence-aware checkpoints.
+        if (
+            "is_flattened_sequence" not in self._generator_checkpoint
+            and len(expected_shape) == 1
+            and checkpoint_names
+            and expected_shape[0] > len(checkpoint_names)
+            and expected_shape[0] % len(checkpoint_names) == 0
+        ):
+            raise ValueError(
+                "This TDTCE checkpoint predates flattened-sequence metadata and may have "
+                "collapsed each sequence into one token. Retrain TDTCE with the corrected "
+                "implementation before evaluating flattened sequences."
+            )
+        runtime_names = _canonical_feature_names(self.feature_names)
+        canonical_checkpoint_names = _canonical_feature_names(checkpoint_names)
+        if runtime_names and canonical_checkpoint_names and runtime_names != canonical_checkpoint_names:
             raise ValueError(
                 "TDTCE feature schema differs from its checkpoint: "
                 f"runtime={tuple(self.feature_names)}, trained={checkpoint_names}"
             )
+        checkpoint_immutable_raw = self._generator_checkpoint.get("immutable_features")
+        if checkpoint_immutable_raw is None:
+            checkpoint_training = self._generator_checkpoint.get("training_config", {})
+            if isinstance(checkpoint_training, Mapping):
+                checkpoint_immutable_raw = checkpoint_training.get("immutable_features")
+        if checkpoint_immutable_raw is None and self.immutable_features:
+            raise ValueError(
+                "TDTCE checkpoint is missing immutable_features metadata required by "
+                "the configured attack"
+            )
+        if checkpoint_immutable_raw is not None:
+            checkpoint_immutable = _validate_immutable_features(
+                canonical_checkpoint_names or runtime_names,
+                _canonical_feature_names(checkpoint_immutable_raw),
+            )
+            if checkpoint_immutable != _canonical_feature_names(self.immutable_features):
+                raise ValueError(
+                    "TDTCE immutable_features differ from the trained checkpoint: "
+                    f"runtime={tuple(self.immutable_features)}, trained={checkpoint_immutable}"
+                )
 
         configured_target = int(kwargs.get("target_label", self.target_label))
         num_classes = int(self._generator_checkpoint["num_classes"])
@@ -1106,6 +1416,43 @@ class TDTCEAttack(FeatureSpaceAttack):
 
         model_cfg = dict(self._generator_checkpoint["model_config"])
         timesteps = int(model_cfg["timesteps"])
+        feature_dim = int(self._generator_checkpoint.get("feature_dim", model_cfg.get("feature_dim", 0)))
+        is_flattened_sequence = bool(
+            self._generator_checkpoint.get("is_flattened_sequence", False)
+        )
+        sequence_length = int(
+            self._generator_checkpoint.get(
+                "sequence_length",
+                (expected_shape[0] // feature_dim)
+                if is_flattened_sequence and feature_dim > 0 and len(expected_shape) == 1
+                else (expected_shape[0] if len(expected_shape) == 2 else 1),
+            )
+        )
+        if feature_dim < 1 or sequence_length < 1:
+            raise ValueError("TDTCE checkpoint has invalid feature/sequence metadata")
+        if is_flattened_sequence:
+            if len(expected_shape) != 1 or expected_shape[0] != sequence_length * feature_dim:
+                raise ValueError("TDTCE flattened sequence metadata conflicts with input_shape")
+            if self.feature_names and len(self.feature_names) != feature_dim:
+                raise ValueError(
+                    "TDTCE flattened sequence feature_names must describe exactly one packet: "
+                    f"expected {feature_dim}, got {len(self.feature_names)}"
+                )
+        valid_mask_array = kwargs.get("valid_mask")
+        expected_packets = (
+            sequence_length if is_flattened_sequence
+            else (x_array.shape[1] if x_array.ndim == 3 else 1)
+        )
+        if valid_mask_array is None and (expected_packets > 1 or x_array.ndim == 3):
+            raise ValueError("TDTCE sequence generation requires valid_mask")
+        if valid_mask_array is None:
+            valid_mask_array = np.ones((len(x_array), expected_packets), dtype=bool)
+        valid_mask_array = np.asarray(valid_mask_array, dtype=bool)
+        if valid_mask_array.shape != (len(x_array), expected_packets):
+            raise ValueError(
+                f"valid_mask shape {valid_mask_array.shape} does not match "
+                f"expected {(len(x_array), expected_packets)}"
+            )
         torch_generator = torch.Generator(device=device)
         torch_generator.manual_seed(seed_value)
         adversarial = np.empty_like(x_array, dtype=np.float32)
@@ -1114,28 +1461,42 @@ class TDTCEAttack(FeatureSpaceAttack):
             stop = min(start + self.batch_size, len(x_array))
             x_batch = torch.as_tensor(x_array[start:stop], device=device, dtype=torch.float32)
             labels_batch = torch.as_tensor(y_array[start:stop], device=device, dtype=torch.long)
+            valid_batch = torch.as_tensor(
+                valid_mask_array[start:stop],
+                device=device,
+                dtype=torch.bool,
+            )
             condition_labels = (
                 torch.full_like(labels_batch, configured_target) if self.targeted else labels_batch
             )
+            x_batch_generator = (
+                x_batch.reshape(len(x_batch), sequence_length, feature_dim)
+                if is_flattened_sequence
+                else x_batch
+            )
+            token_mask_3d = valid_batch.unsqueeze(-1).to(dtype=x_batch.dtype)
             with torch.no_grad():
-                latent_mean, _ = self._vae.encode(x_batch)
+                latent_mean, _ = self._vae.encode(x_batch_generator)
+                latent_mean = latent_mean * token_mask_3d
                 initial_noise = torch.randn(
                     latent_mean.shape,
                     device=device,
                     dtype=latent_mean.dtype,
                     generator=torch_generator,
-                )
+                ) * token_mask_3d
                 alpha_bar_terminal = self._alpha_bars[-1]
                 latent = (
                     torch.sqrt(alpha_bar_terminal) * latent_mean
                     + torch.sqrt(1.0 - alpha_bar_terminal) * initial_noise
-                )
+                ) * token_mask_3d
 
                 for timestep in range(timesteps, 0, -1):
                     timestep_batch = torch.full(
                         (len(x_batch),), timestep, dtype=torch.long, device=device
                     )
-                    predicted_noise = self._tdiT(latent, timestep_batch, condition_labels)
+                    predicted_noise = self._tdiT(
+                        latent, timestep_batch, condition_labels, valid_mask=valid_batch
+                    )
                     beta_t = self._betas[timestep - 1]
                     alpha_t = self._alphas[timestep - 1]
                     alpha_bar_t = self._alpha_bars[timestep - 1]
@@ -1159,22 +1520,41 @@ class TDTCEAttack(FeatureSpaceAttack):
                         latent = reverse_mean + torch.sqrt(posterior_variance) * reverse_noise
                     else:
                         latent = reverse_mean
-                    latent = latent.detach()
+                    latent = (latent.detach()) * token_mask_3d
                     del predicted_noise, timestep_batch, reverse_mean
 
-                decoded = self._vae.decode(latent, output_ndim=x_batch.ndim)
-                # epsilon bounds the per-feature perturbation in the model's
-                # normalized feature space; downstream gatekeeper checks remain
-                # authoritative for physical feasibility.
-                decoded = torch.maximum(
-                    torch.minimum(decoded, x_batch + self.epsilon), x_batch - self.epsilon
+                decoded_generator = self._vae.decode(
+                    latent, output_ndim=x_batch_generator.ndim
                 )
-                adversarial[start:stop] = decoded.detach().cpu().numpy().astype(
+                # epsilon bounds the per-feature perturbation in normalized feature space.
+                decoded_generator = torch.maximum(
+                    torch.minimum(
+                        decoded_generator, x_batch_generator + self.epsilon
+                    ),
+                    x_batch_generator - self.epsilon,
+                )
+                protection_mask = ~_expanded_valid_mask(valid_batch, decoded_generator).bool()
+                if self.immutable_features:
+                    protection_mask |= immutable_feature_mask(
+                        x_batch_generator,
+                        self.feature_names,
+                        self.immutable_features,
+                    ).bool()
+                decoded_generator = torch.where(
+                    protection_mask, x_batch_generator, decoded_generator
+                )
+                decoded_output = (
+                    decoded_generator.reshape(len(x_batch), -1)
+                    if is_flattened_sequence
+                    else decoded_generator
+                )
+                adversarial[start:stop] = decoded_output.detach().cpu().numpy().astype(
                     np.float32, copy=False
                 )
                 del (
-                    x_batch, labels_batch, condition_labels, latent_mean,
-                    initial_noise, latent, decoded,
+                    x_batch, x_batch_generator, labels_batch, valid_batch, condition_labels,
+                    token_mask_3d, latent_mean, initial_noise, latent, decoded_generator,
+                    decoded_output,
                 )
 
         # Keep classifier inference bounded as well when generate() is called

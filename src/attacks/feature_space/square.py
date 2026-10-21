@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from core.registry import register_attack
+from ._linf_utils import immutable_feature_mask
 from attacks.base import AttackResult, FeatureSpaceAttack
 
 
@@ -26,6 +27,7 @@ class SquareAttack(FeatureSpaceAttack):
     targeted: bool = False
     target_label: int | None = None
     feature_names: tuple[str, ...] = ()
+    immutable_features: tuple[str, ...] = ()
 
     attack_name = "square"
     query_based = True
@@ -53,6 +55,11 @@ class SquareAttack(FeatureSpaceAttack):
             self.feature_names,
             normalization_mean=kwargs.get("normalization_mean"),
             normalization_std=kwargs.get("normalization_std"),
+        ).cpu().numpy()
+        perturbation_mask *= immutable_feature_mask(
+            torch.as_tensor(x0),
+            self.feature_names,
+            self.immutable_features,
         ).cpu().numpy()
         queries = np.zeros(n, dtype=np.int64)
         base_pred, base_prob = self._scores(adv)

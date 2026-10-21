@@ -73,10 +73,10 @@ class FeatureSpaceAttack(BaseAttack):
     objective first, then this optional adapter snaps selected physical fields
     to integer lattice points before the result reaches evaluation.
 
-    The projector is installed as a small finalization wrapper around concrete
-    subclasses' ``generate`` methods.  This centralizes the behavior so newly
-    registered feature-space attacks inherit it without embedding gatekeeper or
-    lattice logic in every optimizer implementation.  Problem-space attacks do
+    Finalization is installed as a small wrapper around concrete subclasses'
+    ``generate`` methods. This centralizes immutable-field and padding
+    restoration, followed by optional lattice projection, so newly registered
+    feature-space attacks inherit the safety policy. Problem-space attacks do
     not inherit this class and are unaffected.
     """
 
@@ -100,10 +100,17 @@ class FeatureSpaceAttack(BaseAttack):
             if not isinstance(result, AttackResult) or result.adversarial is None:
                 return result
 
+            original = args[0] if args else call_kwargs.get("x")
             names = tuple(
                 result.feature_names
                 or getattr(self, "feature_names", ())
                 or call_kwargs.get("feature_names", ())
+            )
+            result.adversarial = self._restore_protected_values(
+                result.adversarial,
+                original,
+                names,
+                valid_mask=call_kwargs.get("valid_mask"),
             )
             normalization_mean = call_kwargs.get("normalization_mean")
             normalization_std = call_kwargs.get("normalization_std")
@@ -112,6 +119,12 @@ class FeatureSpaceAttack(BaseAttack):
                 names,
                 normalization_mean=normalization_mean,
                 normalization_std=normalization_std,
+            )
+            result.adversarial = self._restore_protected_values(
+                result.adversarial,
+                original,
+                names,
+                valid_mask=call_kwargs.get("valid_mask"),
             )
             result.metadata.setdefault("discrete_projection_enabled", bool(self.discrete_projection))
             result.metadata.setdefault(
@@ -127,6 +140,87 @@ class FeatureSpaceAttack(BaseAttack):
 
         setattr(_generate_with_discrete_projection, "_discrete_projector_wrapped", True)
         setattr(cls, "generate", _generate_with_discrete_projection)
+
+    def _restore_protected_values(
+        self,
+        x_adv: np.ndarray | torch.Tensor,
+        x_orig: Any,
+        feature_names: Sequence[str],
+        *,
+        valid_mask: Any = None,
+    ) -> np.ndarray | torch.Tensor:
+        """Restore configured immutable fields and invalid sequence rows."""
+        if x_orig is None:
+            return x_adv
+        if isinstance(x_adv, torch.Tensor):
+            original = torch.as_tensor(x_orig, device=x_adv.device, dtype=x_adv.dtype)
+            if original.shape != x_adv.shape:
+                raise ValueError("Generated and original feature shapes must match")
+            protected = torch.zeros_like(x_adv, dtype=torch.bool)
+            names = tuple(str(name).upper() for name in feature_names)
+            immutable = {
+                str(name).upper() for name in getattr(self, "immutable_features", ())
+            }
+            unknown = sorted(immutable.difference(names))
+            if unknown:
+                raise ValueError(
+                    f"Unknown immutable feature name(s): {unknown}; available: {names}"
+                )
+            if immutable:
+                immutable_indices = [index for index, name in enumerate(names) if name in immutable]
+                if x_adv.ndim == 3:
+                    protected[..., immutable_indices] = True
+                elif x_adv.ndim == 2 and len(names) and x_adv.shape[-1] % len(names) == 0:
+                    for index in immutable_indices:
+                        protected[:, index::len(names)] = True
+            if valid_mask is not None:
+                mask = torch.as_tensor(valid_mask, device=x_adv.device, dtype=torch.bool)
+                if x_adv.ndim == 3 and tuple(mask.shape) == tuple(x_adv.shape[:2]):
+                    protected |= ~mask.unsqueeze(-1)
+                elif x_adv.ndim == 2 and len(names) and x_adv.shape[-1] % len(names) == 0:
+                    width = x_adv.shape[-1] // len(names)
+                    if tuple(mask.shape) != (x_adv.shape[0], width):
+                        raise ValueError("valid_mask shape does not match flattened feature shape")
+                    protected |= (~mask).repeat_interleave(len(names), dim=1)
+                else:
+                    raise ValueError("valid_mask shape does not match generated feature shape")
+            return torch.where(protected, original, x_adv)
+
+        adversarial = np.asarray(x_adv)
+        original_array = (
+            x_orig.detach().cpu().numpy()
+            if isinstance(x_orig, torch.Tensor)
+            else np.asarray(x_orig)
+        )
+        if adversarial.shape != original_array.shape:
+            raise ValueError("Generated and original feature shapes must match")
+        protected = np.zeros(adversarial.shape, dtype=bool)
+        names = tuple(str(name).upper() for name in feature_names)
+        immutable = {str(name).upper() for name in getattr(self, "immutable_features", ())}
+        unknown = sorted(immutable.difference(names))
+        if unknown:
+            raise ValueError(
+                f"Unknown immutable feature name(s): {unknown}; available: {names}"
+            )
+        if immutable:
+            immutable_indices = [index for index, name in enumerate(names) if name in immutable]
+            if adversarial.ndim == 3:
+                protected[..., immutable_indices] = True
+            elif adversarial.ndim == 2 and names and adversarial.shape[-1] % len(names) == 0:
+                for index in immutable_indices:
+                    protected[:, index::len(names)] = True
+        if valid_mask is not None:
+            mask_array = np.asarray(valid_mask, dtype=bool)
+            if adversarial.ndim == 3 and mask_array.shape == adversarial.shape[:2]:
+                protected |= ~mask_array[..., None]
+            elif adversarial.ndim == 2 and names and adversarial.shape[-1] % len(names) == 0:
+                packet_count = adversarial.shape[-1] // len(names)
+                if mask_array.shape != (adversarial.shape[0], packet_count):
+                    raise ValueError("valid_mask shape does not match flattened feature shape")
+                protected |= np.repeat(~mask_array, len(names), axis=1)
+            else:
+                raise ValueError("valid_mask shape does not match generated feature shape")
+        return np.where(protected, original_array, adversarial)
 
     def _require_model(self) -> ModelWrapper:
         if self.model is None:
@@ -158,12 +252,13 @@ class FeatureSpaceAttack(BaseAttack):
         is absent, the original batch is returned and the independent gatekeeper
         remains responsible for reporting non-integral features.
         """
-        if self.discrete_projection:
-            if normalization_mean is None or normalization_std is None:
-                raise ValueError(
-                    "discrete_projection=True requires normalization_mean and normalization_std "
-                    "to be provided to the generate() method."
-                )
+        if not self.discrete_projection:
+            return x_adv
+        if normalization_mean is None or normalization_std is None:
+            raise ValueError(
+                "discrete_projection=True requires normalization_mean and normalization_std "
+                "to be provided to the generate() method."
+            )
 
         names = tuple(str(name) for name in feature_names)
         if not names:
