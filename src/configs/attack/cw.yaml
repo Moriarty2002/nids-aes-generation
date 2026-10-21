@@ -11,5 +11,5 @@ abort_early: true
 abort_check_every: 3
 clip_min: null
 clip_max: null
-immutable_features: []
+immutable_features: ${dataset.immutable_features}
 variant: "steps${attack.max_steps}_bs${attack.binary_search_steps}_c${attack.initial_const}"

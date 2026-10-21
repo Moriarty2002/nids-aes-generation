@@ -4,5 +4,5 @@ targeted: false
 target_label: null
 clip_min: null
 clip_max: null
-immutable_features: []
+immutable_features: ${dataset.immutable_features}
 variant: "eps${attack.epsilon}"

@@ -6,5 +6,5 @@ overshoot: 0.02
 gradient_epsilon: 1.0e-12
 clip_min: null
 clip_max: null
-immutable_features: []
+immutable_features: ${dataset.immutable_features}
 variant: "steps${attack.max_steps}_over${attack.overshoot}"

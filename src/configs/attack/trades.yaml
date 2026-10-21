@@ -7,5 +7,5 @@ trades_beta: 6.0
 targeted: false
 target_label: null
 discrete_projection: false
-immutable_features: []
+immutable_features: ${dataset.immutable_features}
 variant: "eps${.epsilon}_steps${.steps}"

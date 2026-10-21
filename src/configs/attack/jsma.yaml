@@ -11,6 +11,6 @@ jacobian_batch_size: 4
 direction: auto
 clip_min: null
 clip_max: null
-immutable_features: []
+immutable_features: ${dataset.immutable_features}
 saliency_epsilon: 1.0e-12
 variant: "theta${attack.theta}_l0${attack.max_perturbation_ratio}"

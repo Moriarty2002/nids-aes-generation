@@ -1,4 +1,5 @@
 name: ciciomt2024
+immutable_features: [DIR, FLG]
 params:
   path: ${hydra:runtime.cwd}/data/ciciomt2024.parquet
   id_column: Index
