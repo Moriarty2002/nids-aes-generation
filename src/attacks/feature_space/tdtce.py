@@ -738,8 +738,7 @@ class TDTCEAttack(FeatureSpaceAttack):
     """Latent diffusion feature-space attack conditioned toward the benign class.
 
     The generator checkpoint is trained with ``action=train_attack`` and loaded
-    lazily during ``action=evaluate_attack``. No constraint gatekeeper is used
-    during generation; all realizability checks remain in EvaluationEngine.
+    lazily during ``action=evaluate_attack``.
     """
 
     attack_name: ClassVar[str] = "tdtce"

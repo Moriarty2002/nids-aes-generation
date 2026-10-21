@@ -65,27 +65,36 @@ class UniversalConstraintGatekeeper:
         x = self._to_numpy(samples).astype(np.float32, copy=False)
         if x.ndim not in {2, 3}:
             raise ValueError(f"Constraints require a 2-D or 3-D batch, received shape {x.shape}")
-        physical = x
-        original_physical = None
-        
+        original = None
         if original_samples is not None:
             original = self._to_numpy(original_samples).astype(np.float32, copy=False)
             if original.shape != x.shape:
                 raise ValueError("original_samples must have the same shape as samples")
-            original_physical = original
-            
+
         if self.normalization_mean is not None or self.normalization_std is not None:
             if self.normalization_mean is None or self.normalization_std is None:   
                 raise ValueError("normalization_mean and normalization_std must be configured together")
+            
             expected = x.shape[-1] if x.ndim == 3 else x.shape[1]
             if len(self.normalization_mean) != expected or len(self.normalization_std) != expected:
                 raise ValueError("Normalization statistics do not match sample dimensionality")
-            physical = x * self.normalization_std + self.normalization_mean
-            if original_physical is not None:
-                original_physical = (
-                    original_physical * self.normalization_std + self.normalization_mean
-                )
-                
+            
+            # 1. Allocate only one float64 matrix and denormalize in place to avoid unnecessary copies.
+            physical = np.array(x, dtype=np.float64, copy=True)
+            np.multiply(physical, self.normalization_std, out=physical)
+            np.add(physical, self.normalization_mean, out=physical)
+            
+            original_physical = None
+            if original is not None:
+                original_physical = np.array(original, dtype=np.float64, copy=True)
+                np.multiply(original_physical, self.normalization_std, out=original_physical)
+                np.add(original_physical, self.normalization_mean, out=original_physical)
+        else:
+            # If no stats are provided, safely cast to float64 anyway so downstream 
+            # discrete rule checks don't trip over incoming float32 representation drift.
+            physical = np.array(x, dtype=np.float64, copy=True)
+            original_physical = None if original is None else np.array(original, dtype=np.float64, copy=True)
+            
         rule_features = physical
         original_rule_features = original_physical
         rule_mask = None if valid_mask is None else self._to_numpy(valid_mask)
