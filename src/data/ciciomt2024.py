@@ -140,12 +140,12 @@ class SequenceParquetDataset(BaseDataset):
                 )
             features = self._canonical
             if self.include_padding_indicator:
-                pad_channel = 1.0 - self.valid_mask.astype(np.float32)[..., None]
+                pad_channel = 1.0 - self.valid_mask.astype(np.float64)[..., None]
                 features = np.concatenate([features, pad_channel], axis=-1)
             if self.flatten:
-                self._raw_cache = features.reshape(features.shape[0], -1).astype(np.float32, copy=False)
+                self._raw_cache = features.reshape(features.shape[0], -1).astype(np.float64, copy=False)
             else:
-                self._raw_cache = features.astype(np.float32, copy=False)
+                self._raw_cache = features.astype(np.float64, copy=False)
         return self._raw_cache, self._labels.copy()
 
     def release_raw_features(self) -> None:

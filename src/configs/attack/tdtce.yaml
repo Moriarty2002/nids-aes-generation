@@ -20,6 +20,7 @@ weight_mahal: 0.1
 targeted: true
 target_label: 0
 discrete_projection: true
+clip_ranges: ${dataset.clip_ranges} # set to null to disable clipping
 immutable_features: ${dataset.immutable_features}
 mahalanobis_full_cov_max_dim: 512
 mahalanobis_ridge: 1e-3

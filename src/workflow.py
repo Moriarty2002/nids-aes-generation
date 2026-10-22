@@ -391,6 +391,7 @@ def _run_empirical_at(
     seed: int,
     checkpoint_dir: Path,
     logger: logging.Logger | None,
+    x_physical: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """Train a differentiable surrogate and generate gatekeeper-filtered EAT samples.
 
@@ -572,12 +573,14 @@ def _run_empirical_at(
     for b_start in range(0, len(selected_idx), attack_batch_size):
         batch_indices = selected_idx[b_start : b_start + attack_batch_size]
         x_clean = x_tensor[batch_indices].detach().cpu().numpy().astype(np.float32, copy=False)
+        x_clean_phys = x_physical[batch_indices]
         y_clean = y_np[batch_indices].astype(np.int64, copy=False)
         batch_kwargs: dict[str, Any] = {
             "seed": int(seed + b_start),
             "target_label": benign_label,
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
+            "_clean_authoritative_physical": x_clean_phys,
         }
         batch_valid_mask = None
         if valid_mask_full is not None:
@@ -599,7 +602,8 @@ def _run_empirical_at(
             x_adv,
             feature_names,
             valid_mask=batch_valid_mask,
-            original_samples=x_clean,
+            authoritative_physical=result.authoritative_physical,   # From AttackResult
+            original_physical=x_clean_phys,                         # Pristine baseline
         )
         accepted = np.asarray(gate.accepted, dtype=bool).copy()
         if result.intrinsic_feasible_mask is not None:
@@ -702,7 +706,7 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
     x_norm = normalization.normalize(x_raw).astype(np.float32)
     x_tensor = torch.as_tensor(x_norm, dtype=torch.float32)
     y_tensor = torch.as_tensor(y_np, dtype=torch.long)
-    del x_raw, x_norm
+    del x_norm
 
     model_cfg = dict(cfg["model"])
     classes = getattr(dataset, "classes", tuple(np.unique(y_np)))
@@ -824,7 +828,9 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
                 seed=seed,
                 checkpoint_dir=checkpoint_dir,
                 logger=logger,
+                x_physical=x_raw
             )
+            del x_raw
             augmented_train_x = np.vstack((clean_train_x, adversarial_x))
             augmented_train_y = np.concatenate((clean_train_y, adversarial_y), axis=0)
             eat_stats["eat_augmented_samples"] = float(len(adversarial_y))
@@ -843,7 +849,9 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
                     pin_memory=pin,
                 ),
             )
-
+        else:
+            del x_raw
+        
         estimator = wrapper.estimator
         if logger:
             logger.info(
@@ -1104,18 +1112,19 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
             seed, device_info.torch_device, cfg["dataset"]["name"], len(y_np),
             len(feature_names), cfg["attack"]["name"], cfg["model"]["name"], max_samples or "all",
         )
-
+    
+    # keep x_raw for floating drift checks, but the target model will receive a normalized copy
+    clean_physical = x_raw
     # -------------------- target model --------------------
     target_cfg = dict(cfg["model"])
     target_ckpt = _checkpoint_path(target_cfg, seed, role="model")
     target_meta = _load_checkpoint_metadata(target_ckpt)
     target_norm = _normalization_from_checkpoint(target_meta, feature_names, role="target model")
     x_target = target_norm.normalize(x_raw).astype(np.float32, copy=False)
-    # The target-normalized copy is now the evaluation input. Drop both the local
-    # raw reference and the dataset plugin's canonical/raw cache before loading
+    # The target-normalized copy is now the evaluation input.
+    # Drop the dataset plugin's canonical/raw cache before loading
     # the surrogate or starting the attack. Sequence datasets implement this
     # release hook; other dataset plugins may simply be garbage-collected here.
-    del x_raw
     release_raw_features = getattr(dataset, "release_raw_features", None)
     if callable(release_raw_features):
         release_raw_features()
@@ -1319,6 +1328,7 @@ def evaluate_attack_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logg
         attack_input_is_target_normalized=(
             attack_input_is_target_normalized and not issubclass(attack_cls, ProblemSpaceAttack)
         ),
+        clean_physical=clean_physical,
         raw_traffic=raw_traffic,
         valid_mask=valid_mask,
         attack_kwargs={"seed": int(seed)},

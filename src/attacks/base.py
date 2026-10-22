@@ -14,16 +14,17 @@ from models.wrapper import ModelWrapper
 @dataclass
 class AttackResult:
     """Common container separating generated data from attack telemetry."""
-    adversarial: Any
+    adversarial: np.ndarray | torch.Tensor | None
     success_mask: np.ndarray | torch.Tensor | None = None
     queries: np.ndarray | None = None
     intrinsic_feasible_mask: np.ndarray | None = None
     raw_adversarial: Any | None = None
     feature_names: tuple[str, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    authoritative_physical: np.ndarray | torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        for field_name in ("adversarial", "raw_adversarial", "success_mask"):
+        for field_name in ("adversarial", "raw_adversarial", "success_mask", "authoritative_physical"):
             value = getattr(self, field_name)
             if isinstance(value, torch.Tensor):
                 setattr(self, field_name, value.detach())
@@ -81,6 +82,7 @@ class FeatureSpaceAttack(BaseAttack):
     """
 
     discrete_projection: bool = False
+    clip_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     feature_names: tuple[str, ...] = ()
     immutable_features: tuple[str, ...] = ()
     model: ModelWrapper | None = field(default=None, init=False, repr=False, compare=False)
@@ -96,46 +98,64 @@ class FeatureSpaceAttack(BaseAttack):
         def _generate_with_discrete_projection(
             self: "FeatureSpaceAttack", *args: Any, **call_kwargs: Any
         ) -> AttackResult:
+            # Engine supplies the unquantized physical baseline. Never forward
+            # this internal argument to concrete PGD/gradient-attack methods.
+            clean_authoritative = call_kwargs.pop("_clean_authoritative_physical", None)
             result = implementation(self, *args, **call_kwargs)
             if not isinstance(result, AttackResult) or result.adversarial is None:
                 return result
 
             original = args[0] if args else call_kwargs.get("x")
-            names = tuple(
-                result.feature_names
-                or getattr(self, "feature_names", ())
-                or call_kwargs.get("feature_names", ())
-            )
-            result.adversarial = self._restore_protected_values(
-                result.adversarial,
-                original,
-                names,
+            names = tuple(result.feature_names or self.feature_names or call_kwargs.get("feature_names", ()))
+            mean = call_kwargs.get("normalization_mean")
+            std = call_kwargs.get("normalization_std")
+            if mean is None or std is None:
+                raise ValueError("Dual-representation feature attacks require normalization statistics")
+            if original is None:
+                raise ValueError("Dual-representation feature attacks require a clean input")
+            source = result.adversarial
+            if source.dtype != (torch.float32 if isinstance(source, torch.Tensor) else np.float32):
+                raise TypeError("Feature attack must generate normalized float32 samples")
+            if tuple(source.shape) != tuple(original.shape):
+                raise ValueError("Attack and baseline shapes differ")
+
+            # Exactly one float64 candidate workspace. The separate clean
+            # physical reference is necessary for faithful victim restoration.
+            if clean_authoritative is None:
+                raise ValueError(
+                    "Authoritative clean physical baseline is required; "
+                    "normalized float32 values cannot recover exact physical truth"
+                )
+            physical = decode_physical64(source, names, mean, std)
+            if isinstance(physical, torch.Tensor):
+                clean_physical = torch.as_tensor(
+                    clean_authoritative, dtype=torch.float64, device=physical.device
+                )
+            else:
+                clean_physical = np.asarray(clean_authoritative, dtype=np.float64)
+            result.metadata["clean_baseline_provenance"] = "pre_normalization_physical"
+            if clean_physical.shape != physical.shape:
+                raise ValueError("Clean authoritative physical shape differs from attack shape")
+
+            # All post-generation operations are in-place in native physical
+            # space. Protected values are restored LAST so clipping and lattice
+            # projection cannot touch victim packets or immutable fields.
+            self._apply_range_clipping(physical, names, clip_ranges=self.clip_ranges)
+            self._apply_discrete_lattice_projection(physical, names)
+            self._restore_protected_values(
+                physical, clean_physical, names,
                 valid_mask=call_kwargs.get("valid_mask"),
             )
-            normalization_mean = call_kwargs.get("normalization_mean")
-            normalization_std = call_kwargs.get("normalization_std")
-            result.adversarial = self._apply_discrete_lattice_projection(
-                result.adversarial,
-                names,
-                normalization_mean=normalization_mean,
-                normalization_std=normalization_std,
-            )
-            result.adversarial = self._restore_protected_values(
-                result.adversarial,
-                original,
-                names,
-                valid_mask=call_kwargs.get("valid_mask"),
-            )
-            result.metadata.setdefault("discrete_projection_enabled", bool(self.discrete_projection))
-            result.metadata.setdefault(
-                "discrete_projection_applied",
-                bool(
-                    self.discrete_projection
-                    and normalization_mean is not None
-                    and normalization_std is not None
-                    and {str(name).upper() for name in names}.intersection({"PL", "TTL", "WIN"})
-                ),
-            )
+            result.authoritative_physical = physical
+            result.adversarial = encode_normalized32(physical, names, mean, std)
+            result.metadata.update({
+                "range_clipping_enabled": bool(self.clip_ranges),
+                "range_clipping_applied": bool(self.clip_ranges),
+                "discrete_projection_enabled": bool(self.discrete_projection),
+                "discrete_projection_applied": bool(self.discrete_projection and
+                    {str(n).upper() for n in names}.intersection({"PL", "TTL", "WIN"})),
+                "dual_authoritative_representation": True,
+            })
             return result
 
         setattr(_generate_with_discrete_projection, "_discrete_projector_wrapped", True)
@@ -144,98 +164,106 @@ class FeatureSpaceAttack(BaseAttack):
     def _restore_protected_values(
         self,
         x_adv: np.ndarray | torch.Tensor,
-        x_orig: Any,
+        x_orig: np.ndarray | torch.Tensor,
         feature_names: Sequence[str],
         *,
-        valid_mask: Any = None,
+        valid_mask: np.ndarray | torch.Tensor | None = None,
     ) -> np.ndarray | torch.Tensor:
-        """Restore configured immutable fields and invalid sequence rows."""
-        if x_orig is None:
-            return x_adv
+        """Restore physical immutable columns, victim packets, and padding IN PLACE."""
+        if x_adv.dtype != (torch.float64 if isinstance(x_adv, torch.Tensor) else np.float64):
+            raise TypeError("Physical restoration requires float64 adversarial input")
+        b, t, f = layout(x_adv, feature_names)
+        if tuple(x_adv.shape) != tuple(x_orig.shape):
+            raise ValueError("Clean and attack physical shapes must match")
+        names = tuple(str(n).upper() for n in feature_names)
+        immutable = {str(n).upper() for n in self.immutable_features} | ({"DIR"} if "DIR" in names else set())
+        if immutable - set(names):
+            raise ValueError(f"Unknown immutable features: {sorted(immutable - set(names))}")
         if isinstance(x_adv, torch.Tensor):
-            original = torch.as_tensor(x_orig, device=x_adv.device, dtype=x_adv.dtype)
-            if original.shape != x_adv.shape:
-                raise ValueError("Generated and original feature shapes must match")
-            protected = torch.zeros_like(x_adv, dtype=torch.bool)
-            names = tuple(str(name).upper() for name in feature_names)
-            immutable = {
-                str(name).upper() for name in getattr(self, "immutable_features", ())
-            }
-            unknown = sorted(immutable.difference(names))
-            if unknown:
-                raise ValueError(
-                    f"Unknown immutable feature name(s): {unknown}; available: {names}"
-                )
-            if immutable:
-                immutable_indices = [index for index, name in enumerate(names) if name in immutable]
-                if x_adv.ndim == 3:
-                    protected[..., immutable_indices] = True
-                elif x_adv.ndim == 2 and len(names) and x_adv.shape[-1] % len(names) == 0:
-                    for index in immutable_indices:
-                        protected[:, index::len(names)] = True
-            if valid_mask is not None:
-                mask = torch.as_tensor(valid_mask, device=x_adv.device, dtype=torch.bool)
-                if x_adv.ndim == 3 and tuple(mask.shape) == tuple(x_adv.shape[:2]):
-                    protected |= ~mask.unsqueeze(-1)
-                elif x_adv.ndim == 2 and len(names) and x_adv.shape[-1] % len(names) == 0:
-                    width = x_adv.shape[-1] // len(names)
-                    if tuple(mask.shape) != (x_adv.shape[0], width):
-                        raise ValueError("valid_mask shape does not match flattened feature shape")
-                    protected |= (~mask).repeat_interleave(len(names), dim=1)
-                else:
-                    raise ValueError("valid_mask shape does not match generated feature shape")
-            return torch.where(protected, original, x_adv)
-
-        adversarial = np.asarray(x_adv)
-        original_array = (
-            x_orig.detach().cpu().numpy()
-            if isinstance(x_orig, torch.Tensor)
-            else np.asarray(x_orig)
-        )
-        if adversarial.shape != original_array.shape:
-            raise ValueError("Generated and original feature shapes must match")
-        protected = np.zeros(adversarial.shape, dtype=bool)
-        names = tuple(str(name).upper() for name in feature_names)
-        immutable = {str(name).upper() for name in getattr(self, "immutable_features", ())}
-        unknown = sorted(immutable.difference(names))
-        if unknown:
-            raise ValueError(
-                f"Unknown immutable feature name(s): {unknown}; available: {names}"
-            )
-        if immutable:
-            immutable_indices = [index for index, name in enumerate(names) if name in immutable]
-            if adversarial.ndim == 3:
-                protected[..., immutable_indices] = True
-            elif adversarial.ndim == 2 and names and adversarial.shape[-1] % len(names) == 0:
-                for index in immutable_indices:
-                    protected[:, index::len(names)] = True
-        if valid_mask is not None:
-            mask_array = np.asarray(valid_mask, dtype=bool)
-            if adversarial.ndim == 3 and mask_array.shape == adversarial.shape[:2]:
-                protected |= ~mask_array[..., None]
-            elif adversarial.ndim == 2 and names and adversarial.shape[-1] % len(names) == 0:
-                packet_count = adversarial.shape[-1] // len(names)
-                if mask_array.shape != (adversarial.shape[0], packet_count):
-                    raise ValueError("valid_mask shape does not match flattened feature shape")
-                protected |= np.repeat(~mask_array, len(names), axis=1)
+            clean = torch.as_tensor(x_orig, dtype=torch.float64, device=x_adv.device).reshape(b,t,f)
+            adv = x_adv.reshape(b,t,f)
+            if valid_mask is None:
+                valid = None
             else:
-                raise ValueError("valid_mask shape does not match generated feature shape")
-        return np.where(protected, original_array, adversarial)
+                valid = torch.as_tensor(valid_mask, dtype=torch.bool, device=x_adv.device)
+                if tuple(valid.shape) != (b,t):
+                    raise ValueError("Invalid valid_mask shape")
+            with torch.no_grad():
+                if "DIR" in names:
+                    victim = torch.isclose(clean[...,names.index("DIR")],
+                                            torch.tensor(1.0, dtype=torch.float64, device=x_adv.device),
+                                            atol=1e-2, rtol=0.0)
+                    if valid is not None:
+                        victim &= valid
+                    torch.where(victim.unsqueeze(-1), clean, adv, out=adv)
+                for field_name in immutable:
+                    j = names.index(field_name)
+                    adv[...,j].copy_(clean[...,j])
+                if valid is not None:
+                    torch.where((~valid).unsqueeze(-1), clean, adv, out=adv)
+            return x_adv
+        adv = x_adv.reshape(b,t,f)
+        clean = np.asarray(x_orig, dtype=np.float64).reshape(b,t,f)
+        if valid_mask is None:
+            valid_np = None
+        else:
+            valid_np = np.asarray(valid_mask, dtype=bool)
+            if valid_np.shape != (b,t):
+                raise ValueError("Invalid valid_mask shape")
+        if "DIR" in names:
+            victim_np = np.isclose(clean[...,names.index("DIR")], 1.0, atol=1e-2, rtol=0.0)
+            if valid_np is not None:
+                victim_np &= valid_np
+            np.copyto(adv, clean, where=victim_np[...,None])
+        for field_name in immutable:
+            j = names.index(field_name)
+            np.copyto(adv[...,j], clean[...,j])
+        if valid_np is not None:
+            np.copyto(adv, clean, where=(~valid_np)[...,None])
+        return x_adv
 
     def _require_model(self) -> ModelWrapper:
         if self.model is None:
-            raise RuntimeError(f"{type(self).__name__} requires a bound target/surrogate model")
+            raise RuntimeError(f"{type(self).__name__} requires a bound model")
         return self.model
+
+    def _apply_range_clipping(
+        self,
+        x_adv: np.ndarray | torch.Tensor,
+        feature_names: Sequence[str],
+        *,
+        clip_ranges: dict[str, tuple[float, float]],
+    ) -> np.ndarray | torch.Tensor:
+        """In-place float64 physical clipping; no normalized-space conversion."""
+        b, t, f = layout(x_adv, feature_names)
+        if x_adv.dtype != (torch.float64 if isinstance(x_adv, torch.Tensor) else np.float64):
+            raise TypeError("Physical clipping requires float64")
+        names = tuple(str(n).upper() for n in feature_names)
+        view = x_adv.reshape(b,t,f)
+        for key, bound in clip_ranges.items():
+            name = str(key).upper()
+            if name not in names:
+                raise ValueError(f"Unknown clip_ranges feature {key!r}")
+            if len(bound) != 2:
+                raise ValueError(f"Invalid physical bounds for {key!r}")
+            lower, upper = float(bound[0]), float(bound[1])
+            if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+                raise ValueError(f"Invalid physical bounds for {key!r}")
+            j = names.index(name)
+            if isinstance(view, torch.Tensor):
+                with torch.no_grad():
+                    view[...,j].clamp_(min=lower, max=upper)
+            else:
+                np.clip(view[...,j], lower, upper, out=view[...,j])
+        return x_adv
 
     def _apply_discrete_lattice_projection(
         self,
         x_adv: np.ndarray | torch.Tensor,
         feature_names: Sequence[str],
-        normalization_mean: Sequence[float] | np.ndarray | torch.Tensor | None,
-        normalization_std: Sequence[float] | np.ndarray | torch.Tensor | None,
     ) -> np.ndarray | torch.Tensor:
-        """Optionally snap ``PL``, ``TTL`` and ``WIN`` to integer physical values.
-
+        """Snap PL/TTL/WIN directly to float64 physical integers IN PLACE.
+        
         Option A (default): ``discrete_projection=False`` returns the original
         object unchanged, preserving continuous attack outputs but unfeasible
         for real-world deployment.
@@ -254,83 +282,19 @@ class FeatureSpaceAttack(BaseAttack):
         """
         if not self.discrete_projection:
             return x_adv
-        if normalization_mean is None or normalization_std is None:
-            raise ValueError(
-                "discrete_projection=True requires normalization_mean and normalization_std "
-                "to be provided to the generate() method."
-            )
-
-        names = tuple(str(name) for name in feature_names)
-        if not names:
-            return x_adv
-        target_fields = {"PL", "TTL", "WIN"}
-        target_indices = [i for i, name in enumerate(names) if name.upper() in target_fields]
-        if not target_indices:
-            return x_adv
-
-        is_tensor = isinstance(x_adv, torch.Tensor)
-        if is_tensor:
-            source_device = x_adv.device
-            source_dtype = x_adv.dtype
-            x_array = x_adv.detach().cpu().numpy()
-        else:
-            source_device = None
-            source_dtype = None
-            x_array = np.asarray(x_adv)
-
-        if x_array.ndim == 3:
-            batch_size, time_steps, feature_count = x_array.shape
-            if feature_count != len(names):
-                raise ValueError(
-                    f"Feature schema has {len(names)} names but adversarial tensor has {feature_count} features"
-                )
-            shaped = x_array.reshape(batch_size, time_steps, feature_count).astype(np.float64, copy=True)
-        elif x_array.ndim == 2:
-            batch_size, width = x_array.shape
-            if width % len(names) != 0:
-                raise ValueError(
-                    f"Adversarial width {width} is not divisible by feature count {len(names)}"
-                )
-            time_steps = width // len(names)
-            feature_count = len(names)
-            shaped = x_array.reshape(batch_size, time_steps, feature_count).astype(np.float64, copy=True)
-        else:
-            raise ValueError(
-                f"Discrete lattice projection expects a 2-D or 3-D batch, got shape {x_array.shape}"
-            )
-
-        mean = self._normalization_vector(normalization_mean, "normalization_mean")
-        std = self._normalization_vector(normalization_std, "normalization_std")
-        if mean.size != std.size:
-            raise ValueError("normalization_mean and normalization_std must have equal lengths")
-        if mean.size == feature_count:
-            mean_view = mean.reshape(1, 1, feature_count)
-            std_view = std.reshape(1, 1, feature_count)
-        elif mean.size == time_steps * feature_count:
-            mean_view = mean.reshape(1, time_steps, feature_count)
-            std_view = std.reshape(1, time_steps, feature_count)
-        else:
-            raise ValueError(
-                "Normalization vectors must match the feature count or flattened input width; "
-                f"got {mean.size} values for shape {tuple(x_array.shape)} and {len(names)} names"
-            )
-        if not np.all(np.isfinite(mean_view)) or not np.all(np.isfinite(std_view)):
-            raise ValueError("Normalization statistics must be finite")
-        if np.any(std_view <= 0):
-            raise ValueError("normalization_std must be strictly positive")
-
-        for feature_idx in target_indices:
-            physical = shaped[..., feature_idx] * std_view[..., feature_idx] + mean_view[..., feature_idx]
-            snapped = np.round(physical)
-            shaped[..., feature_idx] = (
-                snapped - mean_view[..., feature_idx]
-            ) / std_view[..., feature_idx]
-
-        projected = shaped.reshape(x_array.shape).astype(x_array.dtype, copy=False)
-        if is_tensor:
-            assert source_device is not None and source_dtype is not None
-            return torch.as_tensor(projected, device=source_device, dtype=source_dtype)
-        return projected
+        b, t, f = layout(x_adv, feature_names)
+        if x_adv.dtype != (torch.float64 if isinstance(x_adv, torch.Tensor) else np.float64):
+            raise TypeError("Physical lattice projection requires float64")
+        view = x_adv.reshape(b,t,f)
+        for j, name in enumerate(feature_names):
+            if str(name).upper() not in {"PL", "TTL", "WIN"}:
+                continue
+            if isinstance(view, torch.Tensor):
+                with torch.no_grad():
+                    view[...,j].round_()
+            else:
+                np.rint(view[...,j], out=view[...,j])
+        return x_adv
 
     @staticmethod
     def _normalization_vector(
@@ -339,13 +303,11 @@ class FeatureSpaceAttack(BaseAttack):
     ) -> np.ndarray:
         """Convert a normalization vector to a validated flat CPU NumPy array."""
         if isinstance(value, torch.Tensor):
-            array = value.detach().cpu().numpy()
-        else:
-            array = np.asarray(value)
-        array = np.asarray(array, dtype=np.float64).reshape(-1)
-        if array.size == 0:
+            value = value.detach().cpu().numpy()
+        out = np.asarray(value, dtype=np.float64).reshape(-1)
+        if not out.size:
             raise ValueError(f"{name} cannot be empty")
-        return array
+        return out
 
     @staticmethod
     def victim_packet_perturbation_mask(
@@ -413,7 +375,7 @@ class FeatureSpaceAttack(BaseAttack):
                 )
             direction = direction * direction_std + direction_mean
 
-        victim = torch.isclose(direction, torch.ones_like(direction), atol=1e-4, rtol=0.0)
+        victim = torch.isclose(direction, torch.ones_like(direction), atol=1e-2, rtol=0.0)
         mask = (~victim).unsqueeze(-1).expand(*victim.shape, feature_count).clone()
         # Direction is part of the traffic metadata, not an attacker-controlled
         # feature, so it must remain unchanged for every packet.

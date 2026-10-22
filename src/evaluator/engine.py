@@ -4,16 +4,17 @@ from collections import Counter
 from dataclasses import dataclass
 import logging
 from time import perf_counter
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
 
-from attacks.base import AttackResult, BaseAttack, ProblemSpaceAttack
+from attacks.base import AttackResult, BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
 from constraints.gatekeeper import UniversalConstraintGatekeeper
 from defenses.base import BaseDetector
 from models.wrapper import ModelWrapper
 from preprocessing.base import BasePreprocessor
+from core.dual_representation import decode_physical64, encode_normalized32, layout
 from .metrics import detection_auroc, evaluate_predictions
 
 
@@ -28,18 +29,12 @@ class FeatureNormalization:
         object.__setattr__(self, "std", np.clip(np.asarray(self.std, dtype=np.float32), 1e-12, None))
 
     def denormalize(self, x: np.ndarray) -> np.ndarray:
-        """Denormalize into one output buffer rather than chaining full-array temporaries."""
-        out = np.array(x, dtype=np.float32, copy=True)
-        np.multiply(out, self.std, out=out)
-        np.add(out, self.mean, out=out)
-        return out
+        """Decode for convenience only, not recovery of pre-float32 truth."""
+        return decode_physical64(x, self.feature_names, self.mean, self.std)
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        """Normalize into one output buffer rather than chaining full-array temporaries."""
-        out = np.array(x, dtype=np.float32, copy=True)
-        np.subtract(out, self.mean, out=out)
-        np.divide(out, self.std, out=out)
-        return out
+        """Canonical physical float64 -> model float32 encoding."""
+        return encode_normalized32(x, self.feature_names, self.mean, self.std)
 
 
 @dataclass(frozen=True)
@@ -83,6 +78,22 @@ def _slice_batch(value: Any, start: int, stop: int) -> Any:
     if isinstance(value, (list, tuple)):
         return value[start:stop]
     raise TypeError(f"Cannot batch value of type {type(value).__name__}")
+
+
+PhysicalSource = np.ndarray | torch.Tensor | Callable[[int, int], np.ndarray | torch.Tensor]
+
+
+def _slice_physical_source(
+    source: PhysicalSource, start: int, stop: int
+) -> np.ndarray | torch.Tensor:
+    # A callable source permits on-demand packet extraction / memory maps with
+    # no mandatory full-dataset float64 physical allocation.
+    value = source(start, stop) if callable(source) else _slice_batch(source, start, stop)
+    if not isinstance(value, (np.ndarray, torch.Tensor)):
+        raise TypeError("physical source must return np.ndarray or torch.Tensor")
+    if value.dtype != (torch.float64 if isinstance(value, torch.Tensor) else np.float64):
+        raise TypeError("physical source must supply original float64 samples")
+    return value
 
 
 def _batched_predict(
@@ -173,6 +184,63 @@ def _chunked_perturbation_distances(
     }
 
 
+def _restore_target_physical_protected_inplace(
+    adversarial: np.ndarray,
+    original: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    immutable_features: Sequence[str] = (),
+    valid_mask: np.ndarray | torch.Tensor | None = None,
+) -> tuple[int, int]:
+    """Last-stage physical immutability projection, in-place without drift."""
+    if adversarial.dtype != np.float64 or original.dtype != np.float64:
+        raise TypeError("Both authoritative arrays must be float64")
+    if adversarial.shape != original.shape or not adversarial.flags.writeable:
+        raise ValueError("Physical batches must match and adversarial must be writable")
+    b, t, f = layout(adversarial, feature_names)
+    names = tuple(str(n).upper() for n in feature_names)
+    adv = adversarial.reshape(b, t, f)
+    clean = original.reshape(b, t, f)
+    valid = None if valid_mask is None else _as_numpy(valid_mask).astype(bool, copy=False)
+    if valid is not None and valid.shape != (b, t):
+        raise ValueError("Invalid valid_mask shape")
+    immutable = {str(n).upper() for n in immutable_features}
+    if "DIR" in names:
+        immutable.add("DIR")
+    if immutable - set(names):
+        raise ValueError(f"Unknown immutable features: {sorted(immutable-set(names))}")
+    victim_count = 0
+    if "DIR" in names:
+        victim = np.isclose(clean[..., names.index("DIR")], 1.0, atol=1e-2, rtol=0.0)
+        if valid is not None:
+            victim &= valid
+        victim_count = int(np.count_nonzero(victim))
+        np.copyto(adv, clean, where=victim[..., None])
+    for key in immutable:
+        j = names.index(key)
+        np.copyto(adv[..., j], clean[..., j])
+    padded = 0
+    if valid is not None:
+        padded = int(np.count_nonzero(~valid))
+        np.copyto(adv, clean, where=(~valid)[..., None])
+    return victim_count, padded
+
+
+def _as_physical_shape(
+    raw: np.ndarray | torch.Tensor,
+    expected: np.ndarray | torch.Tensor,
+    names: Sequence[str],
+) -> np.ndarray:
+    """Accept flattened/sequence-equivalent physical layouts without copying."""
+    physical = _as_numpy(raw)
+    if physical.dtype != np.float64:
+        raise TypeError("Physical source must be float64, not normalized float32")
+    b, t, f = layout(expected, names)
+    if physical.shape[0] != b or physical.size != b * t * f:
+        raise ValueError("Physical batch and target batch dimensions differ")
+    return physical.reshape(tuple(expected.shape))
+
+
 def _violation_counts(gate_result: Any) -> dict[str, float]:
     """Count rejected samples per concrete gatekeeper rule."""
     counter: Counter[str] = Counter()
@@ -251,6 +319,8 @@ class EvaluationEngine:
         feature_names: Sequence[str],
         attack_input: Any | None = None,
         attack_input_is_target_normalized: bool = False,
+        clean_physical: PhysicalSource | None = None,
+        authoritative_physical_output: np.ndarray | None = None,
         raw_traffic: Any | None = None,
         valid_mask: np.ndarray | torch.Tensor | None = None,
         attack_kwargs: Mapping[str, Any] | None = None,
@@ -263,17 +333,60 @@ class EvaluationEngine:
         """
         y_np = _as_numpy(y).astype(np.int64, copy=False)
         x_target = x
+        if clean_physical is None:
+            raise ValueError(
+                "Dual-authoritative evaluation requires clean_physical captured BEFORE "
+                "normalization/float32 quantization; decoding x cannot recover physical truth"
+            )
+        if not callable(clean_physical):
+            if not isinstance(clean_physical, (np.ndarray, torch.Tensor)):
+                raise TypeError("clean_physical must be a float64 batch or a batch supplier")
+            if len(clean_physical) != len(x_target):
+                raise ValueError("clean_physical and x must have identical batch length")
         if self.max_samples is not None and len(y_np) > self.max_samples:
             raise ValueError(
                 "EvaluationEngine received more samples than evaluation.max_samples; "
                 "subsample before normalization in evaluate_attack_seed"
             )
+        if authoritative_physical_output is not None:
+            if (not isinstance(authoritative_physical_output, np.ndarray)
+                    or authoritative_physical_output.dtype != np.float64
+                    or not authoritative_physical_output.flags.writeable
+                    or authoritative_physical_output.shape != tuple(x_target.shape)):
+                raise ValueError(
+                    "authoritative_physical_output must be a writable float64 "
+                    "array or np.memmap with exactly the target batch shape"
+                )
         if attack_input_is_target_normalized:
             if isinstance(self.attack, ProblemSpaceAttack):
                 raise ValueError("On-demand normalization conversion is only valid for feature-space attacks")
             if self.attack_normalization is None or self.target_normalization is None:
                 raise ValueError(
                     "On-demand target-to-attack normalization requires both normalization objects"
+                )
+        
+        # The clean target input is also required to originate from the exact
+        # physical baseline; otherwise model and oracle already disagree before
+        # the attack runs. The check is chunked, no corpus-sized temporary.
+        for verify_start in range(0, len(y_np), self.batch_size):
+            verify_stop = min(verify_start + self.batch_size, len(y_np))
+            reference = _as_numpy(_slice_batch(x_target, verify_start, verify_stop))
+            reference_physical = _as_physical_shape(
+                _slice_physical_source(clean_physical, verify_start, verify_stop), reference, feature_names
+            )
+            canonical = encode_normalized32(
+                reference_physical, feature_names,
+                None if self.target_normalization is None else self.target_normalization.mean,
+                None if self.target_normalization is None else self.target_normalization.std,
+            )
+            if reference.dtype != np.float32 or not np.array_equal(
+                np.ascontiguousarray(reference).view(np.uint32),
+                np.ascontiguousarray(canonical).view(np.uint32),
+            ):
+                raise RuntimeError(
+                    f"Clean model/physical encoding mismatch in batch "
+                    f"{verify_start}:{verify_stop}; re-encode clean inputs "
+                    "from pre-normalization float64 physical source"
                 )
 
         baseline_pred, baseline_elapsed = _batched_predict(
@@ -341,16 +454,27 @@ class EvaluationEngine:
             if batch_kwargs.get("seed") is not None:
                 batch_kwargs["seed"] = int(batch_kwargs["seed"]) + start
 
+            clean_target_physical = _as_physical_shape(
+                _slice_physical_source(clean_physical, start, stop),
+                _slice_batch(x_target, start, stop),
+                feature_names,
+            )
             attack_batch_input = _slice_batch(target_input, start, stop)
             if attack_input_is_target_normalized:
-                attack_batch_input = self._convert_target_space_to_attack(
-                    _as_numpy(attack_batch_input)
+                # Preserve physical truth while changing model normalization.
+                attack_batch_input = encode_normalized32(
+                    clean_target_physical, feature_names,
+                    self.attack_normalization.mean, self.attack_normalization.std,
                 )
 
             expected_batch_size = stop - start
             valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
             if valid_mask_batch is not None:
                 batch_kwargs["valid_mask"] = valid_mask_batch
+            if isinstance(self.attack, FeatureSpaceAttack):
+                batch_kwargs["_clean_authoritative_physical"] = clean_target_physical
+                batch_kwargs["_discrete_diagnostic_logger"] = self.logger
+                batch_kwargs["_discrete_diagnostic_config"] = self.discrete_diagnostics
             batch_result = self.attack.generate(
                 attack_batch_input,
                 _slice_batch(y, start, stop),
@@ -402,18 +526,47 @@ class EvaluationEngine:
                 if self.preprocessor is None:
                     raise RuntimeError("Problem-space evaluation requires a preprocessor")
                 processed = self.preprocessor.transform(batch_result.raw_adversarial)
-                x_adv_batch = np.asarray(processed.features, dtype=np.float32)
                 batch_feature_names = tuple(processed.feature_names)
-            else:
-                if batch_result.adversarial is None:
+                # Physical packet features must be supplied by the extractor;
+                # decoding its normalized outputs would falsely claim authority.
+                raw_physical = getattr(processed, "physical_features", None)
+                if raw_physical is None:
                     raise RuntimeError(
-                        "Feature-space attack returned neither adversarial nor raw_adversarial data"
+                        "Problem-space preprocessor must export float64 physical_features "
+                        "before normalization for dual-authoritative evaluation"
                     )
-                x_adv_source = _as_numpy(batch_result.adversarial).astype(np.float32, copy=False)
-                batch_feature_names = tuple(batch_result.feature_names or feature_names)
-                x_adv_batch = self._convert_attack_space_to_target(
-                    x_adv_source, batch_feature_names
+                x_adv_physical = _as_physical_shape(
+                    raw_physical, _slice_batch(x_target, start, stop), batch_feature_names
                 )
+                if not x_adv_physical.flags.writeable or not x_adv_physical.flags.c_contiguous:
+                    x_adv_physical = np.array(x_adv_physical, dtype=np.float64, copy=True, order="C")
+            else:
+                if batch_result.adversarial is None or batch_result.authoritative_physical is None:
+                    raise RuntimeError("Feature attack must return BOTH dual representations")
+                batch_feature_names = tuple(batch_result.feature_names or feature_names)
+                x_adv_source = _as_numpy(batch_result.adversarial)
+                if x_adv_source.dtype != np.float32:
+                    raise TypeError("Attack model representation must be float32")
+                x_adv_physical = _as_physical_shape(
+                    batch_result.authoritative_physical, x_adv_source, batch_feature_names
+                )
+                if not x_adv_physical.flags.writeable or not x_adv_physical.flags.c_contiguous:
+                    x_adv_physical = np.array(x_adv_physical, dtype=np.float64, copy=True, order="C")
+
+            if tuple(batch_feature_names) != tuple(feature_names):
+                raise ValueError("Physical and target feature schemas differ")
+            victim_packets, padded_packets = _restore_target_physical_protected_inplace(
+                x_adv_physical, clean_target_physical, batch_feature_names,
+                immutable_features=getattr(self.attack, "immutable_features", ()),
+                valid_mask=valid_mask_batch,
+            )
+            
+            # Sole final target encoding is the authoritative physical representation, not the attack's internal float32 copy.
+            x_adv_batch = encode_normalized32(
+                x_adv_physical, batch_feature_names,
+                None if self.target_normalization is None else self.target_normalization.mean,
+                None if self.target_normalization is None else self.target_normalization.std,
+            )
 
             if len(x_adv_batch) != expected_batch_size:
                 raise RuntimeError(
@@ -443,6 +596,10 @@ class EvaluationEngine:
             # Write each result straight into the final array. Do not retain a list
             # of all batches and then concatenate a second full-size corpus copy.
             x_adv_target[start:stop] = x_adv_batch
+            if authoritative_physical_output is not None:
+                # Optional disk-backed float64 sink for retaining the entire
+                # authoritative physical corpus without using system RAM.
+                authoritative_physical_output[start:stop] = x_adv_physical
 
             x_clean_batch = _slice_batch(x_target, start, stop)
             y_batch = y_np[start:stop]
@@ -450,8 +607,9 @@ class EvaluationEngine:
             gate = self.gatekeeper.validate(
                 x_adv_batch,
                 first_feature_names,
+                authoritative_physical=x_adv_physical,
+                original_physical=clean_target_physical,
                 valid_mask=valid_mask_batch,
-                original_samples=x_clean_batch,
             )
             accepted_batch = np.asarray(gate.accepted, dtype=bool).reshape(-1)
             if len(accepted_batch) != expected_batch_size:
@@ -498,7 +656,8 @@ class EvaluationEngine:
                 y_score_batches.append(y_batch[score_mask_batch])
                 baseline_score_batches.append(baseline_batch[score_mask_batch])
 
-            del batch_result, x_adv_batch, x_clean_batch, y_batch, baseline_batch
+            del batch_result, x_adv_batch, x_adv_physical, clean_target_physical
+            del x_clean_batch, y_batch, baseline_batch
             if x_adv_source is not None:
                 del x_adv_source
             if processed is not None:
@@ -536,7 +695,11 @@ class EvaluationEngine:
             success_mask=np.concatenate(success_batches) if success_available else None,
             queries=np.concatenate(query_batches) if queries_available else None,
             feature_names=actual_feature_names,
-            metadata=first_metadata,
+            metadata={**first_metadata, "physical_authority": (
+                "retained_in_caller_sink" if authoritative_physical_output is not None
+                else "batch_local_not_retained"
+            )},
+            authoritative_physical=authoritative_physical_output,
         )
 
         if len(x_adv_target) != n_samples or len(accepted) != n_samples:
@@ -650,37 +813,3 @@ class EvaluationEngine:
             detector_adversarial_scores=detector_adversarial_scores,
         )
 
-    def _convert_target_space_to_attack(self, x_target: np.ndarray) -> np.ndarray:
-        """Convert one target-normalized batch into attack-model normalization in-place."""
-        if self.target_normalization is None or self.attack_normalization is None:
-            raise ValueError("Target-to-attack conversion requires both normalization objects")
-        if self.target_normalization.feature_names != self.attack_normalization.feature_names:
-            raise ValueError("Target and attack feature schemas differ")
-        out = np.array(x_target, dtype=np.float32, copy=True)
-        np.multiply(out, self.target_normalization.std, out=out)
-        np.add(out, self.target_normalization.mean, out=out)
-        np.subtract(out, self.attack_normalization.mean, out=out)
-        np.divide(out, self.attack_normalization.std, out=out)
-        return out
-
-    def _convert_attack_space_to_target(self, x_adv: np.ndarray, feature_names: Sequence[str]) -> np.ndarray:
-        if self.attack_normalization is None or self.target_normalization is None:
-            return x_adv
-        if tuple(feature_names) != self.attack_normalization.feature_names:
-            raise ValueError(
-                "Attack feature schema does not match surrogate normalization schema: "
-                f"{tuple(feature_names)} != {self.attack_normalization.feature_names}"
-            )
-        if tuple(feature_names) != self.target_normalization.feature_names:
-            raise ValueError(
-                "Surrogate and target feature schemas must match for transfer evaluation: "
-                f"{tuple(feature_names)} != {self.target_normalization.feature_names}"
-            )
-        # Convert directly in one batch-sized output instead of allocating an
-        # intermediate denormalized physical-space matrix.
-        out = np.array(x_adv, dtype=np.float32, copy=True)
-        np.multiply(out, self.attack_normalization.std, out=out)
-        np.add(out, self.attack_normalization.mean, out=out)
-        np.subtract(out, self.target_normalization.mean, out=out)
-        np.divide(out, self.target_normalization.std, out=out)
-        return out

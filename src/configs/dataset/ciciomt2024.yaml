@@ -1,5 +1,10 @@
 name: ciciomt2024
 immutable_features: [DIR, FLG]
+clip_ranges:
+  WIN: [-1.0, 65535.0]
+  TTL: [0.0, 255.0]
+  PL: [0.0, 1500.0]
+  IAT: [0.0, 1.0e6]
 params:
   path: ${hydra:runtime.cwd}/data/ciciomt2024.parquet
   id_column: Index

@@ -37,7 +37,7 @@ class NonNegativeRule(ConstraintRule):
         if found is None:
             return None
         values, _ = found
-        bad = np.flatnonzero(~np.isfinite(values) | (values < 0))
+        bad = np.flatnonzero(~np.isfinite(values) | (values < 0.0))
         return RuleViolation(self.name, bad, f"{self.feature} must be finite and >= 0") if len(bad) else None
 
 
@@ -61,7 +61,7 @@ class RangeRule(ConstraintRule):
 class DiscreteIntegrityRule(ConstraintRule):
     feature: str
     allowed_values: tuple[int, ...] | None = None
-    tolerance: float = 1e-2
+    tolerance: float = 1e-4
     name: str = "discrete_integrity"
 
     def check(self, x: np.ndarray, feature_index: Mapping[str, int]) -> RuleViolation | None:
@@ -158,13 +158,17 @@ class DirectionalImmutabilityRule(ConstraintRule):
         # before the immutability check runs.
         direction = original[:, feature_index[self.direction_feature]]
         victim = np.isclose(direction, self.victim_direction, atol=self.tolerance, rtol=0.0)
-        direction_changed = ~np.isclose(
-            x[:, feature_index[self.direction_feature]] - direction,
-            0.0,
-            atol=self.tolerance,
-            rtol=0.0,
+        # Physical authority is float64: enforce bit-identical values, not a
+        # numerical tolerance. Signed zero is also treated as a byte change.
+        if x.dtype != np.float64 or original.dtype != np.float64:
+            raise TypeError("Directional immutability requires float64 physical arrays")
+        direction_changed = (
+            x[:, feature_index[self.direction_feature]].view(np.uint64)
+            != direction.view(np.uint64)
         )
-        packet_changed = np.any(~np.isclose(x - original, 0.0, atol=self.tolerance, rtol=0.0), axis=1)
+        packet_changed = np.any(
+            x.view(np.uint64) != original.view(np.uint64), axis=1
+        )
         bad = np.flatnonzero(direction_changed | (victim & packet_changed))
         return (
             RuleViolation(
@@ -197,9 +201,8 @@ class RuleSet:
                 # gatekeeper receives the dataset's valid packet mask.
                 # Independent Gatekeeper oracle: these integrality rules are always
                 # enforced, regardless of whether an attack uses lattice projection.
-                NonNegativeRule("PL"),
-                DiscreteIntegrityRule("PL", name="discrete_packet_length"),
-                NonNegativeRule("IAT"),
+                DiscreteIntegrityRule("PL", tuple(range(0, 1501)), name="discrete_packet_length"),
+                NonNegativeRule("IAT", name="non_negative_inter_arrival_time"),
                 RangeRule("TTL", 0, 255),
                 DiscreteIntegrityRule("TTL", tuple(range(0, 256)), name="discrete_ttl_integrity"),
                 DiscreteIntegrityRule("DIR", (-1, 0, 1)),
