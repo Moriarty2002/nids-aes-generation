@@ -58,7 +58,7 @@ A modular, extensible PyTorch benchmarking framework for evaluating state-of-the
 ### Framework Goal
 A significant portion of adversarial machine learning literature suffers from reproducibility and comparability issues: researchers evaluate attacks against different target models, non-standardized feature spaces, or single-seed runs without physical protocol constraint checks or defensive baselines.
 
-This framework addresses these shortcomings by providing a standardized, multi-seed evaluation harness. It decouples dataset handling, model wrappers, threat models, physical protocol gatekeeping, and metric reporting to allow seamless plug-and-play evaluation under realistic network security constraints.
+This framework addresses these shortcomings by providing a standardized, multi-seed evaluation harness. It decouples dataset handling, model wrappers, threat models, physical protocol gatekeeping, and metric reporting to allow seamless plug-and-play evaluation. **Crucially, it implements a Dual Authoritative Representation architecture**, mathematically separating unassailable physical constraints (`float64`) from normalized continuous model inference (`float32`) to resolve representation drift.
 
 ### Execution Mechanics
 
@@ -67,7 +67,7 @@ The framework employs a two-tier execution lifecycle (parent orchestrator $\righ
 1. [`main.py`](./main.py) resolves Hydra configurations, initializes logging and run directories, discovers registered plugins, and manages seed execution.
 2. [`orchestrator/runner.py`](./orchestrator/runner.py) spawns isolated worker processes, assigning a deterministic random seed and target GPU/CPU device to each worker.
 3. [`workflow.py`](./workflow.py) executes worker-level routines: `train_nids_seed`, `train_attack_seed`, `evaluate_attack_seed`, and `preprocess_seed`.
-4. Workers handle data loading, normalization schema matching, model/attack instantiation, constraint checks, and seed-local artifact serialization.
+4. Workers handle data loading, normalization schema matching, model/attack instantiation, strict constraint checks, and seed-local artifact serialization.
 5. `main.py` aggregates numeric metrics across all completed seed workers to compute cross-seed statistics (Mean $\pm$ Std) and Wilcoxon significance tests.
 
 ---
@@ -76,7 +76,7 @@ The framework employs a two-tier execution lifecycle (parent orchestrator $\righ
 
 ### 2.1 End-to-End Pipeline Flow
 
-The execution graph separates adversarial generation, protocol validation, and victim model scoring into decoupled steps:
+The execution graph strictly separates adversarial generation, physical protocol validation, and victim model scoring:
 
 ```text
 [Hydra CLI / Config]
@@ -88,37 +88,35 @@ The execution graph separates adversarial generation, protocol validation, and v
 [ProcessPoolExecutor (spawn)] ── Distributes Seeds & GPU/CPU Assignments
         │
         ├── Worker: Seed 1 (Device cuda:0) ── logs/seed_1.log
-        ├── Worker: Seed 2 (Device cuda:1) ── logs/seed_2.log
-        └── Worker: Seed N ...
+        ├── Worker: Seed N ...
                 │
                 ▼
-        [Dynamic Tensor Shaping] ── Maps 2D Flat vectors vs. 3D (N, T, F) Sequence layout
-                │
-                ▼
-        [Label Encoder (AD/AC)] ── Maps Benign -> 0; Attack classes -> 1..K
-                │
+        [Dataset Loading & DAR Extraction] ── Extracts absolute physical baseline (float64)
+                │                             before normalizing for the model (float32)
                 ▼
         [Clean Baseline Inference] ── Establishes baseline MCC, FAR, DR, Accuracy
                 │
                 ▼
         [Attack Optimization] ── Targeted optimization toward Benign (Label 0)
-          ├── Feature-Space: PGD / Square / TRADES / C&W on normalized vectors
+          ├── Continuous Generation (float32): PGD, TRADES, C&W, Square, TDTCE (Diffusion)
+          ├── Physical Projection (float64): Discretization (optional) & immutable restorations
+          ├── Feature-Space: PGD / TdTce / etc. on normalized vectors
           └── Problem-Space: PCAP mutation -> SOTA Feature Extractor
                 │
                 ▼
-        [Universal Constraint Gatekeeper] ── Realizability referee in physical domain
-          ├── Checks: Non-negativity, discrete integers, TCP bitmask coherence, bounds
+        [Universal Constraint Gatekeeper] ── Realizability referee in strict physical domain
+          ├── Bitwise Sync Check: Verifies float64 physical encodes exactly to float32 model input
+          ├── Checks (on float64): Exact bounds, discrete protocol rules, victim immutability
           └── Telemetry: Realizability Rate (RR) & per-rule violation counters
                 │
                 ▼
-        [Target Model Scoring] ── Bounded batch scoring (prunes clean misclassifications)
+        [Target Model Scoring] ── Bounded batch scoring (prunes unrealizable samples if strict)
                 │
                 ▼
         [Per-Seed Reporting] ── Writes predictions (.npz), text reports, confusion matrices
                 │
                 ▼
-[Post-Run Aggregator (main.py)] ── Computes Mean ± Std, Wilcoxon p-values,
-                                   generates mean CMs & multi-seed learning curves
+[Post-Run Aggregator (main.py)] ── Computes Mean ± Std, Wilcoxon p-values, generates mean CMs & multi-seed learning curves
 ```
 
 ---
@@ -129,7 +127,6 @@ The execution graph separates adversarial generation, protocol validation, and v
 * **Hydra I/O Control:** Default Hydra directory generation is suppressed (`output_subdir: null`). Output directories are deterministically generated by the framework.
 * **Deterministic Single-Evaluation Path:** Output directories follow a unified convention:
   `runs/<action>/<dataset>/<model>/<attack_variant>/<timestamp>_<hash>/`
-  This root path is cached and shared across all parallel workers, checkpoints, and reports.
 
 #### 2. Multi-Process Orchestrator (`orchestrator/`)
 * **Process Isolation:** Worker seeds execute in isolated Python processes via `spawn` to prevent CUDA memory fragmentation and global state bleeding.
@@ -147,27 +144,25 @@ The execution graph separates adversarial generation, protocol validation, and v
 * **Anomaly Detection (AD):** Activates when binary numeric labels (`0`, `1`) are detected (`0 = Benign`, `1 = Malicious`).
 * **Attack Classification (AC):** Activates when multi-class labels are present. The framework maps `benign_string` to class index `0` and attack classes to `1..K`.
 * **Strict Targeted Evasion:** Confusing one attack type for another still triggers defensive alerts. Attacks optimize explicitly toward the Benign class (`target_label = 0`), and Attack Success Rate (ASR) measures forced predictions to `0`.
+* **Physical Source Authority:** Datasets (e.g., `SequenceParquetDataset`) natively extract padding and sequence attributes in `float64` to preserve pristine physical metrics before canonical model normalization. 
 
 #### 5. Threat Models & Attack Engines (`attacks/`)
-* **Feature-Space Pipeline (`attacks/feature_space/`):** Implements gradient-based (PGD, BIM, C&W, TRADES) and gradient-free (Square Attack) generators.
+* **Feature-Space Pipeline (`attacks/feature_space/`):** Implements gradient-based (PGD, BIM, C&W, TRADES), gradient-free (Square Attack), and generative attacks (TDTCE - Latent Diffusion).
 * **TRADES as an Attack Plugin (`TRADESAttack`):** Uses TRADES' inner KL-divergence maximization loop to explore prediction boundary instability. This creates transfer-capable adversarial samples for robustifying non differentiable models during EAT.
 * **Autograd Isolation:** Iterative gradient attacks enforce strict tensor detaching (`logits.detach()`, `loss.detach()`, `grad.detach()`), zeroing, and `del` calls per step to prevent autograd graph memory leaks. Non-gradient forward passes execute inside `with torch.no_grad():`.
+* **Dual Representation Intercept:** `FeatureSpaceAttack` wrappers intercept continuous `float32` adversarial outputs, project them into a `float64` workspace to snap discrete features (PL, TTL, WIN) to perfect integers, and flawlessly restore immutable victim bytes. 
 * **Problem-Space Pipeline (`attacks/problem_space/`):** Modifies raw PCAP packets/bytes and re-extracts features dynamically using `BasePreprocessor`.
 
 #### 6. Universal Constraint Gatekeeper (`constraints/`)
 * **Decoupled Evaluation:** Sits strictly downstream of attack generation. Attacks do not have access to gatekeeper rules during optimization.
-* **Physical Domain Validation:** Normalization is inverted to evaluate physical units:
-  * Non-negativity constraints (packet length, IAT $\ge 0$).
-  * Discrete protocol specifications (TCP flags bitmasks).
-  * Feature monotonicity and packet/byte ratio boundaries.
-* **Realizability Telemetry:** Computes the **Realizability Rate** ($RR = \frac{N_{\text{valid}}}{N_{\text{total}}}$) and logs violation tallies per rule. When `strict_constraints: true`, unrealizable flows are filtered before target model scoring.
+* **Absolute Physical Truth:** Rejects drift-tolerance hacks. Validates exact constraints (e.g., `< 0.0`) on `float64` tensors where zero is mathematically exact.
+* **Bitwise Sync Verification:** Before executing any physical rules, it strictly verifies that the `float64` physical tensor precisely maps to the target NIDS `float32` memory layout, guaranteeing the oracle and NIDS evaluate the exact same payload. 
+* **Realizability Telemetry:** Computes the **Realizability Rate** ($RR = \frac{N_{\text{valid}}}{N_{\text{total}}}$). When `strict_constraints: true`, unrealizable flows are discarded before scoring.
 
 #### 7. Evaluation Engine & Bounded Memory Management (`evaluator/`)
-* **Bounded Batch Processing:** All prediction passes, detector scoring, and distance calculations execute in configurable batch chunks (`evaluation.batch_size=256`).
-* **Dataset Subsampling (`evaluation.max_samples`):** Enables deterministic pre-normalization subsampling to evaluate large datasets without memory exhaustion.
-* **Raw Storage Release Hook:** Datasets implementing `release_raw_features()` (e.g., `ciciomt2024.py`) release multi-gigabyte raw sequence caches immediately after normalizing target features.
-* **On-Demand Normalization Conversion:** Transfer attacks convert target-normalized feature slices to surrogate-normalized space per batch inside `EvaluationEngine`, avoiding full-corpus array duplication.
-* **Preallocated Memory & Chunked Distances:** Preallocates target adversarial matrices and computes perturbation distances ($L_0, L_2, L_\infty$) in chunks.
+* **Bounded Batch Processing:** All prediction passes, detector scoring, and distance calculations execute in configurable batch chunks to prevent OOM errors (e.g., `evaluation.batch_size=256`).
+* **Float64 Lifecycle Management:** To prevent memory bloat, `workflow.py` aggressively manages massive `float64` datasets, actively destroying arrays via `del` immediately after EAT or DAR projections conclude.
+* **Dataset Subsampling (`evaluation.max_samples`):** Enables deterministic pre-normalization subsampling for evaluating giant datasets efficiently.
 
 #### 8. Crash-Resilient Reporting Engine (`evaluator/logger.py`)
 * **Atomic Telemetry:** `FlushFileHandler` calls `os.fsync()` after writes to preserve logs in the event of job interruption.
@@ -188,12 +183,13 @@ nids-adv-benchmark/
 │   └── preprocessing/                # PCAP feature extractor configurations
 │
 ├── core/
+│   ├── dual_representation.py        # Canonical float32 model/float64 physical codecs
 │   ├── exceptions.py                 # Domain exceptions (ConfigurationError, etc.)
 │   └── registry.py                   # ComponentRegistry supporting decorator registration
 │
 ├── data/
 │   ├── base.py                       # BaseDataset interface and NormalizationStats
-│   └── ciciomt2024.py                # SequenceParquetDataset with release_raw_features()
+│   └── ciciomt2024.py                # SequenceParquetDataset with float64 preservation
 │
 ├── defenses/
 │   ├── base.py                       # BaseDetector interface (fit, score, state_dict)
@@ -204,8 +200,8 @@ nids-adv-benchmark/
 │   └── sota_extractor.py             # PCAP-to-vector extraction engine
 │
 ├── constraints/
-│   ├── rules.py                      # Physical and RFC constraint definitions
-│   └── gatekeeper.py                 # UniversalConstraintGatekeeper referee
+│   ├── rules.py                      # Physical and strict float64 RFC constraint definitions
+│   └── gatekeeper.py                 # UniversalConstraintGatekeeper dual-mode referee
 │
 ├── models/
 │   ├── architectures/                # PyTorch models (MLP, CNN, LSTM, Transformer)
@@ -214,7 +210,7 @@ nids-adv-benchmark/
 │
 ├── attacks/
 │   ├── base.py                       # BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
-│   ├── feature_space/                # Feature attacks (PGD, Square, TRADES, C&W)
+│   ├── feature_space/                # Feature attacks (PGD, Square, TdTce, C&W, etc.)
 │   └── problem_space/                # PCAP mutators and flow injectors
 │
 ├── evaluator/
@@ -227,7 +223,7 @@ nids-adv-benchmark/
 │   ├── device.py                     # CUDA pinning and fallback management
 │   └── runner.py                     # Multiprocessing seed executor (spawn)
 │
-├── workflow.py                       # Worker entry points (train_nids, evaluate_attack)
+├── workflow.py                       # Worker entry points with strict memory lifecycle hooks
 └── main.py                           # CLI entry point and post-run aggregator
 ```
 
@@ -365,13 +361,13 @@ python main.py \
 ---
 
 ### 5.2 Attack Model Training (Generative / Surrogates)
-For attacks requiring pre-trained generative models or substitute generators:
+For attacks requiring pre-trained generative models (like TDTCE) or substitute generators:
 
 ```bash
 python main.py \
   action=train_attack \
-  attack=<registered_attack_with_train_method> \
-  attack.params.<parameter>=<value> \
+  attack=tdtce \
+  attack.params.epochs=30 \
   seeds=[1,2,3,4,5] \
   gpu=0
 ```
@@ -514,6 +510,9 @@ class CustomDetector(BaseDetector):
 
 This framework builds upon concepts and foundational implementations from open-source research in adversarial machine learning:
 
+* **TDTCE (Time-Conditioned Diffusion):**
+  * **Paper:** *TDTCE: generating adversarial instances against NIDS via diffusion model* - Sui et al., The Computer Journal 2026
+  * **Repository:** [https://github.com/HHLinlife/TDTCE](https://github.com/HHLinlife/TDTCE)
 * **TRADES Adversarial Training:**
   * **Paper:** *Theoretically Principled Trade-off between Robustness and Accuracy* - Zhang et al., ICML 2019
   * **Repository:** [https://github.com/yaodongyu/TRADES](https://github.com/yaodongyu/TRADES)
