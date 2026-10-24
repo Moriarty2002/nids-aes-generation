@@ -357,7 +357,7 @@ class SequenceParquetDataset(BaseDataset):
         if target_length <= 0:
             raise ValueError("The Parquet dataset contains no packet observations")
 
-        canonical = np.empty((len(frame), target_length, len(self.fields)), dtype=np.float32)
+        canonical = np.empty((len(frame), target_length, len(self.fields)), dtype=np.float64)
         valid_mask = np.zeros((len(frame), target_length), dtype=bool)
 
         for row_idx in range(len(frame)):
@@ -382,9 +382,9 @@ class SequenceParquetDataset(BaseDataset):
                 if len(values) > target_length:
                     values = values[:target_length]
                 pad_value = float(self.pad_values.get(field, 0.0))
-                padded = np.full(target_length, pad_value, dtype=np.float32)
+                padded = np.full(target_length, pad_value, dtype=np.float64)
                 if values:
-                    padded[: len(values)] = np.asarray(values, dtype=np.float32)
+                    padded[: len(values)] = np.asarray(values, dtype=np.float64)
                 canonical[row_idx, :, feature_idx] = padded
 
         return canonical, valid_mask
