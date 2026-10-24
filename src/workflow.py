@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Callable, Mapping, Sequence, cast
 
 import numpy as np
 import torch
@@ -24,7 +24,7 @@ from core.registry import ATTACKS, DATASETS, DETECTORS, NIDS, PREPROCESSORS
 from evaluator.engine import EvaluationEngine, FeatureNormalization
 from evaluator.logger import ExperimentReporter
 from evaluator.metrics import classification_metrics
-from models.trainer import train_classifier
+from models.trainer import TrainingBatch, train_classifier
 from models.wrapper import ModelWrapper, PyTorchModelWrapper, SklearnModelWrapper
 from orchestrator.device import configure_process_device
 from orchestrator.runner import seed_everything
@@ -376,6 +376,98 @@ def _as_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+def _make_endpoint_perturbation_mask_fn(
+    feature_names: Sequence[str],
+    normalization: Any,
+    *,
+    immutable_features: Sequence[str] | None = None,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Define a non-MitM attacker's editable feature set for robust training.
+
+    DIR=1 means the packet belongs to the victim, so its entire feature row
+    cannot be changed by an endpoint attacker. All DIR columns are immutable;
+    any additional immutable protocol fields (FLG by default) are frozen on
+    attacker-owned packets as well. The feature-space attack owns threat-model
+    interpretation; the trainer receives only this generic mask callback.
+
+    Padding is *not* inferred from feature values here: shuffled batch masks
+    travel as an optional third training tensor and are intersected by the
+    trainer before PGD-AT/TRADES optimization.
+    """
+    names = tuple(str(name).upper() for name in feature_names)
+    if not names:
+        raise ConfigurationError("Asymmetric robust training requires feature_names")
+    immutable = tuple(dict.fromkeys(
+        str(name).upper() for name in (
+            immutable_features if immutable_features is not None
+            else (name for name in ("DIR", "FLG") if name in names)
+        )
+    ))
+    unknown = set(immutable).difference(names)
+    if unknown:
+        raise ConfigurationError(
+            f"Unknown robust-training immutable features: {sorted(unknown)}"
+        )
+    if not hasattr(normalization, "mean") or not hasattr(normalization, "std"):
+        raise ConfigurationError("Robust-training directional mask requires normalization metadata")
+    mean = normalization.mean
+    std = normalization.std
+    immutable_indices = tuple(names.index(name) for name in immutable)
+
+    def endpoint_mask(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return a device-local binary edit mask for a normalized training batch."""
+        del y  # Packet ownership is determined by DIR, not a class label.
+        allowed = FeatureSpaceAttack.victim_packet_perturbation_mask(
+            x,
+            names,
+            normalization_mean=mean,
+            normalization_std=std,
+        )
+        if immutable_indices:
+            view = allowed.reshape(x.shape[0], -1, len(names))
+            for index in immutable_indices:
+                view[..., index] = 0.0
+        return allowed
+
+    return endpoint_mask
+
+
+def _validated_packet_mask(
+    value: np.ndarray | torch.Tensor,
+    *,
+    sample_count: int,
+    input_shape: Sequence[int],
+    feature_count: int | None = None,
+) -> torch.Tensor:
+    """Validate a real-packet bitmap before binding it to shuffled examples.
+
+    The only authoritative source of padding is the dataset's explicit bitmap;
+    inspecting zero-valued normalized inputs cannot distinguish empty padding
+    from legitimate zero-valued protocol features.
+    """
+    packet_mask = torch.as_tensor(value, dtype=torch.bool)
+    if len(input_shape) not in (2, 3):
+        raise ConfigurationError("Packet masking requires flattened or sequence inputs")
+    if packet_mask.ndim != 2 or int(packet_mask.shape[0]) != sample_count:
+        raise ConfigurationError("dataset.valid_mask must have shape (N,T)")
+    if input_shape[0] != sample_count:
+        raise ConfigurationError("Input/packet-mask sample counts differ")
+    if len(input_shape) == 3:
+        if int(packet_mask.shape[1]) != int(input_shape[1]):
+            raise ConfigurationError("dataset.valid_mask T disagrees with sequence shape")
+    elif (int(packet_mask.shape[1]) < 1 or
+          int(input_shape[1]) % int(packet_mask.shape[1]) != 0):
+        raise ConfigurationError("Flattened feature width must be divisible by dataset.valid_mask T")
+    if feature_count is not None:
+        if feature_count < 1:
+            raise ConfigurationError("feature_count must be positive")
+        if len(input_shape) == 3 and input_shape[2] != feature_count:
+            raise ConfigurationError("Sequence width differs from feature_names")
+        if len(input_shape) == 2 and input_shape[1] != packet_mask.shape[1] * feature_count:
+            raise ConfigurationError("Flattened width differs from T times feature_names")
+    return packet_mask
+
+
 def _run_empirical_at(
     *,
     eat_cfg: Mapping[str, Any],
@@ -436,7 +528,18 @@ def _run_empirical_at(
         raise ConfigurationError("empirical_at.surrogate.training.batch_size must be >= 1")
     pin = device.type == "cuda"
     generator = torch.Generator().manual_seed(int(seed))
-    surrogate_train_ds = TensorDataset(x_tensor[train_idx], torch.as_tensor(y_np[train_idx], dtype=torch.long))
+    surrogate_train_x = x_tensor[train_idx]
+    surrogate_train_y = torch.as_tensor(y_np[train_idx], dtype=torch.long)
+    surrogate_train_ds = TensorDataset(surrogate_train_x, surrogate_train_y)
+    if valid_mask_full is not None:
+        surrogate_packet_mask = _validated_packet_mask(
+            valid_mask_full, sample_count=len(x_tensor), input_shape=tuple(x_tensor.shape),
+            feature_count=len(feature_names),
+        )
+        # Keep validity aligned with examples when the loader shuffles.
+        surrogate_train_ds = TensorDataset(
+            surrogate_train_x, surrogate_train_y, surrogate_packet_mask[train_idx]
+        )
     surrogate_val_ds = TensorDataset(x_tensor[val_idx], torch.as_tensor(y_np[val_idx], dtype=torch.long))
     surrogate_train_loader = DataLoader(
         surrogate_train_ds, batch_size=s_batch_size, shuffle=True, generator=generator,
@@ -454,6 +557,11 @@ def _run_empirical_at(
     early_stopping_min_delta = float(surrogate_training.get("early_stopping_min_delta", 0.0))
     early_stopping_monitor = str(surrogate_training.get("early_stopping_monitor", "val_loss"))
 
+    surrogate_mask_fn = _make_endpoint_perturbation_mask_fn(
+        feature_names,
+        normalization,
+        immutable_features=surrogate_training.get("immutable_features"),
+    )
     surrogate_summary = train_classifier(
         surrogate_wrapper,
         surrogate_train_loader,
@@ -475,6 +583,7 @@ def _run_empirical_at(
         output_dir=surrogate_output,
         seed=seed,
         logger=logger,
+        perturbation_mask_fn=surrogate_mask_fn,
     )
     surrogate_checkpoint = surrogate_output / "nids.pt"
     torch.save(
@@ -726,16 +835,32 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             if isinstance(wrapper, PyTorchModelWrapper) else 0,
         )
 
-    train_ds = TensorDataset(x_tensor[train_idx], y_tensor[train_idx])
-    val_ds = TensorDataset(x_tensor[val_idx], y_tensor[val_idx])
     tcfg = dict(model_cfg.get("training", {}))
     batch_size = int(tcfg.get("batch_size", 256))
     if batch_size < 1:
         raise ConfigurationError("model.training.batch_size must be >= 1")
     pin = device_info.torch_device.type == "cuda"
+    train_ds = TensorDataset(x_tensor[train_idx], y_tensor[train_idx])
+    val_ds = TensorDataset(x_tensor[val_idx], y_tensor[val_idx])
+
+    configured_mode = str(tcfg.get("defense_mode", "none") or "none").strip().lower()
+    robust_training = (
+        isinstance(wrapper, PyTorchModelWrapper)
+        and (configured_mode in {"pgd", "trades"} or bool(tcfg.get("adversarial_training", False)))
+    )
+    train_defense_ds = train_ds
+    if robust_training and hasattr(dataset, "valid_mask") and dataset.valid_mask is not None:
+        packet_mask = _validated_packet_mask(
+            dataset.valid_mask, sample_count=len(x_tensor), input_shape=tuple(x_tensor.shape),
+            feature_count=len(dataset.feature_names),
+        )
+        train_defense_ds = TensorDataset(
+            train_ds.tensors[0], train_ds.tensors[1], packet_mask[train_idx]
+        )
+
     train_loader = cast(
-        DataLoader[tuple[torch.Tensor, torch.Tensor]],
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=pin),
+        DataLoader[TrainingBatch],
+        DataLoader(train_defense_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=pin),
     )
     val_loader = cast(
         DataLoader[tuple[torch.Tensor, torch.Tensor]],
@@ -766,7 +891,12 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
     detector_enabled = bool(detector_cfg.get("enabled", False))
     augmented_train_x: np.ndarray | None = None
     augmented_train_y: np.ndarray | None = None
-    detector_train_loader = train_loader
+    # Detector fitting consumes (x,y) pairs. The third packet-validity tensor
+    # is exclusively for robust inner optimization, not detector feature fits.
+    detector_train_loader = (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin)
+        if train_defense_ds is not train_ds else train_loader
+    )
     eat_stats: dict[str, float] = {}
 
     if logger:
@@ -935,6 +1065,14 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
         early_stopping_min_delta = float(tcfg.get("early_stopping_min_delta", 0.0))
         early_stopping_monitor = str(tcfg.get("early_stopping_monitor", "val_loss"))
 
+        endpoint_mask_fn = (
+            _make_endpoint_perturbation_mask_fn(
+                tuple(dataset.feature_names),
+                normalization,
+                immutable_features=tcfg.get("immutable_features"),
+            )
+            if robust_training else None
+        )
         summary = train_classifier(
             wrapper,
             train_loader,
@@ -954,6 +1092,7 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             output_dir=checkpoint_dir,
             seed=seed,
             logger=logger,
+            perturbation_mask_fn=endpoint_mask_fn,
         )
 
         train_loss = float(summary.train_loss)

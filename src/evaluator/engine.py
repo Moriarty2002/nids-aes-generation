@@ -468,13 +468,27 @@ class EvaluationEngine:
                 )
 
             expected_batch_size = stop - start
+            # The authoritative mask is per-batch, not the entire corpus.
+            # Explicitly override a stale mask supplied through attack_kwargs.
+            # Padding must be invisible to randomized starts and PGD like updates,
+            # in addition to the existing final float64 physical restoration.
             valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
             if valid_mask_batch is not None:
+                _, expected_time_steps, _ = layout(attack_batch_input, feature_names)
+                if tuple(valid_mask_batch.shape) != (expected_batch_size, expected_time_steps):
+                    raise ValueError(
+                        f"valid_mask batch shape {tuple(valid_mask_batch.shape)} != "
+                        f"{(expected_batch_size, expected_time_steps)}"
+                    )
                 batch_kwargs["valid_mask"] = valid_mask_batch
+            else:
+                # run(valid_mask=None) means no padding mask; never leak one
+                # inherited from a different experiment via attack_kwargs.
+                batch_kwargs.pop("valid_mask", None)
             if isinstance(self.attack, FeatureSpaceAttack):
                 batch_kwargs["_clean_authoritative_physical"] = clean_target_physical
                 batch_kwargs["_discrete_diagnostic_logger"] = self.logger
-                batch_kwargs["_discrete_diagnostic_config"] = self.discrete_diagnostics
+                batch_kwargs["_discrete_diagnostic_config"] = getattr(self, "discrete_diagnostics", None)
             batch_result = self.attack.generate(
                 attack_batch_input,
                 _slice_batch(y, start, stop),

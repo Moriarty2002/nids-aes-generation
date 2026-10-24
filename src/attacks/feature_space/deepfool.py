@@ -102,6 +102,7 @@ class DeepFoolAttack(FeatureSpaceAttack):
             self.feature_names,
             normalization_mean=kwargs.get("normalization_mean"),
             normalization_std=kwargs.get("normalization_std"),
+            valid_mask=kwargs.get("valid_mask")
         ).to(device=x0.device, dtype=x0.dtype)
         mask = mask * immutable_feature_mask(x0, self.feature_names, self.immutable_features)
         lower, upper = resolve_bounds(x0, self.feature_names, self.clip_min, self.clip_max)

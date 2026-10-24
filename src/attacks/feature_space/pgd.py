@@ -115,6 +115,7 @@ class PGDAttack(FeatureSpaceAttack):
             self.feature_names,
             normalization_mean=normalization_mean,
             normalization_std=normalization_std,
+            valid_mask=kwargs.get("valid_mask")
         )
         perturbation_mask = perturbation_mask * immutable_feature_mask(
             x0,

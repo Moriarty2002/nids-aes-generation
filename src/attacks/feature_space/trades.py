@@ -60,6 +60,7 @@ class TRADESAttack(FeatureSpaceAttack):
             feature_names,
             normalization_mean=kwargs.get("normalization_mean"),
             normalization_std=kwargs.get("normalization_std"),
+            valid_mask=kwargs.get("valid_mask")
         )
         mask = mask * immutable_feature_mask(
             x_clean,

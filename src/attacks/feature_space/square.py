@@ -55,6 +55,7 @@ class SquareAttack(FeatureSpaceAttack):
             self.feature_names,
             normalization_mean=kwargs.get("normalization_mean"),
             normalization_std=kwargs.get("normalization_std"),
+            valid_mask=kwargs.get("valid_mask")
         ).cpu().numpy()
         perturbation_mask *= immutable_feature_mask(
             torch.as_tensor(x0),

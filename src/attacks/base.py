@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from models.wrapper import ModelWrapper
+from core.dual_representation import decode_physical64, encode_normalized32, layout
 
 
 @dataclass
@@ -316,71 +317,112 @@ class FeatureSpaceAttack(BaseAttack):
         *,
         normalization_mean: Sequence[float] | np.ndarray | torch.Tensor | None = None,
         normalization_std: Sequence[float] | np.ndarray | torch.Tensor | None = None,
+        valid_mask: np.ndarray | torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return a float mask for the features an endpoint attacker may edit.
+        """Mark only real, attacker-controlled packet coordinates as perturbable.
 
-        ``DIR == 1`` identifies victim-to-attacker packets in the physical
-        feature schema.  Attack inputs are usually z-score normalized, so the
-        direction channel is denormalized before comparison when statistics
-        are supplied.  DIR is always immutable, and every feature is immutable
-        on victim packets. Both sequence tensors ``(N, T, F)`` and flattened
-        tensors ``(N, T*F)`` are supported.
+        For endpoint (non-MitM) attackers, packets with physical ``DIR == 1``
+        are victim-owned and their *entire feature rows* are immutable. The
+        direction column is immutable on every packet. Sequence padding is not
+        traffic: when ``valid_mask[b, t]`` is false, **all** of its feature
+        coordinates must have zero gradient/random-start/PGD updates.
+
+        ``valid_mask`` has shape ``(B, T)`` and is converted to the device of
+        ``x``. Both ``(B, T*F)`` and ``(B, T, F)`` layouts, with ``F`` or
+        ``T*F`` normalization statistics, are supported. The returned tensor
+        has exactly the input's shape, device and dtype (normally float32).
+        For a schema without DIR, padding is still enforced.
         """
-        if x.ndim not in {2, 3}:
-            raise ValueError(f"Directional masking requires a 2-D or 3-D tensor, got {tuple(x.shape)}")
-        try:
-            direction_index = tuple(feature_names).index("DIR")
-        except ValueError:
-            return torch.ones_like(x)
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("Directional masking requires a torch.Tensor")
+        if x.ndim not in (2, 3):
+            raise ValueError(
+                f"Directional masking requires (B, T*F) or (B, T, F), got {tuple(x.shape)}"
+            )
 
-        feature_count = len(feature_names)
-        if feature_count <= direction_index:
-            raise ValueError("feature_names must include a valid DIR feature")
+        names = tuple(feature_names)
+        feature_count = len(names)
+        batch_size = int(x.shape[0])
+        valid: torch.Tensor | None = None
+        if valid_mask is not None:
+            valid = torch.as_tensor(valid_mask, dtype=torch.bool, device=x.device)
+            if valid.ndim != 2 or valid.shape[0] != batch_size:
+                raise ValueError(
+                    "valid_mask must have shape (B, T) with B equal to x.shape[0]"
+                )
+
         if x.ndim == 3:
-            if x.shape[-1] != feature_count:
-                raise ValueError(
-                    f"Expected {feature_count} features for sequence input, got {x.shape[-1]}"
-                )
-            direction = x[..., direction_index]
-            reshape_back = False
+            time_steps = int(x.shape[1])
+            if feature_count == 0:
+                feature_count = int(x.shape[2])
+            elif x.shape[2] != feature_count:
+                raise ValueError("Sequence width differs from feature_names")
         else:
-            if x.shape[-1] % feature_count:
-                raise ValueError(
-                    f"Flattened input width {x.shape[-1]} is not divisible by {feature_count} features"
-                )
-            direction = x.reshape(x.shape[0], -1, feature_count)[..., direction_index]
-            reshape_back = True
+            width = int(x.shape[1])
+            if feature_count == 0:
+                # An absent schema historically permits all changes; with a
+                # packet mask we can still infer layout and freeze padding.
+                if valid is None:
+                    return torch.ones_like(x)
+                if valid.shape[1] == 0 or width % int(valid.shape[1]):
+                    raise ValueError("Cannot infer packet width from valid_mask")
+                time_steps = int(valid.shape[1])
+                feature_count = width // time_steps
+            else:
+                if width % feature_count:
+                    raise ValueError(
+                        f"Flattened width {width} not divisible by {feature_count} features"
+                    )
+                time_steps = width // feature_count
 
+        if feature_count == 0:
+            raise ValueError("At least one feature coordinate is required")
+        if valid is not None and tuple(valid.shape) != (batch_size, time_steps):
+            raise ValueError(
+                f"valid_mask shape {tuple(valid.shape)} does not match "
+                f"packet layout {(batch_size, time_steps)}"
+            )
+
+        x_packets = x.reshape(batch_size, time_steps, feature_count)
+        direction_index = names.index("DIR") if "DIR" in names else None
+        if direction_index is None:
+            if valid is None:
+                return torch.ones_like(x)
+            return (
+                valid.unsqueeze(-1)
+                .expand(batch_size, time_steps, feature_count)
+                .reshape_as(x)
+                .to(dtype=x.dtype)
+            )
+
+        direction = x_packets[..., direction_index]
         if normalization_mean is not None or normalization_std is not None:
             if normalization_mean is None or normalization_std is None:
                 raise ValueError("normalization_mean and normalization_std must be supplied together")
-            mean = torch.as_tensor(normalization_mean, device=x.device, dtype=x.dtype)
-            std = torch.as_tensor(normalization_std, device=x.device, dtype=x.dtype)
-            flat_width = x.reshape(x.shape[0], -1, feature_count).shape[1] * feature_count
+            mean = torch.as_tensor(normalization_mean, device=x.device, dtype=x.dtype).reshape(-1)
+            std = torch.as_tensor(normalization_std, device=x.device, dtype=x.dtype).reshape(-1)
             if mean.numel() == feature_count and std.numel() == feature_count:
                 direction_mean = mean[direction_index]
                 direction_std = std[direction_index]
-            elif mean.numel() == flat_width and std.numel() == flat_width:
-                tiled_mean = mean.reshape(-1, feature_count)
-                tiled_std = std.reshape(-1, feature_count)
-                direction_mean = tiled_mean[:, direction_index]
-                direction_std = tiled_std[:, direction_index]
-                if x.ndim == 3:
-                    direction_mean = direction_mean.view(1, -1)
-                    direction_std = direction_std.view(1, -1)
+            elif mean.numel() == time_steps * feature_count and std.numel() == time_steps * feature_count:
+                direction_mean = mean.reshape(time_steps, feature_count)[:, direction_index]
+                direction_std = std.reshape(time_steps, feature_count)[:, direction_index]
             else:
                 raise ValueError(
-                    "Normalization statistics must match either feature_names "
-                    "or the flattened input width"
+                    "Normalization statistics must have F or T*F elements"
                 )
             direction = direction * direction_std + direction_mean
 
         victim = torch.isclose(direction, torch.ones_like(direction), atol=1e-2, rtol=0.0)
-        mask = (~victim).unsqueeze(-1).expand(*victim.shape, feature_count).clone()
-        # Direction is part of the traffic metadata, not an attacker-controlled
-        # feature, so it must remain unchanged for every packet.
-        mask[..., direction_index] = 0.0
-        return mask.reshape_as(x) if reshape_back else mask
+        editable = ~victim
+        if valid is not None:
+            editable = editable & valid
+
+        # Materialize independent writable storage before zeroing the DIR
+        # coordinate; expanded views cannot be written to safely.
+        packet_mask = editable.unsqueeze(-1).expand_as(x_packets).clone()
+        packet_mask[..., direction_index] = False
+        return packet_mask.reshape_as(x).to(dtype=x.dtype)
 
 
 class ProblemSpaceAttack(BaseAttack):

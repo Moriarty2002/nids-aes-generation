@@ -56,64 +56,158 @@ class MahalanobisDetector(BaseDetector):
             raise ValueError("Penultimate features contain NaN or infinite values")
         return values
 
-    def fit(self, dataloader: DataLoader, wrapper: ModelWrapper) -> "MahalanobisDetector":
-        """Estimate class means and one tied empirical covariance on training data using the wrapper-specific feature extractor.
+    @classmethod
+    def _fit_batch(
+        cls,
+        batch: Any,
+        wrapper: ModelWrapper,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Extract one bounded feature/label batch without retaining prior batches.
 
-        Call this only after the target model has finished its selected training
-        procedure (including PGD or TRADES when enabled), so statistics correspond
-        to the actual defended representation used at inference.
+        The detector works on penultimate representations rather than packet
+        tensors, so input layout and device placement remain the wrapper's
+        responsibility. Statistics are accumulated in CPU float64 for accuracy.
         """
-        feature_batches: list[np.ndarray] = []
-        label_batches: list[np.ndarray] = []
-        # PyTorch wrappers require temporary eval mode to freeze BatchNorm and
-        # dropout. sklearn estimators have no train/eval state, but implement the
-        # same polymorphic extract_features contract and need no special path.
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise ValueError("Detector fit expects batches shaped as (x, y)")
+        x_batch, y_batch = batch[0], batch[1]
+        features = cls._features_to_numpy(wrapper.extract_features(x_batch))
+        if isinstance(y_batch, torch.Tensor):
+            labels = y_batch.detach().cpu().numpy()
+        else:
+            labels = np.asarray(y_batch)
+        labels = labels.reshape(-1).astype(np.int64, copy=False)
+        if features.shape[0] != labels.size:
+            raise ValueError("Feature and label counts differ during detector fitting")
+        if features.shape[1] == 0:
+            raise ValueError("Penultimate features must have at least one column")
+        return features, labels
+
+    def fit(self, dataloader: DataLoader, wrapper: ModelWrapper) -> "MahalanobisDetector":
+        """Estimate class means and pooled MLE covariance in exactly two passes.
+
+        Pass 1 accumulates per-class feature sums and counts, giving
+        mu_c = (sum_{i:y_i=c} f_i) / n_c. Pass 2 sums the within-class
+        residual outer products, Sigma = sum_i (f_i-mu_{y_i})
+        (f_i-mu_{y_i})^T / N. A diagonal ridge stabilizes the pseudoinverse.
+
+        The dataloader must be *reiterable* and must expose the same examples
+        and feature representations on both passes. Random ordering is fine;
+        replacement sampling, stochastic augmentation, or a one-shot stream
+        may make the two-pass estimator inconsistent. Sample and class counts
+        are checked across passes, but cannot detect every dataset mutation.
+
+        CPU working memory is O(F^2 + C*F + B*F) rather than O(N*F), for
+        feature width F, observed classes C, and dataloader batch size B.
+        Fit only after NIDS training is complete, so statistics describe the
+        actual defended representation used for inference.
+        """
+        class_sums: dict[int, np.ndarray] = {}
+        class_counts: dict[int, int] = {}
+        feature_dim: int | None = None
+        n_samples = 0
+
+        # Hold eval mode for BOTH passes: dropout/BatchNorm must not change
+        # the representation in between computing class means and covariance.
         pytorch_wrapper = isinstance(wrapper, PyTorchModelWrapper)
         was_training = wrapper.model.training if pytorch_wrapper else False
         if pytorch_wrapper:
             wrapper.model.eval()
         try:
             with torch.no_grad():
+                # accumulate only O(C*F) sufficient statistics.
                 for batch in dataloader:
-                    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-                        raise ValueError("Detector fit expects batches shaped as (x, y)")
-                    x_batch, y_batch = batch[0], batch[1]
-                    feature_batches.append(self._features_to_numpy(wrapper.extract_features(x_batch)))
-                    if isinstance(y_batch, torch.Tensor):
-                        labels = y_batch.detach().cpu().numpy()
-                    else:
-                        labels = np.asarray(y_batch)
-                    label_batches.append(labels.reshape(-1).astype(np.int64, copy=False))
+                    features, labels = self._fit_batch(batch, wrapper)
+                    if feature_dim is None:
+                        feature_dim = int(features.shape[1])
+                    elif features.shape[1] != feature_dim:
+                        raise ValueError("Penultimate feature dimension changed between batches")
+                    if not labels.size:
+                        continue
+                    for label in np.unique(labels):
+                        key = int(label)
+                        selected = labels == label
+                        if key not in class_sums:
+                            class_sums[key] = np.zeros(feature_dim, dtype=np.float64)
+                            class_counts[key] = 0
+                        np.add(
+                            class_sums[key],
+                            features[selected].sum(axis=0, dtype=np.float64),
+                            out=class_sums[key],
+                        )
+                        class_counts[key] += int(np.count_nonzero(selected))
+                    n_samples += int(labels.size)
+
+                if n_samples == 0 or feature_dim is None:
+                    raise ValueError("Cannot fit MahalanobisDetector: training DataLoader is empty")
+
+                class_labels = np.asarray(sorted(class_sums), dtype=np.int64)
+                means = np.stack(
+                    [class_sums[int(label)] / class_counts[int(label)] for label in class_labels],
+                    axis=0,
+                )
+                if not np.isfinite(means).all():
+                    raise ValueError("Class means contain NaN or infinite values")
+
+                # covariance from centered feature batches, with at
+                # most one class subset's residuals resident at a time.
+                covariance = np.zeros((feature_dim, feature_dim), dtype=np.float64)
+                second_counts = np.zeros(class_labels.size, dtype=np.int64)
+                second_samples = 0
+                for batch in dataloader:
+                    features, labels = self._fit_batch(batch, wrapper)
+                    if features.shape[1] != feature_dim:
+                        raise ValueError("Penultimate feature dimension changed between passes")
+                    if not labels.size:
+                        continue
+                    class_indices = np.searchsorted(class_labels, labels)
+                    if (
+                        np.any(class_indices >= class_labels.size)
+                        or np.any(class_labels[class_indices] != labels)
+                    ):
+                        raise ValueError("DataLoader produced unseen classes on the second pass")
+                    second_counts += np.bincount(
+                        class_indices, minlength=class_labels.size
+                    )
+                    second_samples += int(labels.size)
+                    for index in np.unique(class_indices):
+                        # Boolean indexing allocates only a class subset of
+                        # THIS batch. Never mutate the wrapper's feature tensor.
+                        residuals = features[class_indices == index]
+                        np.subtract(residuals, means[index], out=residuals)
+                        np.add(covariance, residuals.T @ residuals, out=covariance)
+
+                expected_counts = np.asarray(
+                    [class_counts[int(label)] for label in class_labels], dtype=np.int64
+                )
+                if second_samples != n_samples or not np.array_equal(second_counts, expected_counts):
+                    raise ValueError(
+                        "DataLoader must yield the same sample and class counts on both fit passes; "
+                        "disable replacement sampling and changing data sources"
+                    )
         finally:
             if pytorch_wrapper:
                 wrapper.model.train(was_training)
 
-        if not feature_batches:
-            raise ValueError("Cannot fit MahalanobisDetector: training DataLoader is empty")
-        features = np.concatenate(feature_batches, axis=0)
-        labels = np.concatenate(label_batches, axis=0)
-        if len(features) != len(labels):
-            raise ValueError("Feature and label counts differ during detector fitting")
-        class_labels = np.unique(labels)
-        if class_labels.size < 1:
-            raise ValueError("Cannot fit MahalanobisDetector without observed classes")
-
-        means = np.vstack([features[labels == label].mean(axis=0) for label in class_labels])
-        class_index = {int(label): index for index, label in enumerate(class_labels)}
-        residuals = features - means[np.fromiter((class_index[int(label)] for label in labels), dtype=np.int64)]
-        # MLE tied covariance: pool residuals from all classes and divide by N.
-        covariance = (residuals.T @ residuals) / max(len(residuals), 1)
+        # MLE covariance uses N, NOT (N-C), to match the pre-refactor model.
+        np.divide(covariance, n_samples, out=covariance)
+        # Compensate for summation asymmetry before Hermitian pseudoinversion.
         covariance = (covariance + covariance.T) * 0.5
         if self.covariance_ridge:
-            covariance += self.covariance_ridge * np.eye(covariance.shape[0], dtype=np.float64)
+            covariance.flat[::feature_dim + 1] += self.covariance_ridge
+        if not np.isfinite(covariance).all():
+            raise ValueError("Pooled covariance contains NaN or infinite values")
         precision = np.linalg.pinv(covariance, hermitian=True)
+        if not np.isfinite(precision).all():
+            raise ValueError("Pooled precision contains NaN or infinite values")
 
-        self.class_labels_ = class_labels.astype(np.int64, copy=False)
-        self.class_means_ = means.astype(np.float64, copy=False)
-        self.covariance_ = covariance.astype(np.float64, copy=False)
-        self.precision_ = precision.astype(np.float64, copy=False)
-        self.feature_dim_ = int(features.shape[1])
-        self.n_fit_samples_ = int(len(features))
+        # Publish the fitted state only after BOTH complete passes succeeded.
+        self.class_labels_ = class_labels
+        self.class_means_ = means
+        self.covariance_ = covariance
+        self.precision_ = precision
+        self.feature_dim_ = feature_dim
+        self.n_fit_samples_ = n_samples
         return self
 
     def score(self, x: Any, wrapper: ModelWrapper) -> np.ndarray:
