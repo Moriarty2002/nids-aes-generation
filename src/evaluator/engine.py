@@ -11,6 +11,7 @@ import torch
 
 from attacks.base import AttackResult, BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
 from constraints.gatekeeper import UniversalConstraintGatekeeper
+from constraints.rules import DirectionalImmutabilityRule, RuleSet
 from defenses.base import BaseDetector
 from models.wrapper import ModelWrapper
 from preprocessing.base import BasePreprocessor
@@ -291,6 +292,26 @@ class EvaluationEngine:
         self.attack_model = attack_model or target_model
         self.attack = attack.bind_model(self.attack_model)
         self.gatekeeper = gatekeeper
+        # Differential packet comparisons have no positional meaning after
+        # raw packet insertion/deletion. Construct a separate immutable oracle
+        # policy instead of mutating the feature-space Gatekeeper's RuleSet.
+        # All non-differential physical rules and the exact normalized/physical
+        # encoding verification remain active for problem-space candidates.
+        if isinstance(self.attack, ProblemSpaceAttack):
+            aligned_rules = tuple(
+                rule for rule in gatekeeper.rules.rules
+                if not isinstance(rule, DirectionalImmutabilityRule)
+            )
+            self._problem_space_gatekeeper = UniversalConstraintGatekeeper(
+                rules=RuleSet(aligned_rules),
+                strict=gatekeeper.strict,
+                normalization_mean=gatekeeper.normalization_mean,
+                normalization_std=gatekeeper.normalization_std,
+                logger=gatekeeper.logger,
+                discrete_diagnostics=gatekeeper.discrete_diagnostics,
+            )
+        else:
+            self._problem_space_gatekeeper = None
         self.preprocessor = preprocessor
         self.attack_normalization = attack_normalization
         self.target_normalization = target_normalization
@@ -536,6 +557,10 @@ class EvaluationEngine:
 
             x_adv_source: np.ndarray | None = None
             processed: Any | None = None
+            # For raw packet attacks, only the generated packet occupancy is
+            # authoritative. The clean valid_mask is still passed to the attack
+            # above, but must never determine which generated packets are scored.
+            gate_valid_mask_batch = valid_mask_batch
             if batch_result.raw_adversarial is not None:
                 if self.preprocessor is None:
                     raise RuntimeError("Problem-space evaluation requires a preprocessor")
@@ -552,8 +577,51 @@ class EvaluationEngine:
                 x_adv_physical = _as_physical_shape(
                     raw_physical, _slice_batch(x_target, start, stop), batch_feature_names
                 )
-                if not x_adv_physical.flags.writeable or not x_adv_physical.flags.c_contiguous:
-                    x_adv_physical = np.array(x_adv_physical, dtype=np.float64, copy=True, order="C")
+                # Packet insertion can populate previously padded positions.
+                # Reusing the clean mask would silently hide those packets from
+                # the independent physical constraint oracle. Mask provenance
+                # must come from re-extracting the generated raw traffic.
+                generated_valid_mask = getattr(processed, "valid_mask", None)
+                if generated_valid_mask is None:
+                    if valid_mask_batch is not None and not bool(
+                        np.all(_as_numpy(valid_mask_batch))
+                    ):
+                        raise RuntimeError(
+                            "Problem-space preprocessing must export processed.valid_mask "
+                            "when clean sequences contain padding; original padding "
+                            "cannot describe injected packet occupancy"
+                        )
+                    # A fully populated clean sequence has no padded slots to
+                    # recover. Without explicit output metadata, retain that
+                    # all-valid mask (or None for unmasked tabular traffic).
+                else:
+                    generated_valid_mask = _as_numpy(generated_valid_mask)
+                    _, generated_timesteps, _ = layout(x_adv_physical, batch_feature_names)
+                    expected_mask_shape = (expected_batch_size, generated_timesteps)
+                    if (generated_valid_mask.dtype != np.bool_
+                            or generated_valid_mask.shape != expected_mask_shape):
+                        raise ValueError(
+                            "processed.valid_mask must be a boolean array of shape "
+                            f"{expected_mask_shape}, got shape "
+                            f"{generated_valid_mask.shape} and dtype "
+                            f"{generated_valid_mask.dtype}"
+                        )
+                    gate_valid_mask_batch = generated_valid_mask
+                    if self.logger is not None:
+                        if valid_mask_batch is not None:
+                            original_valid = _as_numpy(valid_mask_batch).astype(bool, copy=False)
+                            self.logger.info(
+                                "evaluation.problem_space_occupancy batch=%d:%d "
+                                "injected_positions=%d removed_positions=%d",
+                                start, stop,
+                                int(np.count_nonzero(gate_valid_mask_batch & ~original_valid)),
+                                int(np.count_nonzero(original_valid & ~gate_valid_mask_batch)),
+                            )
+                        else:
+                            self.logger.info(
+                                "evaluation.problem_space_occupancy batch=%d:%d valid_packets=%d",
+                                start, stop, int(np.count_nonzero(gate_valid_mask_batch)),
+                            )
             else:
                 if batch_result.adversarial is None or batch_result.authoritative_physical is None:
                     raise RuntimeError("Feature attack must return BOTH dual representations")
@@ -569,13 +637,24 @@ class EvaluationEngine:
 
             if tuple(batch_feature_names) != tuple(feature_names):
                 raise ValueError("Physical and target feature schemas differ")
-            victim_packets, padded_packets = _restore_target_physical_protected_inplace(
-                x_adv_physical, clean_target_physical, batch_feature_names,
-                immutable_features=getattr(self.attack, "immutable_features", ()),
-                valid_mask=valid_mask_batch,
-            )
-            
-            # Sole final target encoding is the authoritative physical representation, not the attack's internal float32 copy.
+            if isinstance(self.attack, FeatureSpaceAttack):
+                # Feature-space adversaries must not rewrite victim packets,
+                # immutable metadata, or padding in the physical reference.
+                _restore_target_physical_protected_inplace(
+                    x_adv_physical, clean_target_physical, batch_feature_names,
+                    immutable_features=getattr(self.attack, "immutable_features", ()),
+                    valid_mask=valid_mask_batch,
+                )
+            elif isinstance(self.attack, ProblemSpaceAttack):
+                # A raw-traffic attack may legitimately inject into previously
+                # padded slots. The extracted physical packets are authoritative;
+                # applying the clean mask here would erase real attack output.
+                pass
+            else:
+                raise TypeError("Evaluation attack must be feature-space or problem-space")
+
+            # Both paths encode directly from the resulting float64 physical
+            # representation. The Gatekeeper independently checks this encoding.
             x_adv_batch = encode_normalized32(
                 x_adv_physical, batch_feature_names,
                 None if self.target_normalization is None else self.target_normalization.mean,
@@ -618,14 +697,54 @@ class EvaluationEngine:
             x_clean_batch = _slice_batch(x_target, start, stop)
             y_batch = y_np[start:stop]
             baseline_batch = baseline_pred[start:stop]
-            gate = self.gatekeeper.validate(
+            # Raw packet mutations can insert/remove packets and shift all later
+            # positions. A row-wise comparison against the clean physical tensor
+            # therefore rejects valid raw traffic for the wrong reason. The
+            # problem-space oracle omits ONLY this unaligned differential rule;
+            # all independent physical constraints and byte-exact float32
+            # encoding verification are still enforced.
+            problem_space = isinstance(self.attack, ProblemSpaceAttack)
+            if problem_space:
+                # Without an alignment-aware independent validator, packet
+                # ownership must be enforced by the raw mutator itself. Require
+                # an explicit per-flow feasibility claim: silently interpreting
+                # an absent mask as "all feasible" invalidates realizability.
+                raw_intrinsic = batch_result.intrinsic_feasible_mask
+                if raw_intrinsic is None:
+                    raise RuntimeError(
+                        "Problem-space attack must provide intrinsic_feasible_mask "
+                        "from its packet-ownership/alignment validation; unaligned "
+                        "directional immutability cannot be checked by feature rows"
+                    )
+                intrinsic = _as_numpy(raw_intrinsic)
+                if intrinsic.dtype != np.bool_ or intrinsic.shape != (expected_batch_size,):
+                    raise ValueError(
+                        "Problem-space intrinsic_feasible_mask must be boolean "
+                        f"with shape {(expected_batch_size,)}, got "
+                        f"{intrinsic.dtype} and {intrinsic.shape}"
+                    )
+                if self._problem_space_gatekeeper is None:
+                    raise RuntimeError("Problem-space oracle was not initialized")
+                gatekeeper = self._problem_space_gatekeeper
+            else:
+                intrinsic = None
+                gatekeeper = self.gatekeeper
+
+            gate = gatekeeper.validate(
                 x_adv_batch,
                 first_feature_names,
                 authoritative_physical=x_adv_physical,
-                original_physical=clean_target_physical,
-                valid_mask=valid_mask_batch,
+                original_physical=None if problem_space else clean_target_physical,
+                valid_mask=gate_valid_mask_batch,
             )
             accepted_batch = np.asarray(gate.accepted, dtype=bool).reshape(-1)
+            if intrinsic is not None:
+                # Intrinsic checks are necessary but not sufficient: a flow
+                # must also satisfy every independently checkable physical rule.
+                accepted_batch &= intrinsic
+                n_intrinsic_violations = int(np.count_nonzero(~intrinsic))
+                if n_intrinsic_violations:
+                    violation_counts["problem_space_intrinsic_feasibility"] += n_intrinsic_violations
             if len(accepted_batch) != expected_batch_size:
                 raise RuntimeError(
                     "Gatekeeper accepted mask length does not match the generated batch: "

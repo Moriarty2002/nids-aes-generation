@@ -426,7 +426,26 @@ class FeatureSpaceAttack(BaseAttack):
 
 
 class ProblemSpaceAttack(BaseAttack):
-    """Mutate raw traffic before the preprocessor converts it into model features."""
+    """
+    Base class for all problem-space (raw traffic/PCAP) attacks.
+    
+    Mutate raw traffic before the preprocessor converts it into model features. 
+    CRITICAL ARCHITECTURAL REQUIREMENT:
+    Because problem-space attacks can inject or drop packets, the generated adversarial sequence 
+    loses 1:1 positional alignment with the clean baseline. Consequently, the EvaluationEngine 
+    disables post-hoc row-by-row directional immutability checks for these attacks, as array 
+    differentials are mathematically undefined on unaligned sequences.
+
+    To maintain threat-model integrity, concrete implementations MUST:
+    1. Enforce packet ownership intrinsically during the PCAP mutation phase (e.g., strictly 
+       verifying that victim packets are never modified).
+    2. Explicitly populate the `intrinsic_feasible_mask` field in the returned `AttackResult` 
+       with a 1D boolean numpy array of shape `(batch_size,)`.
+    
+    The framework operates on a strict fail-closed security principle. If `intrinsic_feasible_mask` 
+    is returned as `None`, the EvaluationEngine will intercept it and intentionally raise a 
+    RuntimeError to prevent unverified topological changes from bypassing the gatekeeper.
+    """
 
     query_based: bool = True
 

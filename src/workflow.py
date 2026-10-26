@@ -83,9 +83,10 @@ def _inject_dynamic_dataset_shape(cfg: dict[str, Any]) -> None:
 
     The override is applied only when the dataset constructor supports a
     ``flatten`` parameter, preserving all existing flat/tabular adapters.
-    Target and surrogate shapes must agree when a sequence dataset is used;
-    otherwise the same generated tensor cannot faithfully represent both
-    attack and target model input contracts.
+    The target topology determines the dataset's stored representation.
+    Surrogates may use a different topology: EAT maps the same ordered
+    packet-feature coordinates bijectively between (N,T*F) and (N,T,F),
+    without reordering features or changing their physical interpretation.
     """
     dataset_cfg_raw = cfg.get("dataset")
     model_cfg = cfg.get("model")
@@ -100,20 +101,6 @@ def _inject_dynamic_dataset_shape(cfg: dict[str, Any]) -> None:
     target_flatten = _model_requires_flatten(model_cfg)
     if supports_flatten:
         params["flatten"] = target_flatten
-
-    surrogate_cfg = cfg.get("surrogate_model")
-    if (
-        isinstance(surrogate_cfg, Mapping)
-        and bool(surrogate_cfg.get("enabled", True))
-        and bool(surrogate_cfg.get("name"))
-    ):
-        surrogate_flatten = _model_requires_flatten(surrogate_cfg)
-        if supports_flatten and surrogate_flatten != target_flatten:
-            raise ConfigurationError(
-                "Target and surrogate models require incompatible dataset shapes: "
-                f"target flatten={target_flatten}, surrogate flatten={surrogate_flatten}. "
-                "Use compatible sequence/flat model families or provide an explicit adapter."
-            )
 
     dataset_cfg["params"] = params
     cfg["dataset"] = dataset_cfg
@@ -487,11 +474,12 @@ def _run_empirical_at(
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """Train a differentiable surrogate and generate gatekeeper-filtered EAT samples.
 
-    Attacks are invoked on CPU NumPy batches, with at most 256 samples per call.
-    Every batch gets the deterministic but distinct seed ``seed + batch_start``.
-    The gatekeeper receives normalized samples plus the exact normalization stats,
-    so protocol rules operate in physical units and victim-direction immutability
-    can compare adversarial rows to their clean originals.
+    Sklearn targets remain flat (N,T*F); sequence surrogates see a bijective
+    (N,T,F) view of precisely the same ordered coordinates. Attack and clean
+    float64 physical buffers are reshaped together, so the gatekeeper checks
+    physical packet ownership before accepted examples return to flat target
+    layout. Normalization statistics are unchanged (F or T*F entries), and
+    attack batches remain bounded at most 256 samples for memory safety.
     """
     surrogate_cfg_raw = eat_cfg.get("surrogate", eat_cfg.get("surrogate_model", {}))
     if not isinstance(surrogate_cfg_raw, Mapping):
@@ -501,16 +489,34 @@ def _run_empirical_at(
     surrogate_model_cfg: dict[str, Any] = {
         "name": surrogate_name,
         "params": dict(surrogate_cfg.get("params", {})),
-        "requires_flatten": bool(surrogate_cfg.get("requires_flatten", True)),
+        # Infer from registered architecture unless explicitly overridden.
+        # A CNN/LSTM/Transformer cannot be silently treated as a flat MLP.
+        "requires_flatten": _model_requires_flatten(surrogate_cfg),
     }
     if x_tensor.ndim != 2:
         raise ConfigurationError(
-            "Empirical AT for sklearn estimators requires flattened 2-D samples; configure a flattening surrogate."
+            "Sklearn EAT targets require flattened (N,T*F) inputs"
         )
+    feature_count = len(feature_names)
+    if feature_count == 0 or x_tensor.shape[1] % feature_count != 0:
+        raise ConfigurationError(
+            "Cannot reshape EAT samples: target width must be divisible by feature_names"
+        )
+    packets_per_flow = int(x_tensor.shape[1] // feature_count)
+    if packets_per_flow < 1:
+        raise ConfigurationError("EAT samples must contain at least one packet")
+
+    # Only tensor topology changes. This is a row-major, bijective reshape:
+    # flat[t*F + j] == sequence[t,j]. Neither packet order nor the physical
+    # feature schema changes, and reshape does not copy contiguous inputs.
+    surrogate_input = (
+        x_tensor if surrogate_model_cfg["requires_flatten"]
+        else x_tensor.reshape(len(x_tensor), packets_per_flow, feature_count)
+    )
 
     surrogate_wrapper = _build_model(
         surrogate_model_cfg,
-        (len(x_tensor), int(x_tensor.shape[-1])),
+        tuple(surrogate_input.shape),
         device=device,
         num_classes=num_classes,
         seed=seed,
@@ -528,7 +534,8 @@ def _run_empirical_at(
         raise ConfigurationError("empirical_at.surrogate.training.batch_size must be >= 1")
     pin = device.type == "cuda"
     generator = torch.Generator().manual_seed(int(seed))
-    surrogate_train_x = x_tensor[train_idx]
+    surrogate_train_x = surrogate_input[train_idx]
+    surrogate_val_x = surrogate_input[val_idx]
     surrogate_train_y = torch.as_tensor(y_np[train_idx], dtype=torch.long)
     surrogate_train_ds = TensorDataset(surrogate_train_x, surrogate_train_y)
     if valid_mask_full is not None:
@@ -540,7 +547,7 @@ def _run_empirical_at(
         surrogate_train_ds = TensorDataset(
             surrogate_train_x, surrogate_train_y, surrogate_packet_mask[train_idx]
         )
-    surrogate_val_ds = TensorDataset(x_tensor[val_idx], torch.as_tensor(y_np[val_idx], dtype=torch.long))
+    surrogate_val_ds = TensorDataset(surrogate_val_x, torch.as_tensor(y_np[val_idx], dtype=torch.long))
     surrogate_train_loader = DataLoader(
         surrogate_train_ds, batch_size=s_batch_size, shuffle=True, generator=generator,
         num_workers=0, pin_memory=pin,
@@ -595,7 +602,7 @@ def _run_empirical_at(
             "num_classes": int(num_classes),
             "classes": list(range(num_classes)),
             "feature_names": list(feature_names),
-            "input_shape": list(x_tensor.shape[1:]),
+            "input_shape": list(surrogate_input.shape[1:]),
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
             "normalization_version": getattr(normalization, "version", "unknown"),
@@ -683,25 +690,39 @@ def _run_empirical_at(
         batch_indices = selected_idx[b_start : b_start + attack_batch_size]
         x_clean = x_tensor[batch_indices].detach().cpu().numpy().astype(np.float32, copy=False)
         x_clean_phys = x_physical[batch_indices]
+        # Keep authoritative clean coordinates in the SAME topology as the
+        # surrogate's attack input. This is essential for physical victim-row
+        # restoration and independent gatekeeper directional comparisons.
+        if tuple(x_clean_phys.shape) != tuple(x_clean.shape):
+            raise ConfigurationError("EAT clean physical and normalized shapes differ")
+        x_attack = (
+            x_clean if surrogate_model_cfg["requires_flatten"]
+            else x_clean.reshape(len(x_clean), packets_per_flow, feature_count)
+        )
+        x_attack_phys = (
+            x_clean_phys if surrogate_model_cfg["requires_flatten"]
+            else x_clean_phys.reshape(len(x_clean), packets_per_flow, feature_count)
+        )
         y_clean = y_np[batch_indices].astype(np.int64, copy=False)
         batch_kwargs: dict[str, Any] = {
             "seed": int(seed + b_start),
             "target_label": benign_label,
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
-            "_clean_authoritative_physical": x_clean_phys,
+            "_clean_authoritative_physical": x_attack_phys,
         }
         batch_valid_mask = None
         if valid_mask_full is not None:
             batch_valid_mask = np.asarray(valid_mask_full, dtype=bool)[batch_indices]
             batch_kwargs["valid_mask"] = batch_valid_mask
-        result = attack.generate(x_clean, y_clean, **batch_kwargs)
+        result = attack.generate(x_attack, y_clean, **batch_kwargs)
         if result.adversarial is None or result.raw_adversarial is not None:
             raise ConfigurationError("EAT feature-space attack must return result.adversarial")
         x_adv = _as_numpy(result.adversarial).astype(np.float32, copy=False)
-        if x_adv.shape != x_clean.shape:
+        if x_adv.shape != x_attack.shape:
             raise ConfigurationError(
-                f"EAT attack {attack_cls.__name__} changed batch shape {x_clean.shape} -> {x_adv.shape}"
+                f"EAT attack {attack_cls.__name__} changed surrogate shape "
+                f"{x_attack.shape} -> {x_adv.shape}"
             )
         result_names = tuple(result.feature_names or feature_names)
         if result_names != feature_names:
@@ -712,7 +733,7 @@ def _run_empirical_at(
             feature_names,
             valid_mask=batch_valid_mask,
             authoritative_physical=result.authoritative_physical,   # From AttackResult
-            original_physical=x_clean_phys,                         # Pristine baseline
+            original_physical=x_attack_phys,                       # Pristine baseline in surrogate layout
         )
         accepted = np.asarray(gate.accepted, dtype=bool).copy()
         if result.intrinsic_feasible_mask is not None:
@@ -730,7 +751,15 @@ def _run_empirical_at(
                 len(np.unique(np.asarray(violation.indices, dtype=np.int64)))
             )
         if accepted.any():
-            valid_adversarial.append(x_adv[accepted].copy())
+            # The sklearn target ONLY receives (N,T*F). Reshape after oracle
+            # validation, preserving the exact float32 coordinate encoding.
+            # Boolean indexing already allocates its necessary output buffer.
+            x_adv_target = (
+                x_adv.reshape(x_clean.shape) if x_adv.ndim == 3 else x_adv
+            )
+            if x_adv_target.shape != x_clean.shape:
+                raise ConfigurationError("EAT output does not match flat sklearn target shape")
+            valid_adversarial.append(x_adv_target[accepted])
             # Keep the original malicious label when robustifying the target NIDS.
             valid_adversarial_labels.append(y_clean[accepted].copy())
         if logger:
@@ -965,10 +994,12 @@ def train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str, logger: l
             augmented_train_y = np.concatenate((clean_train_y, adversarial_y), axis=0)
             eat_stats["eat_augmented_samples"] = float(len(adversarial_y))
             eat_stats["eat_training_samples_total"] = float(len(augmented_train_y))
-            detector_dataset = TensorDataset(
-                torch.as_tensor(augmented_train_x, dtype=torch.float32),
-                torch.as_tensor(augmented_train_y, dtype=torch.long),
-            )
+            # Mahalanobis reference moments must describe the CLEAN training
+            # distribution, even though the defended sklearn classifier was fit
+            # on (clean + adversarial) traffic. Including adversarial examples
+            # would shift class-conditional means and pooled covariance, changing
+            # the anomaly detector's reference hypothesis. 
+            detector_dataset = train_ds
             detector_train_loader = cast(
                 DataLoader[tuple[torch.Tensor, torch.Tensor]],
                 DataLoader(
