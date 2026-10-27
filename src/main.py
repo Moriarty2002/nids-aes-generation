@@ -194,7 +194,7 @@ def _action(cfg: DictConfig) -> None:
 OmegaConf.register_new_resolver("uuid", lambda: uuid.uuid4().hex[:8])
 OmegaConf.register_new_resolver(
     "eval_path", 
-    lambda action, name, variant: f"{name}_{variant}" if action == "evaluate_attack" else "baseline",
+    lambda action, name, variant: f"{name}_{variant}" if action in ["evaluate_attack", "train_attack"] else "baseline",
     use_cache=True
 )
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")

@@ -6,6 +6,8 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
+from src.core.dual_representation import *
+
 from .rules import RuleSet, RuleViolation, DirectionalImmutabilityRule
 
 

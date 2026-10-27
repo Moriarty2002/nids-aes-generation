@@ -241,21 +241,22 @@ class FeatureSpaceAttack(BaseAttack):
             raise TypeError("Physical clipping requires float64")
         names = tuple(str(n).upper() for n in feature_names)
         view = x_adv.reshape(b,t,f)
-        for key, bound in clip_ranges.items():
-            name = str(key).upper()
-            if name not in names:
-                raise ValueError(f"Unknown clip_ranges feature {key!r}")
-            if len(bound) != 2:
-                raise ValueError(f"Invalid physical bounds for {key!r}")
-            lower, upper = float(bound[0]), float(bound[1])
-            if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
-                raise ValueError(f"Invalid physical bounds for {key!r}")
-            j = names.index(name)
-            if isinstance(view, torch.Tensor):
-                with torch.no_grad():
-                    view[...,j].clamp_(min=lower, max=upper)
-            else:
-                np.clip(view[...,j], lower, upper, out=view[...,j])
+        if clip_ranges:
+            for key, bound in clip_ranges.items():
+                name = str(key).upper()
+                if name not in names:
+                    raise ValueError(f"Unknown clip_ranges feature {key!r}")
+                if len(bound) != 2:
+                    raise ValueError(f"Invalid physical bounds for {key!r}")
+                lower, upper = float(bound[0]), float(bound[1])
+                if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+                    raise ValueError(f"Invalid physical bounds for {key!r}")
+                j = names.index(name)
+                if isinstance(view, torch.Tensor):
+                    with torch.no_grad():
+                        view[...,j].clamp_(min=lower, max=upper)
+                else:
+                    np.clip(view[...,j], lower, upper, out=view[...,j])
         return x_adv
 
     def _apply_discrete_lattice_projection(
