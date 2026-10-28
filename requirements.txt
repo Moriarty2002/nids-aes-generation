@@ -11,3 +11,4 @@ pyarrow>=17.0.0
 tqdm>=4.66.0
 matplotlib>=3.9.2
 seaborn>=0.13.2
+shap>=0.48.1,<0.50.0

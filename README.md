@@ -510,14 +510,17 @@ class CustomDetector(BaseDetector):
 
 This framework builds upon concepts and foundational implementations from open-source research in adversarial machine learning:
 
+* **Literature Reference:**
+  * **Paper:** *Adversarial Robustness of Deep Learning-Based Intrusion Detection Systems: A Systematic Literature Review* - Winanto et al., IEEE Access 2026
 * **TDTCE (Time-Conditioned Diffusion):**
   * **Paper:** *TDTCE: generating adversarial instances against NIDS via diffusion model* - Sui et al., The Computer Journal 2026
   * **Repository:** [https://github.com/HHLinlife/TDTCE](https://github.com/HHLinlife/TDTCE)
+* **AMD-GAN**
+  * **Paper:** *Adversarial red teaming and imbalance correction in heterogeneous NIDS: A class-specific adaptive GAN framework* - Lara et al., Journal of Information Security and Applications 2026
+  * **Repository:** [https://github.com/antoniol00/AMD-GAN](https://github.com/antoniol00/AMD-GAN)
 * **TRADES Adversarial Training:**
   * **Paper:** *Theoretically Principled Trade-off between Robustness and Accuracy* - Zhang et al., ICML 2019
   * **Repository:** [https://github.com/yaodongyu/TRADES](https://github.com/yaodongyu/TRADES)
 * **Deep Mahalanobis Detector:**
   * **Paper:** *A Simple Unified Framework for Detecting Out-of-Distribution Samples and Adversarial Attacks* - Lee et al., NeurIPS 2018
   * **Repository:** [https://github.com/pokaxpoka/deep_Mahalanobis_detector](https://github.com/pokaxpoka/deep_Mahalanobis_detector)
-* **Literature Reference:**
-  * **Paper:** *Adversarial Robustness of Deep Learning-Based Intrusion Detection Systems: A Systematic Literature Review* - Winanto et al., IEEE Access 2026

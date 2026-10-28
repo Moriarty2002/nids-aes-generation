@@ -1,0 +1,42 @@
+# Hydra configs/attack/amd_gan.yaml
+# action=train_attack -> AMDGANFeatureAttack.train(config=..., seed=..., gpu=...)
+# action=evaluate_attack -> registry constructs AMDGANFeatureAttack from settings.
+name: amd_gan
+variant: "classwise_wgangp_xai"
+
+# all dataset immutable_features plus DIR and FLG become categorical heads;
+# remaining coordinates become continuous heads. 
+# set both lists explicitly after inspecting the dataset's feature order if desired.
+continuous_idx: [1]
+categorical_idx: [0,2,3,4,5]
+max_categories: 3000
+latent_dim: 100
+gumbel_tau: 0.7
+
+training_steps_large: 2 #15000
+training_steps_small: 5 #25000
+training_steps_nano: 3 #30000
+critic_steps_large: 5
+critic_steps_small: 3
+critic_steps_nano: 2
+learning_rate_large: 0.0001
+learning_rate_small: 0.00005
+learning_rate_nano: 0.00002
+training_fraction: 0.8
+
+xai_threshold: 0.85
+xai_samples: 256
+xai_trees: 5 #100
+
+# IMPORTANT:
+# The same expression is resolved under train_attack and evaluate_attack.
+# remember to overrire the checkpoint path for 'evaluate_attack' operation
+# or it will try to search a non existing checkpoint in the output_dir of the current run.
+checkpoint: "${output_dir}/checkpoints/amd_gan_seed{seed}.pt"
+
+# Must not overwrite GAN coordinates before independent gatekeeper verification.
+# The inherited FeatureSpaceAttack finalizer still protects victim packets,
+# padding, and exact authoritative float64 <-> float32 consistency.
+discrete_projection: true
+clip_ranges: ${dataset.clip_ranges}
+immutable_features: ${dataset.immutable_features}
