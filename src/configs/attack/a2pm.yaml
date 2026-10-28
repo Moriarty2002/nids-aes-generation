@@ -1,0 +1,18 @@
+# Example Hydra attack configuration. Adjust packet-local indices to the
+# actual ordered dataset.feature_names (never to flattened T*F positions).
+# Illustrative six-feature schema: index 0 is immutable DIR, index 5 is a
+# protected categorical context/lock. Do not use these indices blindly.
+name: a2pm
+variant: "a2pm_int{.params.interval_probability}_comb{.params.combination_probability}_iter{.params.max_iterations}"
+
+params:
+  continuous_idx: [1]
+  categorical_idx: [0, 3, 5]
+  locked_features: [2, 4]
+  interval_probability: 0.6
+  combination_probability: 0.4
+  max_iterations: 20
+  target_label: 0
+
+discrete_projection: false
+checkpoint: null

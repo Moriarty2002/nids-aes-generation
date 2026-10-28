@@ -518,6 +518,9 @@ This framework builds upon concepts and foundational implementations from open-s
 * **AMD-GAN**
   * **Paper:** *Adversarial red teaming and imbalance correction in heterogeneous NIDS: A class-specific adaptive GAN framework* - Lara et al., Journal of Information Security and Applications 2026
   * **Repository:** [https://github.com/antoniol00/AMD-GAN](https://github.com/antoniol00/AMD-GAN)
+* **A2PM**
+  * **Paper:** *Adaptative Perturbation Patterns: Realistic Adversarial Learning for Robust Intrusion Detection* - Vitorino et al., Future Internet 2022
+  * **Repository:** [https://github.com/vitorinojoao/a2pm](https://github.com/vitorinojoao/a2pm)
 * **TRADES Adversarial Training:**
   * **Paper:** *Theoretically Principled Trade-off between Robustness and Accuracy* - Zhang et al., ICML 2019
   * **Repository:** [https://github.com/yaodongyu/TRADES](https://github.com/yaodongyu/TRADES)
