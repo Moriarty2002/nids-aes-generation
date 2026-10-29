@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Sequence
+from typing import Any, ClassVar, Sequence
 
 import numpy as np
 import torch
@@ -86,77 +86,193 @@ class FeatureSpaceAttack(BaseAttack):
     clip_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     feature_names: tuple[str, ...] = ()
     immutable_features: tuple[str, ...] = ()
+    operates_on_physical_features: ClassVar[bool] = False
     model: ModelWrapper | None = field(default=None, init=False, repr=False, compare=False)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Ensure each concrete feature attack finalizes output before returning it."""
+        """Finalize feature-space attacks in an authoritative physical domain.
+
+        Normalized attacks retain their existing float32 input/output contract.
+        Opted-in physical generators receive and emit float64 measurements.
+
+        Both paths converge on the same physical constraint projection followed
+        by canonical float32 encoding. The gatekeeper remains independent.
+        """
         super().__init_subclass__(**kwargs)
+
         implementation = cls.__dict__.get("generate")
         if implementation is None or getattr(implementation, "_discrete_projector_wrapped", False):
             return
 
         @wraps(implementation)
         def _generate_with_discrete_projection(
-            self: "FeatureSpaceAttack", *args: Any, **call_kwargs: Any
+            self: "FeatureSpaceAttack",
+            *args: Any,
+            **call_kwargs: Any,
         ) -> AttackResult:
             # Engine supplies the unquantized physical baseline. Never forward
             # this internal argument to concrete PGD/gradient-attack methods.
             clean_authoritative = call_kwargs.pop("_clean_authoritative_physical", None)
             result = implementation(self, *args, **call_kwargs)
+
             if not isinstance(result, AttackResult) or result.adversarial is None:
                 return result
 
             original = args[0] if args else call_kwargs.get("x")
-            names = tuple(result.feature_names or self.feature_names or call_kwargs.get("feature_names", ()))
+            names = tuple(
+                result.feature_names
+                or self.feature_names
+                or call_kwargs.get("feature_names", ())
+            )
+
             mean = call_kwargs.get("normalization_mean")
             std = call_kwargs.get("normalization_std")
+
             if mean is None or std is None:
                 raise ValueError("Dual-representation feature attacks require normalization statistics")
             if original is None:
                 raise ValueError("Dual-representation feature attacks require a clean input")
             source = result.adversarial
-            if source.dtype != (torch.float32 if isinstance(source, torch.Tensor) else np.float32):
-                raise TypeError("Feature attack must generate normalized float32 samples")
+
+            if not isinstance(source, (np.ndarray, torch.Tensor)):
+                raise TypeError("Feature attack must return a NumPy array or PyTorch tensor")
+
+            physical_mode = bool(self.operates_on_physical_features)
+
+            expected_dtype = (
+                torch.float64
+                if physical_mode and isinstance(source, torch.Tensor)
+                else np.float64
+                if physical_mode
+                else torch.float32
+                if isinstance(source, torch.Tensor)
+                else np.float32
+            )
+
+            if source.dtype != expected_dtype:
+                raise TypeError(
+                    "Physical-space attacks must generate float64; "
+                    "normalized-space attacks must generate float32"
+                )
+
             if tuple(source.shape) != tuple(original.shape):
                 raise ValueError("Attack and baseline shapes differ")
 
-            # Exactly one float64 candidate workspace. The separate clean
-            # physical reference is necessary for faithful victim restoration.
+            if physical_mode and (
+                not isinstance(original, (np.ndarray, torch.Tensor))
+                or original.dtype != (
+                    torch.float64
+                    if isinstance(original, torch.Tensor)
+                    else np.float64
+                )
+            ):
+                raise TypeError("Physical feature attacks require float64 inputs")
+
             if clean_authoritative is None:
                 raise ValueError(
                     "Authoritative clean physical baseline is required; "
                     "normalized float32 values cannot recover exact physical truth"
                 )
-            physical = decode_physical64(source, names, mean, std)
+
+            if physical_mode and (
+                not isinstance(clean_authoritative, (np.ndarray, torch.Tensor))
+                or clean_authoritative.dtype != (
+                    torch.float64
+                    if isinstance(clean_authoritative, torch.Tensor)
+                    else np.float64
+                )
+            ):
+                raise TypeError("Physical feature attacks require a float64 clean baseline")
+
+            if physical_mode:
+                # The generator has already emitted authoritative physical
+                # measurements. Never decode these values from normalized space.
+                if isinstance(source, torch.Tensor):
+                    physical = source.detach().contiguous()
+                else:
+                    physical = (
+                        source
+                        if source.flags.writeable and source.flags.c_contiguous
+                        else np.array(
+                            source,
+                            dtype=np.float64,
+                            copy=True,
+                            order="C",
+                        )
+                    )
+            else:
+                # Preserve the original PGD like float32 contract.
+                physical = decode_physical64(
+                    source,
+                    names,
+                    mean,
+                    std,
+                )
+
             if isinstance(physical, torch.Tensor):
                 clean_physical = torch.as_tensor(
-                    clean_authoritative, dtype=torch.float64, device=physical.device
+                    clean_authoritative,
+                    dtype=torch.float64,
+                    device=physical.device,
                 )
             else:
-                clean_physical = np.asarray(clean_authoritative, dtype=np.float64)
-            result.metadata["clean_baseline_provenance"] = "pre_normalization_physical"
+                clean_physical = np.asarray(
+                    clean_authoritative,
+                    dtype=np.float64,
+                )
+
             if clean_physical.shape != physical.shape:
                 raise ValueError("Clean authoritative physical shape differs from attack shape")
 
-            # All post-generation operations are in-place in native physical
-            # space. Protected values are restored LAST so clipping and lattice
-            # projection cannot touch victim packets or immutable fields.
-            self._apply_range_clipping(physical, names, clip_ranges=self.clip_ranges)
-            self._apply_discrete_lattice_projection(physical, names)
+            result.metadata["clean_baseline_provenance"] = (
+                "pre_normalization_physical"
+            )
+            
+            # Never trust a generator's own bounds or discrete outputs as could suffer from float drifting.
+            self._apply_range_clipping(
+                physical,
+                names,
+                clip_ranges=self.clip_ranges,
+            )
+
+            self._apply_discrete_lattice_projection(
+                physical,
+                names,
+            )
+
+            # Restore protected coordinates LAST, after every operation that
+            # could otherwise alter victim-owned packets, immutable metadata, or padding.
             self._restore_protected_values(
-                physical, clean_physical, names,
+                physical,
+                clean_physical,
+                names,
                 valid_mask=call_kwargs.get("valid_mask"),
             )
+
             result.authoritative_physical = physical
-            result.adversarial = encode_normalized32(physical, names, mean, std)
+
+            # Sole output conversion for the surrogate/model contract.
+            result.adversarial = encode_normalized32(
+                physical,
+                names,
+                mean,
+                std,
+            )
+
             result.metadata.update({
                 "range_clipping_enabled": bool(self.clip_ranges),
                 "range_clipping_applied": bool(self.clip_ranges),
                 "discrete_projection_enabled": bool(self.discrete_projection),
-                "discrete_projection_applied": bool(self.discrete_projection and
-                    {str(n).upper() for n in names}.intersection({"PL", "TTL", "WIN"})),
+                "discrete_projection_applied": bool(
+                    self.discrete_projection
+                    and {str(n).upper() for n in names}.intersection(
+                        {"PL", "TTL", "WIN"}
+                    )
+                ),
                 "dual_authoritative_representation": True,
+                "source_domain": ("physical_float64" if physical_mode else "normalized_float32"),
             })
+
             return result
 
         setattr(_generate_with_discrete_projection, "_discrete_projector_wrapped", True)

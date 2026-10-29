@@ -480,13 +480,44 @@ class EvaluationEngine:
                 _slice_batch(x_target, start, stop),
                 feature_names,
             )
-            attack_batch_input = _slice_batch(target_input, start, stop)
-            if attack_input_is_target_normalized:
-                # Preserve physical truth while changing model normalization.
-                attack_batch_input = encode_normalized32(
-                    clean_target_physical, feature_names,
-                    self.attack_normalization.mean, self.attack_normalization.std,
+            
+            physical_feature_attack = (
+                isinstance(self.attack, FeatureSpaceAttack)
+                and bool(getattr(
+                    self.attack,
+                    "operates_on_physical_features",
+                    False,
+                ))
+            )
+
+            if physical_feature_attack:
+                # Give the physical generator its own float64 batch workspace.
+                # In-place generator mutations must never corrupt the pristine baseline
+                # or a shared/memory-mapped physical dataset.
+                attack_batch_input = np.array(
+                    clean_target_physical,
+                    dtype=np.float64,
+                    copy=True,
+                    order="C",
                 )
+            else:
+                # Existing normalized-float32 behavior remains unchanged.
+                # ProblemSpaceAttack continues through its existing separate path.
+                attack_batch_input = _slice_batch(
+                    target_input,
+                    start,
+                    stop,
+                )
+
+                if attack_input_is_target_normalized:
+                    # Transfer attacks may require surrogate-specific normalization.
+                    # Physical generators do not need this intermediate conversion.
+                    attack_batch_input = encode_normalized32(
+                        clean_target_physical,
+                        feature_names,
+                        self.attack_normalization.mean,
+                        self.attack_normalization.std,
+                    )
 
             expected_batch_size = stop - start
             # The authoritative mask is per-batch, not the entire corpus.

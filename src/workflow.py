@@ -715,7 +715,21 @@ def _run_empirical_at(
         if valid_mask_full is not None:
             batch_valid_mask = np.asarray(valid_mask_full, dtype=bool)[batch_indices]
             batch_kwargs["valid_mask"] = batch_valid_mask
-        result = attack.generate(x_attack, y_clean, **batch_kwargs)
+            
+        # for feature space attacks that works on raw physical features, we need to pass the physical features to the attack
+        physical_feature_attack = bool(getattr(attack, "operates_on_physical_features", False))
+        attack_generation_input = (
+            np.array(
+                x_attack_phys,
+                dtype=np.float64,
+                copy=True,
+                order="C",
+            )
+            if physical_feature_attack
+            else x_attack
+        )    
+        
+        result = attack.generate(attack_generation_input, y_clean, **batch_kwargs)
         if result.adversarial is None or result.raw_adversarial is not None:
             raise ConfigurationError("EAT feature-space attack must return result.adversarial")
         x_adv = _as_numpy(result.adversarial).astype(np.float32, copy=False)

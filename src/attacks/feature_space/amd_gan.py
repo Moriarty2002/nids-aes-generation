@@ -1,21 +1,19 @@
-"""Composite-manifold AMD-GAN for normalized feature-space NIDS evaluation.
+"""Composite-manifold AMD-GAN over authoritative physical NIDS features.
 
-The GAN fits independent WGAN-GP generators to (class, immutable state)
-manifolds. Signed logarithmic smoothing (sign(x) * log1p(abs(x))) preserves
-negative classifier-normalized coordinates and has the exact signed-exponential
-inverse (sign(u) * expm1(abs(u))) before normalized float32 output.
+A specialist WGAN-GP models each (class, physical immutable state) manifold.
+Nonnegative continuous measurements use log1p before per-cluster GAN-domain
+scaling; generated continuous coordinates return to physical units via expm1.
+Categorical codebooks independently map GAN states to exact physical protocol
+states. The raw float64 attack candidate is not projected or normalized here:
+FeatureSpaceAttack performs final physical clipping, lattice projection,
+immutable/victim/padding restoration, and canonical normalized float32 encoding.
 
-The GAN synthesizes complete attacker-owned packet feature vectors: it never
-splices selected generated coordinates into an unrelated source packet. Padded
-and victim-owned packet rows, and attacker rows without an XAI-approved
-composite generator, are copied verbatim from the source without running a
-GAN forward pass. Original (B,T,F) or (B,T*F) topology is preserved exactly.
-The inherited FeatureSpaceAttack wrapper independently performs authoritative
-float64 finalization and protected-value restoration. This is a six-feature
-packet generator, not a sequence-aware PCAP mutator.
+The attack generates fixed-shape packet-feature matrices rather than modifying
+PCAP packet identities or lengths. It does not enforce packet ownership or
+padding itself. Its fit path excludes invalid padding rows from statistical
+training so that placeholder measurements are not learned as network traffic.
 
-NOTE: Signed-log smoothing here acts on already NIDS-normalized coordinates,
-not on the positive physical measurements of the original AMD-GAN paper.
+Training data must be captured in float64 before model normalization.
 
 * **AMD-GAN**
   * **Paper:** *Adversarial red teaming and imbalance correction in heterogeneous NIDS: A class-specific adaptive GAN framework* - Lara et al., Journal of Information Security and Applications 2026
@@ -145,8 +143,8 @@ class _Critic(nn.Module):
         return self.network(x).reshape(-1)
 
 
-# The second key component contains immutable normalized float32 values in
-# the canonical feature-name order, serialized as ordinary Python floats.
+# The second key component contains exact physical immutable-state values
+# in canonical feature-name order; no classifier normalization is involved.
 ClusterKey = tuple[int, tuple[float, ...]]
 
 
@@ -157,15 +155,13 @@ def _checkpoint_path(template: str | Path, seed: int) -> Path:
     return Path(str(template).format(seed=int(seed))).expanduser()
 
 
-def _classifier_statistics(
+def _classifier_schema(
     config: Mapping[str, Any], seed: int
-) -> tuple[dict[str, Any], tuple[int, ...], np.ndarray, np.ndarray, tuple[str, ...]]:
-    """Read the already-fitted NIDS/surrogate normalization, never refit it.
+) -> tuple[dict[str, Any], tuple[int, ...], tuple[str, ...]]:
+    """Read classifier topology and feature ordering, but never its scaling.
 
-    AMD-GAN requires the classifier's input *coordinates*, but it does not
-    backpropagate through that classifier. Loading a trained model on GPU would
-    waste VRAM and violate the per-class GAN memory budget. This loader therefore
-    reads only checkpoint metadata and checks normalization provenance.
+    A physical-space generator must learn from the dataset's pre-normalization
+    measurements; the checkpoint is consulted only for structural compatibility.
     """
     raw_surrogate = config.get("surrogate_model")
     if isinstance(raw_surrogate, Mapping) and raw_surrogate.get("enabled", True):
@@ -184,28 +180,14 @@ def _classifier_statistics(
     path = _checkpoint_path(str(checkpoint_template), seed)
     if not path.is_file():
         raise FileNotFoundError(f"Classifier checkpoint does not exist: {path}")
-
-    # Framework-produced classifier checkpoints commonly contain NumPy arrays
-    # alongside model metadata, so use the same trusted-artifact loader as
-    # TDTCE. Never load checkpoints from an untrusted location.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, Mapping):
         raise TypeError(f"Classifier checkpoint {path} must be a mapping")
-    if "normalization_mean" not in checkpoint or "normalization_std" not in checkpoint:
-        raise ValueError(f"Classifier checkpoint lacks normalization statistics: {path}")
-
-    mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
-    std = np.asarray(checkpoint["normalization_std"], dtype=np.float32)
-    if mean.shape != std.shape or not mean.size:
-        raise ValueError("Classifier normalization mean/std must have the same nonempty shape")
-    if not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any():
-        raise ValueError("Classifier normalization contains non-finite or nonpositive entries")
-    std = np.maximum(std, np.float32(1e-12))
-    input_shape = tuple(int(value) for value in checkpoint.get("input_shape", ()))
-    if len(input_shape) not in (1, 2) or any(value < 1 for value in input_shape):
+    input_shape = tuple(int(v) for v in checkpoint.get("input_shape", ()))
+    if len(input_shape) not in (1, 2) or any(v < 1 for v in input_shape):
         raise ValueError(f"Classifier checkpoint has invalid input_shape {input_shape}")
-    names = tuple(str(name).upper() for name in checkpoint.get("feature_names", ()))
-    return model_cfg, input_shape, mean, std, names
+    names = tuple(str(n).upper() for n in checkpoint.get("feature_names", ()))
+    return model_cfg, input_shape, names
 
 
 def _training_dataset(config: Mapping[str, Any], input_shape: tuple[int, ...]) -> Any:
@@ -225,11 +207,11 @@ def _training_dataset(config: Mapping[str, Any], input_shape: tuple[int, ...]) -
 
 
 def _train_indices(labels: np.ndarray, seed: int) -> np.ndarray:
-    """Hold out about 20% within each class, preserving singleton nano classes.
+    """Hold out a class-wise subset for generator fitting.
 
-    Fitting directly on the entire evaluation dataset would leak test records
-    into the generator. The class-wise split also avoids dropping sparse classes
-    when a conventional global stratified split cannot be constructed.
+    The split is deterministic but does not automatically match the classifier's
+    own training split. Benchmark orchestration must restrict raw_arrays() to
+    permissible training samples to avoid inadvertent test-set leakage.
     """
     rng = np.random.default_rng(seed)
     selections: list[np.ndarray] = []
@@ -241,63 +223,19 @@ def _train_indices(labels: np.ndarray, seed: int) -> np.ndarray:
     return np.sort(np.concatenate(selections)).astype(np.int64)
 
 
-def _normalize_from_checkpoint(
-    raw: np.ndarray, mean: np.ndarray, std: np.ndarray, packet_width: int = 6
-) -> np.ndarray:
-    """Produce classifier-normalized float32 data in the saved topology.
 
-    Both per-packet feature vectors (F) and per-position vectors (T*F) are
-    supported. All normalization is in bounded CPU chunks, so memory usage
-    does not depend on the number of GPU-resident training samples.
-    """
-    data = np.asarray(raw)
-    if data.ndim not in (2, 3) or data.shape[0] < 1:
-        raise ValueError("Dataset must expose a nonempty (N,F)/(N,T,F) raw array")
-    if not np.issubdtype(data.dtype, np.number):
-        raise TypeError("Dataset raw features must be numeric")
-    if data.ndim == 3 and data.shape[-1] != packet_width:
-        raise ValueError("Dataset packet feature width differs from AMD-GAN schema")
-    if data.ndim == 2 and data.shape[-1] % packet_width:
-        raise ValueError("Flattened dataset width is not divisible by six")
-
-    flattened_width = int(np.prod(data.shape[1:]))
-    mean_flat = mean.reshape(-1)
-    std_flat = std.reshape(-1)
-    if mean_flat.size not in (packet_width, flattened_width):
-        raise ValueError(
-            "Checkpoint mean/std must be per feature or per flattened coordinate: "
-            f"got {mean.shape}, expected 6 or {flattened_width} elements"
-        )
-    if mean_flat.size == packet_width:
-        mu = mean_flat.reshape(1, 1, packet_width)
-        scale = std_flat.reshape(1, 1, packet_width)
-    else:
-        mu = mean_flat.reshape(1, -1, packet_width)
-        scale = std_flat.reshape(1, -1, packet_width)
-
-    normalized = np.empty(data.shape, dtype=np.float32)
-    for start in range(0, len(data), 4096):
-        stop = min(len(data), start + 4096)
-        batch = np.asarray(data[start:stop], dtype=np.float32).reshape(-1, flattened_width // packet_width, packet_width)
-        result = (batch - mu) / scale
-        if not np.isfinite(result).all():
-            raise ValueError(f"Non-finite normalized training values in rows {start}:{stop}")
-        normalized[start:stop] = result.reshape(normalized[start:stop].shape)
-    return normalized
 
 
 @register_attack("amd_gan")
 class AMDGANFeatureAttack(FeatureSpaceAttack):
-    """Class-specific six-feature WGAN-GP with disk-based training lifecycle.
+    """Class-specific WGAN-GP generator of float64 physical packet features.
 
-    Each GAN learns an entire packet vector conditioned by its class label and
-    exact, already-normalized immutable-state tuple. A generated sample is
-    never blended with source coordinates inside ``generate``. Unrepresentable
-    ownership/padding configurations fail closed, and the inherited feature
-    attack finalizer still guarantees physical immutability independently.
+    It emits raw candidate packets and delegates all threat-model constraints
+    to the inherited feature-space finalizer and independent gatekeeper.
     """
 
     attack_name = "amd_gan"
+    operates_on_physical_features = True
     query_based = False
     requires_gradients = False
 
@@ -426,20 +364,28 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         return value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
 
     def _packets(self, x: Any) -> np.ndarray:
-        """View normalized float32 input as (batch,time,6), without copying."""
+        """View unnormalized float64 data as (batch, time, six features).
+
+        Reject float32 inputs rather than silently losing physical precision.
+        Both flat and sequence model topologies have the same ordered packets.
+        """
         data = self._numpy(x)
-        if data.dtype != np.float32 or data.ndim not in (2, 3):
-            raise TypeError("AMD-GAN requires 2-D or 3-D normalized float32 input")
+        if data.dtype != np.float64 or data.ndim not in (2, 3):
+            raise TypeError("AMD-GAN requires 2-D or 3-D physical float64 input")
         if data.ndim == 2 and data.shape[-1] % self.width:
             raise ValueError("Flattened width must be divisible by six")
         if data.ndim == 3 and data.shape[-1] != self.width:
             raise ValueError("Packet width must equal six")
         if not np.isfinite(data).all():
-            raise ValueError("Normalized input contains non-finite values")
+            raise ValueError("Physical input contains non-finite values")
         return data.reshape(data.shape[0], -1, self.width)
 
     def _immutable_indices(self, names: Sequence[str]) -> tuple[int, ...]:
-        """Require exact-valued protected states in categorical singleton heads."""
+        """Use physical categorical protocol states as manifold conditions.
+
+        This is a conditioning schema check, not an immutability projection.
+        The inherited interceptor is solely responsible for restoration.
+        """
         names = tuple(str(name).upper() for name in names)
         if len(names) != self.width or len(set(names)) != self.width:
             raise ValueError("An ordered, unique six-feature schema is required")
@@ -462,67 +408,50 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
     def _cluster_key(label: int, row: np.ndarray, immutable_idx: Sequence[int]) -> ClusterKey:
         return (int(label), tuple(float(row[j]) for j in immutable_idx))
 
-    def _generation_row_ownership(
+    def _categorical_codebooks(
         self,
-        packets: np.ndarray,
-        names: Sequence[str],
-        valid_mask: np.ndarray | torch.Tensor | None,
-        mean: Any,
-        std: Any,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Identify valid packets and victim-owned packets without modifying data.
+        physical: np.ndarray,
+        minimum: np.ndarray,
+        safe_span: np.ndarray,
+        constant: np.ndarray,
+        scaled: np.ndarray,
+    ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+        """Represent discrete physical states by categorical GAN-domain tokens.
 
-        Returning packet-level ownership is deliberately different from a
-        coordinate perturbation mask. Every selected attacker packet is fully
-        synthesized, and every excluded row stays exactly equal to its source.
-        This avoids both unnecessary GAN inference and partial-feature grafts.
-
-        A sequence without its validity mask is ambiguous: padding cannot be
-        safely inferred from the normalized feature values, so fail closed.
+        Gumbel-Softmax samples tokens. Their physical lookup tables are kept in
+        float64 and are NEVER inverse-log-transformed or reconstructed through
+        a lossy float32 min/max inverse. Continuous scaling is independent.
         """
-        batch_size, steps, _ = packets.shape
-        if valid_mask is None:
-            if steps != 1:
-                raise ValueError("Sequence synthesis requires valid_mask")
-            valid = np.ones((batch_size, steps), dtype=bool)
-        else:
-            valid = np.asarray(self._numpy(valid_mask), dtype=bool)
-            if valid.shape != (batch_size, steps):
-                raise ValueError(f"valid_mask must have shape {(batch_size, steps)}")
-
-        victim = np.zeros_like(valid)
-        if "DIR" not in names:
-            return valid, victim
-
-        if mean is None or std is None:
-            raise ValueError("DIR ownership verification requires normalization metadata")
-        direction_index = names.index("DIR")
-        mu = np.asarray(self._numpy(mean), dtype=np.float64).reshape(-1)
-        sigma = np.asarray(self._numpy(std), dtype=np.float64).reshape(-1)
-        direction = packets[..., direction_index].astype(np.float64)
-        if mu.size == self.width and sigma.size == self.width:
-            direction = direction * sigma[direction_index] + mu[direction_index]
-        elif mu.size == steps * self.width and sigma.size == steps * self.width:
-            offsets = mu.reshape(steps, self.width)[:, direction_index]
-            scales = sigma.reshape(steps, self.width)[:, direction_index]
-            direction = direction * scales[None, :] + offsets[None, :]
-        else:
-            raise ValueError("Normalization vectors must be per packet or per coordinate")
-
-        victim = valid & np.isclose(direction, 1.0, atol=1e-2, rtol=0.0)
-        return valid, victim
-
-    def _category_values(self, scaled: np.ndarray) -> dict[int, np.ndarray]:
-        codebooks: dict[int, np.ndarray] = {}
+        scaled_codes: dict[int, np.ndarray] = {}
+        physical_states: dict[int, np.ndarray] = {}
         for j in self.categorical_idx:
-            unique = np.unique(scaled[:, j]).astype(np.float32)
-            if unique.size > self.max_categories:
+            states = np.unique(physical[:, j])
+            if states.size > self.max_categories:
                 raise ValueError(
-                    f"Categorical coordinate {j} has {unique.size} states, "
+                    f"Categorical coordinate {j} has {states.size} states, "
                     f"more than max_categories={self.max_categories}"
                 )
-            codebooks[j] = unique
-        return codebooks
+            if not np.equal(states, np.rint(states)).all():
+                raise ValueError(f"Categorical coordinate {j} must have integral physical states")
+            if constant[j]:
+                tokens = np.zeros(states.size, dtype=np.float32)
+            else:
+                tokens = (
+                    2.0 * (states - minimum[j]) / safe_span[j] - 1.0
+                ).astype(np.float32)
+            if np.unique(tokens).size != states.size:
+                raise ValueError(
+                    f"Physical categorical states for feature {j} collide "
+                    "in the generator's float32 token domain"
+                )
+            # Make every real categorical coordinate exactly a codebook token.
+            # This guarantees the critic and categorical Gumbel head see the
+            # same discretized manifold, including when raw states are large.
+            scaled[:, j] = tokens[np.searchsorted(states, physical[:, j])]
+            scaled_codes[j] = tokens
+            physical_states[j] = states.astype(np.float64, copy=True)
+        return scaled_codes, physical_states
+
 
     @staticmethod
     def _gradient_penalty(
@@ -591,10 +520,11 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         device: torch.device,
         logger: logging.Logger | None,
     ) -> tuple[dict[ClusterKey, dict[str, Any]], dict[ClusterKey, dict[str, Any]]]:
-        """Fit specialists sequentially and return CPU-only accepted weights.
+        """Fit WGAN-GP specialists on physical, non-padding packet samples.
 
-        Nothing is stored in ``self._checkpoints`` here. Classmethod ``train``
-        owns the checkpoint lifetime and serializes the returned mapping.
+        Nonnegative continuous measurements are mapped by log1p to tame heavy
+        tails, then scaled into the bounded GAN domain. Discrete protocol
+        states are represented by independent categorical lookup tables.
         """
         packets = self._packets(x)
         labels = np.asarray(y).reshape(-1)
@@ -625,22 +555,36 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             if device.type == "cuda":
                 torch.cuda.manual_seed_all(cluster_seed)
             rng = np.random.default_rng(cluster_seed)
-            class_data = np.array(flat[positions], dtype=np.float32, copy=True)
+            physical_data = np.array(flat[positions], dtype=np.float64, copy=True)
+            class_data = physical_data.copy()
             n = len(positions)
             regime = self._regime(n)
             if self.continuous_idx:
                 cols = list(self.continuous_idx)
-                values = class_data[:, cols]
-                class_data[:, cols] = np.sign(values) * np.log1p(np.abs(values))
+                if (class_data[:, cols] < 0.0).any():
+                    raise ValueError(
+                        "Physical continuous measurements must be nonnegative "
+                        "for log1p; revise continuous_idx for signed features"
+                    )
+                class_data[:, cols] = np.log1p(class_data[:, cols])
 
             minimum = class_data.min(axis=0)
             maximum = class_data.max(axis=0)
             span = maximum - minimum
             constant = span <= 1e-12
-            safe_span = np.where(constant, 1.0, span).astype(np.float32)
-            scaled = np.clip(2 * (class_data - minimum) / safe_span - 1, -1, 1)
-            scaled[:, constant] = 0
-            codebooks = self._category_values(scaled)
+            safe_span = np.where(constant, 1.0, span)
+            if not np.isfinite(safe_span).all():
+                raise ValueError("Physical feature range cannot be scaled safely")
+            scaled = np.clip(
+                2.0 * (class_data - minimum) / safe_span - 1.0,
+                -1.0, 1.0,
+            ).astype(np.float32)
+            scaled[:, constant] = 0.0
+            if not np.isfinite(scaled).all():
+                raise ValueError("Non-finite GAN training coordinates")
+            codebooks, physical_categories = self._categorical_codebooks(
+                physical_data, minimum, safe_span, constant, scaled,
+            )
 
             generator = _Generator(
                 self.latent_dim, self.width, regime.hidden,
@@ -716,6 +660,10 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                             j: torch.from_numpy(codes.copy())
                             for j, codes in codebooks.items()
                         },
+                        "physical_categories": {
+                            j: torch.from_numpy(states.copy())
+                            for j, states in physical_categories.items()
+                        },
                         "hidden": tuple(regime.hidden),
                         "cluster_key": key,
                     }
@@ -728,7 +676,7 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                     )
             finally:
                 del generator, critic, opt_g, opt_d, cpu_training
-                del class_data, scaled, codebooks
+                del class_data, physical_data, scaled, codebooks, physical_categories
                 gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -743,11 +691,11 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         gpu: str,
         logger: logging.Logger | None = None,
     ) -> Mapping[str, float]:
-        """Train using the framework's dataset and model checkpoint lifecycle.
+        """Train on pre-normalization physical float64 dataset measurements.
 
-        This matches TDTCE's classmethod contract. It never computes global
-        normalization from the GAN training subset: the previously trained
-        NIDS or surrogate checkpoint is the only normalization authority.
+        Classifier checkpoint metadata supplies only input topology and the
+        ordered feature schema. No classifier normalization is performed,
+        fitted, stored, or applied inside this generator.
         """
         device = configure_process_device(gpu).torch_device
         torch.manual_seed(int(seed))
@@ -771,10 +719,15 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         params["device"] = str(device)
         settings = cls(config=config, **params)
 
-        classifier_cfg, input_shape, mean, std, checkpoint_names = _classifier_statistics(config, seed)
+        classifier_cfg, input_shape, checkpoint_names = _classifier_schema(config, seed)
         dataset = _training_dataset(config, input_shape)
         raw, labels = dataset.raw_arrays()
         raw = np.asarray(raw)
+        if raw.dtype != np.float64:
+            raise TypeError(
+                "Dataset raw_arrays() must expose pre-normalization float64 "
+                "physical data; converting normalized/quantized float32 is unsafe"
+            )
         labels = np.asarray(labels).reshape(-1)
         if len(raw) != len(labels) or tuple(raw.shape[1:]) != input_shape:
             raise ValueError(
@@ -796,8 +749,7 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         settings.feature_names = settings.feature_names or dataset_names or checkpoint_names
         settings._immutable_indices(settings.feature_names)
 
-        normalized = _normalize_from_checkpoint(raw, mean, std, settings.width)
-        packets = settings._packets(normalized)
+        packets = settings._packets(raw)
         input_mask = getattr(dataset, "valid_mask", None)
         if input_mask is None and packets.shape[1] > 1:
             raise ValueError("Sequence datasets must provide a valid_mask")
@@ -818,16 +770,16 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                 seed, device, len(training_indices), int(training_mask.sum()),
                 classifier_cfg.get("name", "unknown"),
             )
-        accepted, summary = settings._fit_clusters(normalized, labels, training_mask, device, logger)
+        accepted, summary = settings._fit_clusters(raw, labels, training_mask, device, logger)
 
         # Explicit checkpoint schema: no live Modules, only CPU tensors and
         # small immutable metadata. Composite keys remain exact tuple keys.
         payload: dict[str, Any] = {
-            # Version 4 changes the continuous-coordinate transform. Old
-            # checkpoints used a lossy nonnegative rectifier and MUST NOT be
-            # interpreted through the new signed-exponential inverse.
-            "format_version": 4,
-            "continuous_transform": "signed_log1p",
+            # Version 5 separates physical continuous and categorical domains.
+            # Older normalized-domain generators MUST be retrained.
+            "format_version": 5,
+            "data_domain": "physical_float64",
+            "continuous_transform": "log1p_expm1",
             "attack_name": "amd_gan",
             "seed": int(seed),
             "input_shape": tuple(input_shape),
@@ -838,8 +790,6 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             "latent_dim": int(settings.latent_dim),
             "gumbel_tau": float(settings.gumbel_tau),
             "width": int(settings.width),
-            "normalization_mean": torch.from_numpy(mean.copy()),
-            "normalization_std": torch.from_numpy(std.copy()),
             "checkpoints": accepted,
             "training_summary": summary,
             "training_flow_count": int(len(training_indices)),
@@ -909,12 +859,13 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             raise ValueError("AMD-GAN checkpoint must be a mapping")
         if (
             payload.get("attack_name") != "amd_gan"
-            or payload.get("format_version") != 4
-            or payload.get("continuous_transform") != "signed_log1p"
+            or payload.get("format_version") != 5
+            or payload.get("data_domain") != "physical_float64"
+            or payload.get("continuous_transform") != "log1p_expm1"
         ):
             raise ValueError(
-                "Unsupported AMD-GAN checkpoint or continuous transform; "
-                "retrain old checkpoints after changing to signed-log smoothing"
+                "Unsupported AMD-GAN checkpoint or transform; "
+                "retrain old normalized-domain checkpoints for physical float64"
             )
         if int(payload.get("seed", -1)) != seed:
             raise ValueError("AMD-GAN checkpoint seed does not match generation seed")
@@ -940,8 +891,6 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             raise ValueError("Malformed AMD-GAN composite checkpoint dictionary")
         self._checkpoints = dict(loaded)
         self.training_summary = dict(payload.get("training_summary", {}))
-        self._checkpoint_normalization_mean = payload["normalization_mean"]
-        self._checkpoint_normalization_std = payload["normalization_std"]
         self._checkpoint_input_shape = tuple(int(value) for value in payload["input_shape"])
         self._loaded_path = path
 
@@ -952,18 +901,13 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         target_label: int | None = None,
         **kwargs: Any,
     ) -> AttackResult:
-        """Generate only valid attacker packets and preserve exact input topology.
+        """Generate float64 physical candidates without projecting constraints.
 
-        An entire synthesized packet is returned, never a mixture of unrelated
-        source and GAN coordinates. Victim/padded packets and attacker packets
-        without an accepted specialist remain complete clean *rows*. This is
-        distinct from feature-level masking, which would break the manifold.
-
-        Packet counts in metadata are mutually exclusive and exhaustive:
-        generated + missing_cluster + padding_restored + victim_restored
-        equals B*T. A missing cluster count is a *packet* count, not a count
-        of distinct cluster keys. ``success_mask`` is deliberately all false:
-        only EvaluationEngine can assess post-finalization attack success.
+        The wrapper owns victim/immutable/padding restoration, range clipping,
+        lattice projection, and normalized float32 encoding. This generator
+        only conditions on physical class/protocol states and samples entire
+        packet vectors from accepted WGAN-GP specialists. Rows without a
+        trained specialist are left unchanged, not synthesized arbitrarily.
         """
         input_shape = self._numpy(x).shape
         original = self._packets(x)
@@ -980,53 +924,26 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
 
         names = tuple(self.feature_names)
         immutable_idx = self._immutable_indices(names)
-        mean = kwargs.get("normalization_mean")
-        std = kwargs.get("normalization_std")
-        if mean is None or std is None:
-            raise ValueError("Generation requires framework normalization_mean/std")
-
-        # Bit-exact normalization provenance: do not quietly restandardize
-        # input or tolerate a different evaluation/surrogate normalization.
-        runtime_mean = np.asarray(self._numpy(mean))
-        runtime_std = np.asarray(self._numpy(std))
-        checkpoint_mean = self._checkpoint_normalization_mean.numpy()
-        checkpoint_std = self._checkpoint_normalization_std.numpy()
-        if (
-            runtime_mean.shape != checkpoint_mean.shape
-            or runtime_std.shape != checkpoint_std.shape
-            or not np.array_equal(runtime_mean, checkpoint_mean)
-            or not np.array_equal(runtime_std, checkpoint_std)
-        ):
-            raise ValueError("Evaluation normalization differs from generator's training checkpoint")
-
-        valid, victim = self._generation_row_ownership(
-            original, names, kwargs.get("valid_mask"), mean, std,
-        )
-        eligible = valid & ~victim
-        padding_restored_count = int(np.count_nonzero(~valid))
-        victim_restored_count = int(np.count_nonzero(victim))
-
         flat = original.reshape(-1, self.width)
-        editable_flat = eligible.reshape(-1)
         groups: dict[ClusterKey, list[int]] = {}
         missing_cluster_count = 0
         missing_keys: set[ClusterKey] = set()
-        for row_id in np.flatnonzero(editable_flat):
+        for row_id in range(len(flat)):
             key = self._cluster_key(requested_label, flat[row_id], immutable_idx)
             if key not in self._checkpoints:
                 missing_cluster_count += 1
                 missing_keys.add(key)
                 continue
-            groups.setdefault(key, []).append(int(row_id))
+            groups.setdefault(key, []).append(row_id)
 
-        # One contiguous copy of the clean normalized representation. Ineligible
-        # and unsupported rows are untouched. Only fully generated packet rows
-        # are assigned, never individual feature coordinates from the source.
-        proposed_reshaped = torch.from_numpy(np.array(original, copy=True))
-        output_rows = proposed_reshaped.reshape(-1, self.width)
+        # Detached physical candidate. Never alias the baseline that the
+        # interceptor needs for exact protected-coordinate restoration.
+        candidate = np.array(original, dtype=np.float64, copy=True, order="C")
+        output_rows = candidate.reshape(-1, self.width)
         sampler = torch.Generator(device=device)
         sampler.manual_seed(seed)
         generated_packet_count = 0
+
         for key, row_ids in sorted(groups.items()):
             info = self._checkpoints[key]
             generator = _Generator(
@@ -1038,54 +955,61 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                 generator.eval()
                 with torch.inference_mode():
                     latent = torch.randn(
-                        len(row_ids), self.latent_dim, generator=sampler, device=device,
+                        len(row_ids), self.latent_dim,
+                        generator=sampler, device=device,
                     )
                     scaled = generator(latent)
-                    minimum = torch.as_tensor(info["min"], dtype=torch.float64, device=device)
-                    span = torch.as_tensor(info["span"], dtype=torch.float64, device=device)
-                    proposals = (scaled.to(torch.float64) + 1.0) * (span / 2.0) + minimum
-                    constant = torch.as_tensor(info["constant"], dtype=torch.bool, device=device)
+                    minimum = torch.as_tensor(
+                        info["min"], dtype=torch.float64, device=device,
+                    )
+                    span = torch.as_tensor(
+                        info["span"], dtype=torch.float64, device=device,
+                    )
+                    proposals = (
+                        (scaled.to(torch.float64) + 1.0) * (span / 2.0)
+                        + minimum
+                    )
+                    constant = torch.as_tensor(
+                        info["constant"], dtype=torch.bool, device=device,
+                    )
                     proposals[:, constant] = minimum[constant]
                     if self.continuous_idx:
                         cols = list(self.continuous_idx)
-                        values = proposals[:, cols]
-                        proposals[:, cols] = torch.sign(values) * torch.expm1(torch.abs(values))
-                    proposals = proposals.to(torch.float32)
+                        proposals[:, cols] = torch.expm1(proposals[:, cols])
+
+                    # Never treat categorical codes as continuous measurements.
+                    # Map Gumbel-selected GAN tokens to exact physical float64
+                    # states, without log/exp or float32 quantization.
+                    for j in self.categorical_idx:
+                        codes = torch.as_tensor(
+                            info["categories"][j],
+                            dtype=torch.float32, device=device,
+                        )
+                        states = torch.as_tensor(
+                            info["physical_categories"][j],
+                            dtype=torch.float64, device=device,
+                        )
+                        indices = torch.abs(
+                            scaled[:, j, None] - codes[None, :]
+                        ).argmin(dim=1)
+                        proposals[:, j] = states[indices]
+
                     if not torch.isfinite(proposals).all():
-                        raise RuntimeError(f"Generator {key} emitted non-finite proposals")
-                    output_rows[row_ids] = proposals.cpu()
+                        raise RuntimeError(
+                            f"Generator {key} emitted non-finite physical proposals"
+                        )
+                    output_rows[row_ids] = proposals.cpu().numpy()
                     generated_packet_count += len(row_ids)
-                    del latent, scaled, proposals
             finally:
                 del generator
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-        # Check exact normalized immutable values for all rows. Clustering is
-        # a conditioning mechanism, not a proof that sampled values are exact.
-        # Raise rather than blending protected coordinates into a fake packet.
-        if immutable_idx:
-            immutable_source = torch.from_numpy(
-                np.ascontiguousarray(flat[:, immutable_idx])
-            )
-            immutable_generated = output_rows[:, list(immutable_idx)].contiguous()
-            if not torch.equal(
-                immutable_source.view(torch.int32), immutable_generated.view(torch.int32)
-            ):
-                raise RuntimeError(
-                    "Generator changed an immutable state; no source blending permitted"
-                )
-
-        if (
-            generated_packet_count + missing_cluster_count
-            + padding_restored_count + victim_restored_count
-            != batch_size * packet_count
-        ):
+        if generated_packet_count + missing_cluster_count != batch_size * packet_count:
             raise RuntimeError("AMD-GAN packet accounting invariant failed")
 
-        adversarial = proposed_reshaped.reshape(input_shape)
         return AttackResult(
-            adversarial=adversarial,
+            adversarial=candidate.reshape(input_shape),
             success_mask=np.zeros(batch_size, dtype=bool),
             queries=np.zeros(batch_size, dtype=np.int64),
             feature_names=names,
@@ -1098,13 +1022,11 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                 },
                 "generated_packet_count": generated_packet_count,
                 "missing_cluster_count": missing_cluster_count,
-                "padding_restored_count": padding_restored_count,
-                "victim_restored_count": victim_restored_count,
                 "missing_cluster_keys": tuple(sorted(missing_keys)),
-                "synthesis_domain": "normalized_float32",
+                "synthesis_domain": "physical_float64",
                 "source_feature_blending": False,
                 "packet_independent_synthesis": True,
-                "signed_log_continuous_only": True,
+                "continuous_transform": "log1p_expm1",
                 "checkpoint_path": str(self._loaded_path),
             },
         )
