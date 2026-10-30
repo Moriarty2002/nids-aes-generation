@@ -1,0 +1,30 @@
+name: transformer_gan
+variant: "transformer_d${.model_dim}_h${.num_heads}_l${.num_layers}_z${.noise_dim}"
+
+# Widths are independent of the dataset feature count and sequence length.
+# model_dim must be divisible by num_heads.
+model_dim: 128
+num_heads: 4
+num_layers: 2
+noise_dim: 32
+
+# to update with original paper's hyperparameters once they are known
+loss_config:
+  adv_loss: "bce"               # Options: 'bce'
+  reconstruction_loss: "mse"    # Options: 'mse', 'none'
+  reconstruction_weight: 0.1    # Weight for masked reconstruction
+  label_smoothing: 0.1          # Discriminator real-label smoothing
+categorical_schema: {}
+
+epochs: 30
+batch_size: 64
+learning_rate: 0.0001
+
+
+# IMPORTANT: ${output_dir} changes with action/run. For evaluate_attack,
+# override attack.checkpoint with the original train_attack run's path.
+checkpoint: "${output_dir}/checkpoints/transformer_gan_seed{seed}.pt"
+
+discrete_projection: true
+clip_ranges: ${dataset.clip_ranges}
+immutable_features: ${dataset.immutable_features}

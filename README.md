@@ -521,6 +521,8 @@ This framework builds upon concepts and foundational implementations from open-s
 * **A2PM**
   * **Paper:** *Adaptative Perturbation Patterns: Realistic Adversarial Learning for Robust Intrusion Detection* - Vitorino et al., Future Internet 2022
   * **Repository:** [https://github.com/vitorinojoao/a2pm](https://github.com/vitorinojoao/a2pm)
+* **Transformer-GAN**
+  * **Paper:** *Transformer or Autoencoder? Who is the ultimate adversary for attack detectors?* - Laudanna et al.,International Journal of Information Security 2025
 * **TRADES Adversarial Training:**
   * **Paper:** *Theoretically Principled Trade-off between Robustness and Accuracy* - Zhang et al., ICML 2019
   * **Repository:** [https://github.com/yaodongyu/TRADES](https://github.com/yaodongyu/TRADES)
