@@ -522,7 +522,15 @@ This framework builds upon concepts and foundational implementations from open-s
   * **Paper:** *Adaptative Perturbation Patterns: Realistic Adversarial Learning for Robust Intrusion Detection* - Vitorino et al., Future Internet 2022
   * **Repository:** [https://github.com/vitorinojoao/a2pm](https://github.com/vitorinojoao/a2pm)
 * **Transformer-GAN**
-  * **Paper:** *Transformer or Autoencoder? Who is the ultimate adversary for attack detectors?* - Laudanna et al.,International Journal of Information Security 2025
+  * **Paper:** *Transformer or Autoencoder? Who is the ultimate adversary for attack detectors?* - Laudanna et al., International Journal of Information Security 2025
+* **NIDS-GAN**
+  * **Paper:** *Generating Practical Adversarial Network Traffic Flows Using NIDSGAN* - Zolbayara et al., arXiv preprint 2022
+* **Mirage**
+  * **Paper:** *Mirage: Evading Online Network Traffic Analyzers Via Deep Reinforcement Learning* - Li et al., SSRN preprint 2025
+  * **Repository:** [https://github.com/SecTeamPolaris/Mirage](https://github.com/SecTeamPolaris/Mirage)
+* **DeepRED**
+  * **Paper:** *DeepRed: A Deep Learning–Powered Command and Control Framework for Multi-Stage Red Teaming Against ML-based Network Intrusion Detection Systems* - Hajizadeh et al., 19th USENIX WOOT Conference on Offensive Technologies (WOOT 25). 2025
+  * **Repository:** [https://github.com/SecTeamPolaris/Mirage](https://github.com/SecTeamPolaris/Mirage)
 * **TRADES Adversarial Training:**
   * **Paper:** *Theoretically Principled Trade-off between Robustness and Accuracy* - Zhang et al., ICML 2019
   * **Repository:** [https://github.com/yaodongyu/TRADES](https://github.com/yaodongyu/TRADES)

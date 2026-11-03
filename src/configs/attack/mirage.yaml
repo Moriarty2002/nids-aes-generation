@@ -1,0 +1,28 @@
+# Hydra attack group: place under conf/attack/mirage.yaml
+# Evaluation remains independent: the engine runs preprocessor + gatekeeper.
+name: mirage
+params:
+  # Keep {seed} for the workflow's per-seed checkpoint resolver.
+  checkpoint: ${output_dir}/checkpoints/mirage_seed{seed}.pt
+  target_label: 0
+  min_payload: 1
+  max_payload: 1460
+  max_history: 16
+  time_scale: 1.0
+  length_actions: [128, 256, 512, 768, 1024, 1460]
+  time_factors: [0.5, 1.0, 2.0]
+training:
+  max_train_flows: 2048
+  simulator_epochs: 12
+  simulator_learning_rate: 0.001
+  batch_size: 64
+  episodes_per_class: 128
+  replay_capacity: 2048
+  dqn_batch_size: 16
+  dqn_learning_rate: 0.0005
+  gamma: 0.95
+  epsilon_initial: 0.3
+  epsilon_final: 0.05
+  target_sync_episodes: 16
+
+variant: "simlr${.training.simulator_learning_rate}_simEp${.training.simulator_epochs}dqnlr${.training.dqn_learning_rate}"

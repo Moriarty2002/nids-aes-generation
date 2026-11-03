@@ -1,0 +1,36 @@
+# configs/attack/nids_gan.yaml
+# The generator checkpoint path is shared by train_attack and evaluate_attack.
+# For an isolated run, override attack.params.checkpoint with a per-run path.
+# The train_attack action requires surrogate_model.name and
+# surrogate_model.checkpoint (with {seed} where applicable) to be configured.
+name: nids_gan
+variant: "eps${.params.epsilon}_hidDim${.params.hidden_dim}"
+params:
+  # Normalized float32 sample-level L2 budget; no per-feature clipping here.
+  epsilon: 0.3
+  target_label: 0
+
+  # Generator and critic use the same flat MLP topology internally.
+  hidden_dim: 256
+  depth: 2
+  epochs: 30
+  batch_size: 128
+  critic_steps: 5
+
+  generator_lr: 0.001
+  critic_lr: 0.001
+  adam_beta1: 0.5
+  adam_beta2: 0.9
+  alpha: 0.1            # Weight of generator Wasserstein objective.
+  beta: 0.2             # Weight of masked L2 hinge penalty.
+  gradient_penalty: 10.0
+
+  # The first evaluation batch passes the actual worker seed; the model is
+  # loaded lazily just once, not again with per-batch seed offsets.
+  checkpoint: "${output_dir}/checkpoints/nids_gan/seed_{seed}.pt"
+  surrogate_requires_flatten: null
+
+  # Physical rules are solely owned by FeatureSpaceAttack and the gatekeeper.
+discrete_projection: true
+clip_ranges: ${dataset.clip_ranges}
+immutable_features: ${dataset.immutable_features}
