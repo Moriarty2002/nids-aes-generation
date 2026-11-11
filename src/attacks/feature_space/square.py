@@ -20,6 +20,7 @@ class SquareAttack(FeatureSpaceAttack):
     target-class probability, which keeps query accounting explicit and avoids
     requiring gradients from the wrapped model.
     """
+    hard_budget_norm = "linf"
 
     epsilon: float = 0.03
     max_queries: int = 500
@@ -35,9 +36,10 @@ class SquareAttack(FeatureSpaceAttack):
 
     def _scores(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         model = self._require_model()
-        pred = model.predict(x)
-        proba = model.predict_proba(x)
-        return pred, proba
+        proba = np.asarray(model.predict_proba(x))
+        if proba.ndim != 2 or len(proba) != len(x):
+            raise ValueError('Square requires one probability vector per queried record')
+        return proba.argmax(axis=1), proba
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Search locally around each sample until success or query exhaustion."""
@@ -62,7 +64,9 @@ class SquareAttack(FeatureSpaceAttack):
             self.feature_names,
             self.immutable_features,
         ).cpu().numpy()
-        queries = np.zeros(n, dtype=np.int64)
+        if int(self.max_queries) < 1:
+            raise ValueError('Square max_queries must include at least the initial score query')
+        queries = np.ones(n, dtype=np.int64)  # initial batched score: one evaluated record per flow
         base_pred, base_prob = self._scores(adv)
         if self.targeted and self.target_label is None:
             raise ValueError("target_label is required for targeted Square Attack")
@@ -70,10 +74,10 @@ class SquareAttack(FeatureSpaceAttack):
         target = np.full(n, target_label, dtype=labels.dtype) if self.targeted else labels
         success = (base_pred == target) if self.targeted else (base_pred != labels)
         active = ~success
-        for _ in range(self.max_queries):
+        for _ in range(self.max_queries - 1):
             if not np.any(active):
                 break
-            p = max(1.0 / d, self.p_init * (1.0 - _ / max(self.max_queries, 1)))
+            p = max(1.0 / d, self.p_init * (1.0 - _ / max(self.max_queries - 1, 1)))
             for i in np.flatnonzero(active):
                 width = max(1, int(round(p * d)))
                 mutable_cols = np.flatnonzero(perturbation_mask[i])

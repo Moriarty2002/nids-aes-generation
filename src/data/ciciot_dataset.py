@@ -23,6 +23,8 @@ class CICFlowDataset(BaseDataset):
     drop_columns: tuple[str, ...] = ()
     multiclass: bool = True
     normalization_path: str | None = None
+    id_column: str | None = None
+    group_column: str | None = None
 
     def __post_init__(self) -> None:
         BaseDataset.__init__(self, None)
@@ -31,6 +33,16 @@ class CICFlowDataset(BaseDataset):
         self._frame = self._load_frame(Path(self.path))
         if self.label_column not in self._frame.columns:
             raise ValueError(f"Missing label column {self.label_column!r}")
+        if self.id_column is not None:
+            if self.id_column not in self._frame.columns:
+                raise ValueError(f"Unknown id_column {self.id_column!r}")
+            self.sample_ids = tuple(str(v) for v in self._frame[self.id_column].tolist())
+        else:
+            self.sample_ids = tuple(str(v) for v in self._frame.index.tolist())
+        if self.group_column is not None:
+            if self.group_column not in self._frame.columns:
+                raise ValueError(f"Unknown group_column {self.group_column!r}")
+            self.group_ids = tuple(str(v) for v in self._frame[self.group_column].tolist())
         self._encode_labels()
         if self.normalization_path:
             self.normalization = self._load_normalization(Path(self.normalization_path))
@@ -61,11 +73,12 @@ class CICFlowDataset(BaseDataset):
     @property
     def feature_names(self) -> tuple[str, ...]:
         excluded = {self.label_column, *self.drop_columns}
+        excluded.update(v for v in (self.id_column, self.group_column) if v is not None)
         return tuple(c for c in self._frame.columns if c not in excluded)
 
     def raw_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         x = self._frame.loc[:, self.feature_names].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(
-            dtype=np.float32
+            dtype=np.float64
         )
         y = self._frame[self.label_column].to_numpy(dtype=np.int64)
         return x, y

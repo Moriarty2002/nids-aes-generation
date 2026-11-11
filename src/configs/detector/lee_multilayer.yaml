@@ -1,0 +1,12 @@
+# Lee et al., NeurIPS 2018: fit clean train Gaussians, then validate
+# layer-score combination on independent surrogate-generated validation only.
+# Run action=calibrate_detector after registered target and surrogate training.
+enabled: true
+name: mahalanobis_multilayer_val_calibrated
+params:
+  covariance_ridge: 1.0e-5
+  score_batch_size: 128
+  preprocessing_magnitude: 0.0
+# This is the declared validation attack budget, not paper-optimal on CICIoMT.
+calibration_epsilon: 0.01
+checkpoint: null

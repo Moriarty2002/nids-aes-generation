@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -11,18 +12,14 @@ import torch
 from sklearn.preprocessing import LabelEncoder
 
 from core.registry import register_dataset
+from constraints.rules import validate_clean_packet_source
 from .base import BaseDataset, NormalizationStats
 
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("PL", "IAT", "DIR", "WIN", "FLG", "TTL")
-_DEFAULT_PAD_VALUES: dict[str, float] = {
-    "PL": 0.0,
-    "IAT": 0.0,
-    "DIR": -1.0,
-    "WIN": -1.0,
-    "FLG": -1.0,
-    "TTL": 0.0,
-}
+from core.packet_schema import CICIOMT2024_FIELDS, CICIOMT2024_PAD_VALUES
+
+_DEFAULT_FIELDS: tuple[str, ...] = CICIOMT2024_FIELDS
+_DEFAULT_PAD_VALUES: dict[str, float] = dict(CICIOMT2024_PAD_VALUES)
 
 
 @register_dataset("ciciomt2024")
@@ -50,7 +47,7 @@ class SequenceParquetDataset(BaseDataset):
         label_column: str = "LABEL-bin",
         benign_string: str = "Benign",
         task_mode: str = "auto",
-        max_length: int | None = None,
+        max_length: int = 20,
         feat_pad_column: str = "FEAT_PAD",
         flatten: bool = False,
         include_padding_indicator: bool = False,
@@ -60,6 +57,7 @@ class SequenceParquetDataset(BaseDataset):
         truncate: bool = True,
         normalization_path: str | Path | None = None,
         id_column: str | None = "Index",
+        group_column: str | None = None,
     ) -> None:
         """Load/canonicalize flows and lazily materialize derived feature arrays."""
         super().__init__(None)
@@ -68,7 +66,12 @@ class SequenceParquetDataset(BaseDataset):
         self.label_column = str(label_column)
         self.benign_string = str(benign_string)
         self.task_mode = str(task_mode).strip().lower()
-        self.max_length = max_length
+        if max_length is None or int(max_length) != 20:
+            raise ValueError("CICIoMT2024 scientific policy requires max_length=20; retrain other checkpoints")
+        if not truncate:
+            raise ValueError("CICIoMT2024 requires prefix truncation (truncate=true)")
+        self.max_length = 20
+        self.sequence_policy = "first_20_real_packets_prefix_v1"
         self.feat_pad_column = str(feat_pad_column)
         self.flatten = bool(flatten)
         self.include_padding_indicator = bool(include_padding_indicator)
@@ -78,6 +81,7 @@ class SequenceParquetDataset(BaseDataset):
         self.truncate = bool(truncate)
         self.normalization_path = Path(normalization_path) if normalization_path else None
         self.id_column = id_column
+        self.group_column = group_column
         self.class_mapping: dict[str, int] = {}
         self.classes: tuple[str, ...] = ()
         self.label_mode: str = ""
@@ -104,8 +108,22 @@ class SequenceParquetDataset(BaseDataset):
         else:
             self.sample_ids = tuple(str(value) for value in frame.index.tolist())
 
+        if group_column is not None:
+            if group_column not in frame.columns:
+                raise ValueError(f"Unknown group_column {group_column!r}")
+            self.group_ids = tuple(str(value) for value in frame[group_column].tolist())
         self.lengths = np.empty(len(frame), dtype=np.int64)
+        self.truncated_flow_count = 0
+        self.discarded_packet_positions = 0
+        self.original_real_packet_counts_summary: dict[str, int] = {}
         self._canonical, self.valid_mask = self._pad_sequences(frame)
+        # Check the original, pre-normalization float64 measurements before
+        # either target or surrogate can fit. Never silently filter flows.
+        validate_clean_packet_source(
+            self._canonical, self.fields, self.valid_mask,
+            {field: float(self.pad_values.get(field, 0.0)) for field in self.fields},
+            self.sample_ids,
+        )
         # Keep shape metadata separately so _canonical can be released after the
         # workflow creates its one retained normalized evaluation matrix.
         self._canonical_shape = tuple(int(value) for value in self._canonical.shape)
@@ -245,6 +263,15 @@ class SequenceParquetDataset(BaseDataset):
             "classes": list(self.classes),
             "class_mapping": dict(self.class_mapping),
             "sequence_length": int(self.sequence_shape[0]),
+            "sequence_policy": self.sequence_policy,
+            "clean_physical_validation_policy": "clean_source_wire_domain_v1",
+            "truncate": self.truncate,
+            "strict_feat_pad": self.strict_feat_pad,
+            "feat_pad_column": self.feat_pad_column,
+            "feature_names": list(self.feature_names),
+            "normalization_fitted_on": "train_partition_only" if self.normalization is not None else None,
+            "truncated_flow_count": self.truncated_flow_count,
+            "discarded_packet_positions": self.discarded_packet_positions,
             "feature_count": int(self.sequence_shape[1]),
             "flatten": self.flatten,
             "include_padding_indicator": self.include_padding_indicator,
@@ -265,10 +292,28 @@ class SequenceParquetDataset(BaseDataset):
         if series.isna().any():
             raise ValueError(f"Label column {self.label_column!r} contains missing values")
 
-        numeric = pd.to_numeric(series, errors="coerce")
-        is_numeric = not numeric.isna().any()
+        # Numeric strings are numeric *labels*, not arbitrary categorical class
+        # names. Decimal parses exact tokens before any conversion to np.int64:
+        # pandas.to_numpy(dtype=int64) would silently truncate 1.9 and can
+        # overflow large floating values. No float32 or guessed tolerance enters.
+        parsed: list[Decimal | None] = []
+        for value in series.tolist():
+            token = str(value).strip()
+            try:
+                parsed.append(Decimal(token))
+            except (InvalidOperation, ValueError):
+                parsed.append(None)
+        is_numeric = any(value is not None for value in parsed)
         if is_numeric:
-            numeric_values = numeric.to_numpy(dtype=np.int64)
+            if any(value is None or not value.is_finite() for value in parsed):
+                raise ValueError("Mixed/invalid numeric labels; expected finite integer values")
+            assert all(value is not None for value in parsed)
+            if any(value != value.to_integral_value() for value in parsed):
+                raise ValueError("Fractional numeric labels cannot be truncated to integers")
+            lower, upper = np.iinfo(np.int64).min, np.iinfo(np.int64).max
+            if any(value < lower or value > upper for value in parsed):
+                raise ValueError("Numeric labels exceed the signed int64 range")
+            numeric_values = np.fromiter((int(value) for value in parsed), dtype=np.int64)
             unique = sorted(set(numeric_values.tolist()))
             inferred_binary = set(unique).issubset({0, 1})
             mode = "binary" if self.task_mode == "auto" and inferred_binary else self.task_mode
@@ -332,30 +377,42 @@ class SequenceParquetDataset(BaseDataset):
                 sequence = self._coerce_sequence(row[field], field=field, row_index=row_index)
                 parsed[field].append(sequence)
                 row_lengths.append(len(sequence))
-            observed = max(row_lengths, default=0)
+            if len(set(row_lengths)) != 1:
+                raise ValueError(
+                    f"Inconsistent packet-array lengths at row {row_index}: "
+                    f"{dict(zip(self.fields, row_lengths))}"
+                )
+            observed = row_lengths[0]
             row_observed_lengths.append(observed)
             if self.feat_pad_column in frame.columns:
                 feat_pad = row[self.feat_pad_column]
                 if pd.isna(feat_pad):
+                    if self.strict_feat_pad:
+                        raise ValueError(f"Missing {self.feat_pad_column} at row {row_index}")
                     declared_lengths.append(None)
                 else:
-                    pad_count = int(feat_pad)
-                    if pad_count < 0:
-                        raise ValueError(f"{self.feat_pad_column} cannot be negative at row {row_index}")
-                    declared_lengths.append(observed + pad_count)
+                    number = float(feat_pad)
+                    if not np.isfinite(number) or number < 0 or number != np.rint(number):
+                        raise ValueError(f"{self.feat_pad_column} must be an exact nonnegative integer at row {row_index}")
+                    declared_lengths.append(observed + int(number))
             else:
                 declared_lengths.append(None)
 
-        if self.max_length is not None:
-            target_length = int(self.max_length)
-            if target_length <= 0:
-                raise ValueError("max_length must be > 0")
-        elif any(value is not None for value in declared_lengths):
-            target_length = max(int(value) for value in declared_lengths if value is not None)
-        else:
-            target_length = max(row_observed_lengths, default=0)
-        if target_length <= 0:
-            raise ValueError("The Parquet dataset contains no packet observations")
+        target_length = 20  # Never infer target topology from train, val or test.
+        declarations = [n for n in declared_lengths if n is not None]
+        if self.strict_feat_pad and declarations and len(set(declarations)) > 1:
+            raise ValueError(
+                f"Inconsistent {self.feat_pad_column} source sequence widths: "
+                f"{sorted(set(declarations))}. The source padding declaration is not a packet count."
+            )
+        self.truncated_flow_count = int(sum(n > target_length for n in row_observed_lengths))
+        self.discarded_packet_positions = int(sum(max(0, n - target_length) for n in row_observed_lengths))
+        self.original_real_packet_counts_summary = {
+            "zero": int(sum(n == 0 for n in row_observed_lengths)),
+            "short": int(sum(0 < n < target_length for n in row_observed_lengths)),
+            "exact": int(sum(n == target_length for n in row_observed_lengths)),
+            "truncated": self.truncated_flow_count,
+        }
 
         canonical = np.empty((len(frame), target_length, len(self.fields)), dtype=np.float64)
         valid_mask = np.zeros((len(frame), target_length), dtype=bool)
@@ -363,12 +420,6 @@ class SequenceParquetDataset(BaseDataset):
         for row_idx in range(len(frame)):
             observed = row_observed_lengths[row_idx]
             declared = declared_lengths[row_idx]
-            if declared is not None and self.strict_feat_pad and self.max_length is None and declared != target_length:
-                raise ValueError(
-                    f"Inconsistent {self.feat_pad_column} at row {row_idx}: "
-                    f"observed_length={observed}, declared_length={declared}, global_length={target_length}"
-                )
-
             if observed > target_length and not self.truncate:
                 raise ValueError(
                     f"Row {row_idx} has {observed} packets, exceeding configured max_length={target_length}"
@@ -404,9 +455,15 @@ class SequenceParquetDataset(BaseDataset):
         if isinstance(value, np.ndarray):
             value = value.tolist()
         if not isinstance(value, (list, tuple)):
-            return [float(value)]
+            scalar = float(value)
+            if not np.isfinite(scalar):
+                raise ValueError(f"Non-finite packet measurement in {field!r} at row {row_index}")
+            return [scalar]
         try:
-            return [float(item) for item in value]
+            numbers = [float(item) for item in value]
+            if not all(np.isfinite(numbers)):
+                raise ValueError(f"Non-finite packet measurement in {field!r} at row {row_index}")
+            return numbers
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Non-numeric sequence value in field {field!r} at row {row_index}") from exc
 

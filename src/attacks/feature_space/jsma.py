@@ -201,7 +201,7 @@ class JSMAAttack(FeatureSpaceAttack):
             original_modes = restore_module_modes(model.model)
             try:
                 with torch.no_grad():
-                    clean_logits = model.model(x0)
+                    clean_logits = model.forward_differentiable(x0)
                     clean_scores = _saliency_scores(clean_logits)
                     if torch.any((labels < 0) | (labels >= clean_scores.shape[1])):
                         raise ValueError("Ground-truth labels are outside the model's class range")
@@ -240,7 +240,7 @@ class JSMAAttack(FeatureSpaceAttack):
             # torch.no_grad(). Eval mode fixes BatchNorm and disables Dropout.
             with torch.enable_grad():
                 with torch.no_grad():
-                    clean_logits = model_module(x0)
+                    clean_logits = model.forward_differentiable(x0)
                     clean_scores = _saliency_scores(clean_logits)
                     clean_predictions = input_predictions(clean_logits)
                     class_count = int(clean_scores.shape[1])
@@ -290,7 +290,9 @@ class JSMAAttack(FeatureSpaceAttack):
 
                     for _ in range(step_limit):
                         current = adv_chunk.reshape(chunk_size, *x0.shape[1:]).detach().requires_grad_(True)
-                        logits = model_module(current)
+                        current_mask = kwargs.get("valid_mask")
+                        current_mask = None if current_mask is None else current_mask[batch_start:batch_stop]
+                        logits = model.forward_differentiable(current, valid_mask=current_mask)
                         scores = _saliency_scores(logits)
                         current_predictions = input_predictions(logits)
                         if effective_targeted:
@@ -469,7 +471,7 @@ class JSMAAttack(FeatureSpaceAttack):
                     adv_flat_all[batch_start:batch_stop] = adv_chunk
 
             with torch.no_grad():
-                final_logits = model_module(adversarial)
+                final_logits = model.forward_differentiable(adversarial)
                 final_predictions = input_predictions(final_logits)
                 if effective_targeted:
                     assert target_label is not None

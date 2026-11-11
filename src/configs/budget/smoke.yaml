@@ -1,0 +1,19 @@
+# Fast integration diagnostics. Never cite as state-of-the-art replication.
+name: smoke
+max_test_samples: 128
+max_target_epochs: 2
+max_target_batch_size: 128
+attack_overrides:
+  a2pm: {params.max_iterations: 2}
+  pgd: {steps: 2}
+  bim: {steps: 2}
+  trades: {steps: 2}
+  cw: {max_steps: 3, binary_search_steps: 1}
+  deepfool: {max_steps: 3}
+  jsma: {max_iterations: 3}
+  nids_gan: {params.epochs: 1}
+  amd_gan: {training_steps_large: 3, training_steps_small: 3, training_steps_nano: 3}
+  transformer_gan: {epochs: 1}
+  tdtce: {epochs: 1, timesteps: 2}
+  deepred: {surrogate_epochs: 1, gan_epochs: 1}
+  mirage: {training.simulator_epochs: 1, training.episodes_per_class: 2}

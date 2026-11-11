@@ -10,6 +10,7 @@ import torch
 
 from models.wrapper import ModelWrapper
 from core.dual_representation import decode_physical64, encode_normalized32, layout
+from constraints.budget import FinalAttackBudget
 
 
 @dataclass
@@ -87,6 +88,10 @@ class FeatureSpaceAttack(BaseAttack):
     feature_names: tuple[str, ...] = ()
     immutable_features: tuple[str, ...] = ()
     operates_on_physical_features: ClassVar[bool] = False
+    # Each optimizer with a hard epsilon must explicitly identify its norm;
+    # CW, DeepFool and GANs without a hard mathematical budget are not assigned
+    # a fictional epsilon envelope by the evaluator.
+    hard_budget_norm: ClassVar[str | None] = None
     model: ModelWrapper | None = field(default=None, init=False, repr=False, compare=False)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -240,6 +245,21 @@ class FeatureSpaceAttack(BaseAttack):
                 names,
             )
 
+            if not physical_mode:
+                # An unchanged float32 normalized coordinate does NOT recover its
+                # pristine physical value on inverse normalization. Restore that
+                # coordinate from authoritative float64 before canonical encoding.
+                if isinstance(source, torch.Tensor):
+                    pristine = torch.as_tensor(original, device=source.device, dtype=torch.float32)
+                    unchanged = source.contiguous().view(torch.int32) == pristine.contiguous().view(torch.int32)
+                    with torch.no_grad():
+                        torch.where(unchanged, clean_physical, physical, out=physical)
+                else:
+                    generated = np.ascontiguousarray(source, dtype=np.float32)
+                    pristine = np.ascontiguousarray(original, dtype=np.float32)
+                    unchanged = generated.view(np.uint32) == pristine.view(np.uint32)
+                    np.copyto(physical, clean_physical, where=unchanged)
+
             # Restore protected coordinates LAST, after every operation that
             # could otherwise alter victim-owned packets, immutable metadata, or padding.
             self._restore_protected_values(
@@ -278,6 +298,19 @@ class FeatureSpaceAttack(BaseAttack):
         setattr(_generate_with_discrete_projection, "_discrete_projector_wrapped", True)
         setattr(cls, "generate", _generate_with_discrete_projection)
 
+    def final_budget_contract(self) -> FinalAttackBudget | None:
+        """Immutable declaration read by the *independent* admission oracle."""
+        norm = self.hard_budget_norm
+        if norm is None:
+            if hasattr(self, "epsilon"):
+                raise ValueError(
+                    f"{type(self).__name__} has epsilon without a declared final hard-budget norm"
+                )
+            return None
+        if not hasattr(self, "epsilon"):
+            raise ValueError(f"{type(self).__name__} declares a norm but has no epsilon")
+        return FinalAttackBudget(norm=norm, epsilon=float(self.epsilon))
+
     def _restore_protected_values(
         self,
         x_adv: np.ndarray | torch.Tensor,
@@ -294,6 +327,10 @@ class FeatureSpaceAttack(BaseAttack):
             raise ValueError("Clean and attack physical shapes must match")
         names = tuple(str(n).upper() for n in feature_names)
         immutable = {str(n).upper() for n in self.immutable_features} | ({"DIR"} if "DIR" in names else set())
+        # The optional canonical packet-occupancy channel is structural, never
+        # an attacker-editable wire measurement.
+        if "FEAT_PAD_MASK" in names:
+            immutable.add("FEAT_PAD_MASK")
         if immutable - set(names):
             raise ValueError(f"Unknown immutable features: {sorted(immutable - set(names))}")
         if isinstance(x_adv, torch.Tensor):
@@ -571,7 +608,13 @@ class ProblemSpaceAttack(BaseAttack):
         raise NotImplementedError
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
-        """Adapt raw generation to the common result interface."""
-        raw_adv = self.generate_raw(x, y, **kwargs)
-        count = len(raw_adv) if hasattr(raw_adv, "__len__") else 1
-        return AttackResult(adversarial=None, raw_adversarial=raw_adv, queries=np.zeros(count, dtype=np.int64))
+        """Require intrinsic feasibility evidence from raw mutators; never fabricate it."""
+        result = self.generate_raw(x, y, **kwargs)
+        if not isinstance(result, AttackResult):
+            raise TypeError(
+                'ProblemSpaceAttack.generate_raw must return an AttackResult with '
+                'raw_adversarial and intrinsic_feasible_mask; raw lists are insufficient'
+            )
+        if result.raw_adversarial is None or result.intrinsic_feasible_mask is None:
+            raise ValueError('Problem-space mutation must supply raw traffic and intrinsic feasibility')
+        return result

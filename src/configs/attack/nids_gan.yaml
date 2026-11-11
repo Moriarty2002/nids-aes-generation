@@ -1,10 +1,10 @@
 # configs/attack/nids_gan.yaml
 # The generator checkpoint path is shared by train_attack and evaluate_attack.
-# For an isolated run, override attack.params.checkpoint with a per-run path.
+# Keep the stable checkpoint path independent of per-run log output_dir.
 # The train_attack action requires surrogate_model.name and
 # surrogate_model.checkpoint (with {seed} where applicable) to be configured.
 name: nids_gan
-variant: "eps${.params.epsilon}_hidDim${.params.hidden_dim}"
+variant: "eps${.params.epsilon}_hidDim${.params.hidden_dim}_depth${.params.depth}_ep${.params.epochs}_critic${.params.critic_steps}_a${.params.alpha}_b${.params.beta}"
 params:
   # Normalized float32 sample-level L2 budget; no per-feature clipping here.
   epsilon: 0.3
@@ -13,7 +13,11 @@ params:
   # Generator and critic use the same flat MLP topology internally.
   hidden_dim: 256
   depth: 2
-  epochs: 30
+  # Historical local-native CICIoMT budget was 30 epochs (not paper-recipe).
+  # Published NIDSGAN Table 3 train length for its NSL-KDD/CICIDS runs.
+  # This source training budget is NOT an optimal CICIoMT result.
+  # Budget=smoke overrides this with one epoch; research consumes the full fit.
+  epochs: 800
   batch_size: 128
   critic_steps: 5
 
@@ -27,7 +31,7 @@ params:
 
   # The first evaluation batch passes the actual worker seed; the model is
   # loaded lazily just once, not again with per-batch seed offsets.
-  checkpoint: "${output_dir}/checkpoints/nids_gan/seed_{seed}.pt"
+  checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"
   surrogate_requires_flatten: null
 
   # Physical rules are solely owned by FeatureSpaceAttack and the gatekeeper.

@@ -61,7 +61,7 @@ class RangeRule(ConstraintRule):
 class DiscreteIntegrityRule(ConstraintRule):
     feature: str
     allowed_values: tuple[int, ...] | None = None
-    tolerance: float = 1e-4
+    tolerance: float = 0.0
     name: str = "discrete_integrity"
 
     def check(self, x: np.ndarray, feature_index: Mapping[str, int]) -> RuleViolation | None:
@@ -69,9 +69,11 @@ class DiscreteIntegrityRule(ConstraintRule):
         if found is None:
             return None
         values, _ = found
-        integral = np.isfinite(values) & (np.abs(values - np.rint(values)) <= self.tolerance)
+        # Wire-level integer fields are exactly integral in authoritative float64.
+        # A tolerance admits unrepresentable packet lengths/window values.
+        integral = np.isfinite(values) & (values == np.rint(values))
         if self.allowed_values is not None:
-            integral &= np.isin(np.rint(np.nan_to_num(values, nan=0.0)).astype(np.int64), np.asarray(self.allowed_values, dtype=np.int64))
+            integral &= np.isin(values, np.asarray(self.allowed_values, dtype=np.float64))
         bad = np.flatnonzero(~integral)
         return RuleViolation(self.name, bad, f"{self.feature} must preserve discrete integrity") if len(bad) else None
 
@@ -119,9 +121,9 @@ class TcpFlagStateRule(ConstraintRule):
         fin = x[:, feature_index[self.fin]]
         rst = x[:, feature_index[self.rst]]
         proto = x[:, feature_index[self.protocol]]
-        is_tcp = np.isclose(proto, 6.0)
+        is_tcp = proto == 6.0
         flags = np.stack([syn, ack, fin, rst], axis=1)
-        integral = np.all(np.isfinite(flags) & (flags >= 0) & (np.abs(flags - np.rint(flags)) <= 1e-2), axis=1)
+        integral = np.all(np.isfinite(flags) & (flags >= 0) & (flags == np.rint(flags)), axis=1)
         non_tcp_has_flags = (~is_tcp) & np.any(flags > 0, axis=1)
         bad = np.flatnonzero(~integral | non_tcp_has_flags)
         return RuleViolation(self.name, bad, "invalid TCP flag counts or flags on non-TCP flows") if len(bad) else None
@@ -139,7 +141,7 @@ class DirectionalImmutabilityRule(ConstraintRule):
 
     direction_feature: str = "DIR"
     victim_direction: float = 1.0
-    tolerance: float = 1e-2
+    tolerance: float = 0.0
     name: str = "directional_immutability"
 
     def check(
@@ -205,10 +207,10 @@ class RuleSet:
                 NonNegativeRule("IAT", name="non_negative_inter_arrival_time"),
                 RangeRule("TTL", 0, 255),
                 DiscreteIntegrityRule("TTL", tuple(range(0, 256)), name="discrete_ttl_integrity"),
-                DiscreteIntegrityRule("DIR", (-1, 0, 1)),
-                RangeRule("WIN", -1, 65535),
+                DiscreteIntegrityRule("DIR", (0, 1)),
+                RangeRule("WIN", 0, 65535),
                 DiscreteIntegrityRule("WIN", name="discrete_window_integrity"),
-                DiscreteIntegrityRule("FLG", tuple([-1] + list(range(0, 256)))),
+                DiscreteIntegrityRule("FLG", tuple(range(0, 256))),
                 DirectionalImmutabilityRule(),
             )
         )
@@ -223,8 +225,9 @@ class RuleSet:
     ) -> tuple[np.ndarray, list[RuleViolation]]:
         """Evaluate all rules and map packet-level failures to sample indices.
 
-        Sequence padding is ignored when ``valid_mask`` is supplied, so padded
-        values cannot make an otherwise valid flow fail strict evaluation.
+        Physical wire-domain checks ignore positions with ``valid_mask=False``.
+        The independent gatekeeper separately enforces exact canonical padding
+        sentinels and contiguous real-packet occupancy on those positions.
         """
         if x.ndim == 2:
             flat = x
@@ -292,3 +295,64 @@ def validate_tcp_flag_sequence(flag_sequence: Sequence[Mapping[str, bool | int]]
         if rst or fin:
             terminated = True
     return True, None
+
+
+def validate_clean_packet_source(
+    physical: np.ndarray,
+    feature_names: Sequence[str],
+    valid_mask: np.ndarray,
+    padding_values: Mapping[str, float],
+    sample_ids: Sequence[str],
+    *,
+    batch_size: int = 256,
+) -> None:
+    """Fail closed on invalid original float64 packets before any model fitting.
+
+    Applies the *same* fixed wire-domain rules as the independent adversarial
+    gatekeeper. No learned statistics, normalized values, or test-informed
+    repairs are used. Bounded slices avoid another full-corpus float64 buffer.
+    """
+    source = np.asarray(physical)
+    mask = np.asarray(valid_mask)
+    if source.dtype != np.float64 or source.ndim != 3:
+        raise TypeError("Clean packet validation requires physical float64 (N,T,F)")
+    n, t, f = source.shape
+    if mask.dtype != np.bool_ or mask.shape != (n, t) or len(feature_names) != f:
+        raise ValueError("Clean packet validity mask/schema does not match physical data")
+    if len(sample_ids) != n or batch_size < 1:
+        raise ValueError("Clean packet sample IDs/batch size do not match source")
+    names = tuple(str(name) for name in feature_names)
+    if len(set(names)) != len(names):
+        raise ValueError("Clean physical feature names must be unique")
+    expected = np.arange(t)[None, :] < mask.sum(axis=1)[:, None]
+    nonprefix = np.flatnonzero(np.any(mask != expected, axis=1))
+    if len(nonprefix):
+        raise ValueError(f"Invalid clean packet occupancy at sample {sample_ids[int(nonprefix[0])]!r}")
+    if not all(name in padding_values for name in names):
+        raise ValueError("Clean physical schema lacks canonical padding sentinels")
+    canonical = np.array([padding_values[name] for name in names], dtype=np.float64)
+    if not np.isfinite(canonical).all():
+        raise ValueError("Clean physical padding values must be finite")
+    rule_set = RuleSet.default()
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        chunk, occupancy = source[start:stop], mask[start:stop]
+        if not np.isfinite(chunk).all():
+            raise ValueError(f"Non-finite clean physical packet at sample {sample_ids[start]!r}")
+        accepted, violations = rule_set.evaluate(chunk, names, valid_mask=occupancy)
+        if not accepted.all():
+            bad = int(np.flatnonzero(~accepted)[0])
+            violated = ', '.join(sorted({v.rule for v in violations if bad in v.indices}))
+            raise ValueError(
+                f"Invalid clean physical packet at sample {sample_ids[start + bad]!r}: {violated}"
+            )
+        # Exact IEEE-754 padding bytes: do not discard a signed-zero change.
+        for feature_index, sentinel in enumerate(canonical):
+            column = chunk[:, :, feature_index]
+            wrong = (~occupancy) & (column.view(np.uint64) != sentinel.view(np.uint64))
+            if np.any(wrong):
+                bad = int(np.flatnonzero(np.any(wrong, axis=1))[0])
+                raise ValueError(
+                    f"Noncanonical clean padding at sample {sample_ids[start + bad]!r}, "
+                    f"feature {names[feature_index]!r}"
+                )

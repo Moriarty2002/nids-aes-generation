@@ -1,10 +1,9 @@
 # configs/attack/deepred.yaml
 # Registered by attacks.problem_space.deepred (import the module on startup).
-# Offline, benign/malicious *training-only* NFStream-style raw features.
-# Training NPZ requires float64 features[:, 0] = src2dst_bytes,
-# features[:, 1] = src2dst_max_ps, int labels (0=benign),
-# feature_names = ["src2dst_bytes", "src2dst_max_ps"].
-# Optional oracle_labels may be provided for substitute-model fitting.
+# Training uses registered raw-PCAP train IDs, derives actual physical
+# src2dst_bytes/src2dst_max_ps from those captures, and obtains classifier
+# feedback ONLY from independently registered pretrained surrogate weights.
+# The old external NPZ/oracle-label path is forbidden on clean-restart runs.
 name: deepred
 variant: offline_udp_sfp
 
@@ -12,7 +11,6 @@ variant: offline_udp_sfp
 # Use [src2dst_max_ps] for one-packet SPSF; pair selection often fails closed
 # because exact packet/byte geometry cannot satisfy both targets.
 attack_features: [src2dst_bytes]
-training_npz: "data/deepred_training_flows.npz"
 
 # Source endpoint of the flow's first packet. Must be set explicitly.
 attacker_ip: null
@@ -33,7 +31,7 @@ max_delta_max_ps: 256
 mtu: 1500
 max_added_packets: 4
 
-# For evaluate_attack, override checkpoint to the train_attack seed's path;
-# output_dir must be persistent for the extractor to open generated PCAPs.
-checkpoint: "${output_dir}/checkpoints/deepred_seed{seed}.pt"
+# Canonical seed-specific artifact; raw-PCAP preprocessing remains uncertified.
+# PCAP output_dir remains a separate execution-local working area.
+checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"
 output_dir: "${output_dir}/deepred_pcaps"

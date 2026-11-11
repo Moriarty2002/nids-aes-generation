@@ -1,9 +1,14 @@
 name: tdtce
+# Table 1 AdaLN-G I (N=6, image p=4). Here a patch is four ORDERED
+# packet tokens, not a 2-D image square. The train-only surrogate, masks,
+# physical finalizer and strict independent gate are mandatory adaptations.
+# Other widths, schedules and loss coefficients below are unverified NIDS-native.
+source_recipe_status: paper_table1_GI_packet_adaptation
 epsilon: 0.04
 timesteps: 50
 hidden_dim: 64
-num_blocks: 4
-patch_size: 1
+num_blocks: 6
+patch_size: 4
 adaln_mode: adaln_g
 learning_rate: 1e-3
 epochs: 30
@@ -26,5 +31,5 @@ mahalanobis_full_cov_max_dim: 512
 mahalanobis_ridge: 1e-3
 gradient_clip_norm: 1.0
 # The evaluation workflow formats {seed} when it constructs the attack.
-checkpoint: "${output_dir}/checkpoints/tdtce_seed{seed}.pt"
-variant: "steps${.timesteps}_dim${.hidden_dim}"
+checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"
+variant: "pktGI_n${.num_blocks}_p${.patch_size}_t${.timesteps}_z${.latent_dim}_r${.weight_rec}_k${.weight_kl}_a${.weight_adv}_q${.weight_pre}_m${.weight_mahal}"

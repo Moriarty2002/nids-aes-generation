@@ -1,14 +1,18 @@
 name: transformer_gan
-variant: "transformer_d${.model_dim}_h${.num_heads}_l${.num_layers}_z${.noise_dim}"
+variant: "transformer_d${.model_dim}_h${.num_heads}_l${.num_layers}_z${.noise_dim}_ff${.feedforward_dim}"
 
 # Widths are independent of the dataset feature count and sequence length.
 # model_dim must be divisible by num_heads.
 model_dim: 128
-num_heads: 4
+num_heads: 2
 num_layers: 2
+# NIDS Model2 Table 6: reported 32-unit Transformer feed-forward block.
+feedforward_dim: 32
 noise_dim: 32
 
-# to update with original paper's hyperparameters once they are known
+# Paper §4.6 describes G MSE without enough accessible target detail for
+# a faithful loss replacement; BCE fool-D + masked MSE is a declared adaptation.
+# Defaults below are local CICIoMT2024 choices, not original optimal values.
 loss_config:
   adv_loss: "bce"               # Options: 'bce'
   reconstruction_loss: "mse"    # Options: 'mse', 'none'
@@ -21,10 +25,8 @@ batch_size: 64
 learning_rate: 0.0001
 
 
-# IMPORTANT: ${output_dir} changes with action/run. For evaluate_attack,
-# override attack.checkpoint with the original train_attack run's path.
-checkpoint: "${output_dir}/checkpoints/transformer_gan_seed{seed}.pt"
-
+# Experiment checkpoint path is stable across train_attack/evaluate_attack runs.
+checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"
 discrete_projection: true
 clip_ranges: ${dataset.clip_ranges}
 immutable_features: ${dataset.immutable_features}

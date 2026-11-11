@@ -5,15 +5,15 @@ import torch
 from torch import nn
 
 from attacks.feature_space.pgd import PGDAttack
-from attacks.feature_space.square import SquareAttack
 from attacks.base import FeatureSpaceAttack
 from attacks.problem_space.dummy_pcap import DummyPCAPMutator
 from constraints.gatekeeper import UniversalConstraintGatekeeper
 from core.registry import ATTACKS, NIDS, discover_all
 from evaluator.metrics import attack_success_rate, attack_success_mask, classification_metrics
 from models.wrapper import PyTorchModelWrapper, SklearnModelWrapper
-from workflow import _instantiate_attack
+from workflow.factory import _instantiate_attack
 from evaluator.engine import EvaluationEngine
+from core.dual_representation import encode_normalized32
 
 
 def test_discovery_registers_components() -> None:
@@ -33,7 +33,7 @@ def test_attack_metadata_is_not_passed_to_attack_constructors() -> None:
             "training": {"epochs": 2},
         },
         {
-            "name": "square",
+            "name": "nids_constrained_pointwise",
             "epsilon": 0.03,
             "variant": "default",
         },
@@ -54,7 +54,11 @@ def test_attack_metadata_is_not_passed_to_attack_constructors() -> None:
 def test_gatekeeper_rejects_invalid_flow() -> None:
     names = ("flow_duration_s", "packet_count", "byte_count", "protocol", "tcp_syn", "tcp_ack", "tcp_fin", "tcp_rst")
     x = np.array([[1.0, 2.0, 200.0, 6.0, 1.0, 0.0, 0.0, 0.0], [2.0, -1.0, 200.0, 6.0, 1.0, 1.0, 0.0, 0.0]])
-    result = UniversalConstraintGatekeeper().validate(x, names)
+    physical = np.asarray(x, dtype=np.float64)
+    result = UniversalConstraintGatekeeper().validate(
+        encode_normalized32(physical, names, None, None), names,
+        authoritative_physical=physical,
+    )
     assert result.accepted.tolist() == [True, False]
     assert result.realizability_rate == 0.5
 
@@ -68,7 +72,8 @@ def test_gatekeeper_freezes_victim_direction() -> None:
     result = UniversalConstraintGatekeeper().validate(
         adversarial,
         names,
-        original_samples=clean,
+        authoritative_physical=np.asarray(adversarial, dtype=np.float64),
+        original_physical=np.asarray(clean, dtype=np.float64),
         valid_mask=np.array([[True, True]]),
     )
     assert result.accepted.tolist() == [False]
@@ -83,7 +88,8 @@ def test_gatekeeper_rejects_dir_changes_on_attacker_packets() -> None:
     result = UniversalConstraintGatekeeper().validate(
         adversarial,
         names,
-        original_samples=clean,
+        authoritative_physical=np.asarray(adversarial, dtype=np.float64),
+        original_physical=np.asarray(clean, dtype=np.float64),
         valid_mask=np.array([[True]]),
     )
     assert result.accepted.tolist() == [False]
@@ -114,7 +120,15 @@ def test_pgd_changes_tensor() -> None:
     wrapper = PyTorchModelWrapper(model)
     x = torch.randn(4, 3)
     y = torch.tensor([0, 1, 0, 1])
-    result = PGDAttack(epsilon=0.1, alpha=0.02, steps=2).bind_model(wrapper).generate(x, y)
+    result = PGDAttack(
+        epsilon=0.1, alpha=0.02, steps=2,
+        feature_names=('A', 'B', 'C'),
+    ).bind_model(wrapper).generate(
+        x, y,
+        normalization_mean=np.zeros(3, dtype=np.float32),
+        normalization_std=np.ones(3, dtype=np.float32),
+        _clean_authoritative_physical=x.double().numpy(),
+    )
     assert result.adversarial.shape == x.shape
 
 

@@ -1,7 +1,7 @@
 name: deepfool
 # The workflow injects evaluation.benign_label as target_label for targeted evasion.
 target_label: null
-max_steps: 2
+max_steps: 50
 overshoot: 0.02
 gradient_epsilon: 1.0e-12
 clip_min: null

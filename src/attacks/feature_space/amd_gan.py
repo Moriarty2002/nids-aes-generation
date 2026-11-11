@@ -1,24 +1,18 @@
-"""Composite-manifold AMD-GAN over authoritative physical NIDS features.
+"""AMD-GAN: Lara-Gutierrez et al., JISA 2026, §3/Tables 2–3.
 
-A specialist WGAN-GP models each (class, physical immutable state) manifold.
-Nonnegative continuous measurements use log1p before per-cluster GAN-domain
-scaling; generated continuous coordinates return to physical units via expm1.
-Categorical codebooks independently map GAN states to exact physical protocol
-states. The raw float64 attack candidate is not projected or normalized here:
-FeatureSpaceAttack performs final physical clipping, lattice projection,
-immutable/victim/padding restoration, and canonical normalized float32 encoding.
-
-The attack generates fixed-shape packet-feature matrices rather than modifying
-PCAP packet identities or lengths. It does not enforce packet ownership or
-padding itself. Its fit path excludes invalid padding rows from statistical
-training so that placeholder measurements are not learned as network traffic.
-
-Training data must be captured in float64 before model normalization.
-
-* **AMD-GAN**
-  * **Paper:** *Adversarial red teaming and imbalance correction in heterogeneous NIDS: A class-specific adaptive GAN framework* - Lara et al., Journal of Information Security and Applications 2026
-  * **Repository:** [https://github.com/antoniol00/AMD-GAN](https://github.com/antoniol00/AMD-GAN)
+Original: class-decoupled adaptive WGAN-GP generation for imbalance repair,
+TSTR augmentation, and distributional/volumetric NIDS stress testing.
+Mandatory adaptation: CICIoMT packet feature types and immutable DIR/FLG,
+train-only physical float64 states, normalized float32 target input and gate.
+Checkpoint v6: source Table-2 regime changes require newly trained specialists.
+Remaining deviation: this plugin still repurposes class synthesis into per-flow
+benign-conditioned evasion. Although Table-2 source training regimes are now
+reproduced, original TSTR/volumetric-stress evaluation is NOT integrated;
+therefore exclude this method from per-flow original-attack publications.
+Topology: flat physical packet features or masked (B,T,F); no raw PCAP.
 """
+
+
 
 from __future__ import annotations
 
@@ -41,6 +35,7 @@ from torch.nn import functional as F
 
 from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import DATASETS, register_attack
+from core.provenance import authorized_attack_training_indices, trained_generator_provenance, verify_generator_artifact_provenance
 from orchestrator.device import configure_process_device
 
 
@@ -180,13 +175,19 @@ def _classifier_schema(
     path = _checkpoint_path(str(checkpoint_template), seed)
     if not path.is_file():
         raise FileNotFoundError(f"Classifier checkpoint does not exist: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, Mapping):
-        raise TypeError(f"Classifier checkpoint {path} must be a mapping")
+    # The source classifier is NOT an attack oracle. Read schema from a small
+    # trained-model sidecar; never deserialize frozen evaluation target weights.
+    sidecar = path.parent / "training_provenance.json"
+    if not sidecar.is_file():
+        raise ValueError(f"Classifier schema provenance missing: {sidecar}; retrain classifier")
+    import json
+    checkpoint = json.loads(sidecar.read_text(encoding="utf-8"))
     input_shape = tuple(int(v) for v in checkpoint.get("input_shape", ()))
     if len(input_shape) not in (1, 2) or any(v < 1 for v in input_shape):
-        raise ValueError(f"Classifier checkpoint has invalid input_shape {input_shape}")
+        raise ValueError(f"Classifier sidecar has invalid input_shape {input_shape}")
     names = tuple(str(n).upper() for n in checkpoint.get("feature_names", ()))
+    if not names:
+        raise ValueError("Classifier sidecar lacks feature schema; retrain classifier")
     return model_cfg, input_shape, names
 
 
@@ -206,21 +207,6 @@ def _training_dataset(config: Mapping[str, Any], input_shape: tuple[int, ...]) -
     return constructor(**params)
 
 
-def _train_indices(labels: np.ndarray, seed: int) -> np.ndarray:
-    """Hold out a class-wise subset for generator fitting.
-
-    The split is deterministic but does not automatically match the classifier's
-    own training split. Benchmark orchestration must restrict raw_arrays() to
-    permissible training samples to avoid inadvertent test-set leakage.
-    """
-    rng = np.random.default_rng(seed)
-    selections: list[np.ndarray] = []
-    for label in sorted(np.unique(labels)):
-        indices = np.flatnonzero(labels == label)
-        rng.shuffle(indices)
-        training_count = min(len(indices), max(1, int(math.ceil(0.8 * len(indices)))))
-        selections.append(indices[:training_count])
-    return np.sort(np.concatenate(selections)).astype(np.int64)
 
 
 
@@ -274,6 +260,11 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         # accepts neither config nor **kwargs. Newer base classes can accept
         # both. Forward every supported argument, without suppressing errors
         # from unrelated constructor failures or silently discarding settings.
+        if "training_fraction" in kwargs:
+            raise ValueError(
+                "AMD-GAN training_fraction is unsupported: membership is fixed by the "
+                "authorized manifest train IDs. Remove this misleading hyperparameter."
+            )
         self.config = config
         self.checkpoint = checkpoint
         base_kwargs = {
@@ -292,13 +283,15 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         if "config" in signature.parameters or accepts_extra:
             base_init(config=config, **base_kwargs)
         else:
-            # Safely filter out injected orchestrator arguments (like training_fraction)
+            # Filter only unrelated infrastructure kwargs; GAN training IDs come
+            # exclusively from the immutable shared manifest.
             # that the strict base class does not natively support, preventing crashes.
-            filtered_kwargs = {
-                key: value for key, value in base_kwargs.items() 
-                if key in signature.parameters
-            }
-            base_init(**filtered_kwargs)
+            unexpected = set(base_kwargs) - set(signature.parameters)
+            if unexpected:
+                raise ValueError(
+                    f"Unsupported AMD-GAN constructor setting(s): {sorted(unexpected)}"
+                )
+            base_init(**base_kwargs)
 
         self.continuous_idx = tuple(int(j) for j in continuous_idx)
         self.categorical_idx = tuple(int(j) for j in categorical_idx)
@@ -332,11 +325,13 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         self.target_label = int(target_label)
         self.device_name = str(device)
         self._regimes = (
-            _Regime("large", (256, 512, 256), 64, 10.0, 0.0, 1,
+            # Lara-Gutierrez et al. JISA 2026 Table 2 / author 01_gan_wgan_*.py.
+            # These are one-minibatch update counts, not full corpus epochs.
+            _Regime("large", (256, 512, 256), 128, 10.0, 0.0, 1,
                     critic_steps_large, learning_rate_large, training_steps_large),
-            _Regime("small", (128, 256, 128), 16, 15.0, 0.01, 1,
+            _Regime("small", (128, 256, 128), 32, 15.0, 0.02, 10,
                     critic_steps_small, learning_rate_small, training_steps_small),
-            _Regime("nano", (64, 128, 64), 8, 15.0, 0.05, 5,
+            _Regime("nano", (64, 128, 64), 16, 20.0, 0.03, 20,
                     critic_steps_nano, learning_rate_nano, training_steps_nano),
         )
         # Only `_load_generator` may populate this on evaluation. The classmethod
@@ -389,9 +384,14 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         names = tuple(str(name).upper() for name in names)
         if len(names) != self.width or len(set(names)) != self.width:
             raise ValueError("An ordered, unique six-feature schema is required")
-        protected = set(self.immutable_features)
-        if "DIR" in names:
-            protected.add("DIR")
+        active = {"PL", "IAT", "DIR", "WIN", "FLG", "TTL"}
+        if set(names) != active:
+            raise ValueError("Unknown six-column packet feature schema for AMD-GAN; explicit physical type mapping required")
+        if any(names[j] != "IAT" for j in self.continuous_idx):
+            raise ValueError("AMD-GAN continuous_idx must select physical IAT for the active schema")
+        # Immutable DIR and FLG are GAN conditioning states, not editable wire
+        # features even when omitted from the caller's immutable list.
+        protected = set(self.immutable_features) | {"DIR", "FLG"}
         unknown = protected.difference(names)
         if unknown:
             raise ValueError(f"Unknown immutable feature names: {sorted(unknown)}")
@@ -612,7 +612,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                         selected = rng.choice(population, regime.batch_size, replace=True)
                         real = cpu_training[selected].to(device)
                         if regime.noise_sigma:
-                            real = real + torch.randn_like(real) * regime.noise_sigma
+                            # Author source clips minority Gaussian densification
+                            # in the GAN's scaled [-1,1] domain; NOT physical truth.
+                            real = (real + torch.randn_like(real) * regime.noise_sigma).clamp(-1.,1.)
                         latent = torch.randn(regime.batch_size, self.latent_dim, device=device)
                         with torch.no_grad():
                             fake = generator(latent)
@@ -759,7 +761,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         )
         if valid_mask.shape != packets.shape[:2]:
             raise ValueError("Dataset valid_mask shape disagrees with packet topology")
-        training_indices = _train_indices(labels, int(seed))
+        source_role = ('surrogate_model' if isinstance(config.get('surrogate_model'), Mapping)
+                       and config['surrogate_model'].get('enabled', True) else 'model')
+        training_indices = authorized_attack_training_indices(dataset, labels, config, seed, role=source_role)
         training_mask = np.zeros(packets.shape[:2], dtype=bool)
         training_mask[training_indices] = valid_mask[training_indices]
 
@@ -775,9 +779,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         # Explicit checkpoint schema: no live Modules, only CPU tensors and
         # small immutable metadata. Composite keys remain exact tuple keys.
         payload: dict[str, Any] = {
-            # Version 5 separates physical continuous and categorical domains.
-            # Older normalized-domain generators MUST be retrained.
-            "format_version": 5,
+            # Version 6 freezes the source Table-2 specialist regimes; prior
+            # v5 physical states used different critic/noise policies.
+            "format_version": 6,
             "data_domain": "physical_float64",
             "continuous_transform": "log1p_expm1",
             "attack_name": "amd_gan",
@@ -794,10 +798,15 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             "training_summary": summary,
             "training_flow_count": int(len(training_indices)),
             "training_packet_count": int(training_mask.sum()),
+            "artifact_provenance": trained_generator_provenance(
+                dataset, labels, config, seed, source_role=source_role,
+                input_shape=input_shape, feature_names=settings.feature_names,
+            ),
         }
-        directory = Path(str(config.get("output_dir", "runs"))).expanduser() / "checkpoints"
-        directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / f"amd_gan_seed{int(seed)}.pt"
+        if not settings.checkpoint:
+            raise ValueError("AMD-GAN requires an explicit stable attack.checkpoint template")
+        destination = _checkpoint_path(settings.checkpoint, seed)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(".pt.tmp")
         try:
             torch.save(payload, temporary)
@@ -857,15 +866,16 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(payload, Mapping):
             raise ValueError("AMD-GAN checkpoint must be a mapping")
+        verify_generator_artifact_provenance(payload, getattr(self, 'expected_provenance', None))
         if (
             payload.get("attack_name") != "amd_gan"
-            or payload.get("format_version") != 5
+            or payload.get("format_version") != 6
             or payload.get("data_domain") != "physical_float64"
             or payload.get("continuous_transform") != "log1p_expm1"
         ):
             raise ValueError(
                 "Unsupported AMD-GAN checkpoint or transform; "
-                "retrain old normalized-domain checkpoints for physical float64"
+                "retrain v5/legacy generators under the Table-2 regime and source revision"
             )
         if int(payload.get("seed", -1)) != seed:
             raise ValueError("AMD-GAN checkpoint seed does not match generation seed")
@@ -893,6 +903,135 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         self.training_summary = dict(payload.get("training_summary", {}))
         self._checkpoint_input_shape = tuple(int(value) for value in payload["input_shape"])
         self._loaded_path = path
+
+    def sample_class_distribution(self, *, class_label: int, count: int,
+                                  seed: int) -> np.ndarray:
+        """Sample the *learned class distribution*, not per-flow benign evasion.
+
+        Lara-Gutierrez et al. (2026), §3/Algorithm 1: decoupled class WGAN-GP
+        specialists. Packet-level immutable protocol strata are a necessary
+        CICIoMT representation adaptation. No model/target classifier is called;
+        outputs are synthetic physical float64 packet rows, **not PCAP traffic**.
+        Unrepresented classes fail instead of switching to a benign specialist.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError('Distribution sample count must be a positive integer')
+        if int(class_label) < 0:
+            raise ValueError('Invalid distribution class')
+        device = self._device()
+        self._load_generator(device, int(seed))
+        keys = sorted((key for key in self._checkpoints if key[0] == int(class_label)))
+        if not keys:
+            raise ValueError(f'No accepted training-only AMD-GAN specialist for class {class_label}')
+        sizes = np.asarray([self.training_summary[key]['sample_count'] for key in keys], dtype=np.float64)
+        if np.any(sizes <= 0) or not np.isfinite(sizes).all():
+            raise ValueError('Missing specialist training support')
+        rng = np.random.default_rng(int(seed))
+        assignments = rng.choice(len(keys), size=count, replace=True, p=sizes/sizes.sum())
+        out = np.empty((count, self.width), dtype=np.float64)
+        sampler = torch.Generator(device=device)
+        sampler.manual_seed(int(seed))
+        for position, key in enumerate(keys):
+            indices = np.flatnonzero(assignments == position)
+            if not len(indices):
+                continue
+            info = self._checkpoints[key]
+            generator = _Generator(self.latent_dim, self.width, info['hidden'],
+                                   self.continuous_idx, info['categories'],
+                                   self.gumbel_tau).to(device)
+            try:
+                generator.load_state_dict(info['state'], strict=True)
+                generator.eval()
+                with torch.inference_mode():
+                    z = torch.randn(len(indices), self.latent_dim,
+                                    generator=sampler, device=device)
+                    values = generator(z)
+                    low = torch.as_tensor(info['min'], dtype=torch.float64, device=device)
+                    span = torch.as_tensor(info['span'], dtype=torch.float64, device=device)
+                    proposed = (values.to(torch.float64) + 1.) * span/2. + low
+                    constant = torch.as_tensor(info['constant'], dtype=torch.bool, device=device)
+                    proposed[:, constant] = low[constant]
+                    if self.continuous_idx:
+                        proposed[:, list(self.continuous_idx)] = torch.expm1(
+                            proposed[:, list(self.continuous_idx)])
+                    for coordinate in self.categorical_idx:
+                        codebook = torch.as_tensor(info['categories'][coordinate],
+                                                   dtype=torch.float32, device=device)
+                        original_codes = torch.as_tensor(info['physical_categories'][coordinate],
+                                                          dtype=torch.float64, device=device)
+                        code_indices = (values[:, coordinate, None] - codebook[None, :]).abs().argmin(dim=1)
+                        proposed[:, coordinate] = original_codes[code_indices]
+                    if not torch.isfinite(proposed).all():
+                        raise ValueError('Nonfinite distributional specialist output')
+                    out[indices] = proposed.cpu().numpy()
+            finally:
+                del generator
+        return out
+
+    def synthetic_train_test_real(self, *, train_sample_ids: Sequence[str],
+                                  test_sample_ids: Sequence[str],
+                                  real_test_packets: np.ndarray,
+                                  real_test_labels: np.ndarray,
+                                  real_test_valid_mask: np.ndarray,
+                                  classes: Sequence[int], samples_per_class: int,
+                                  seed: int, classifier_trees: int = 100) -> dict[str, Any]:
+        """TSTR task on held-out real packet records, not feasible-ASR.
+
+        A fresh diagnostic RandomForest is fitted ONLY on registered-generator
+        synthetic packets; no frozen evaluation target is queried. Class and
+        test supports are explicit. Split membership must be validated by the
+        experiment owner before calling; provided train/test IDs must not overlap.
+        """
+        from sklearn.metrics import accuracy_score, f1_score
+        if (not train_sample_ids or not test_sample_ids or
+                len(set(map(str, train_sample_ids))) != len(train_sample_ids) or
+                len(set(map(str, test_sample_ids))) != len(test_sample_ids) or
+                set(map(str, train_sample_ids)) & set(map(str, test_sample_ids))):
+            raise ValueError('TSTR requires disjoint, unique registered train/test sample IDs')
+        x = self._packets(real_test_packets)
+        labels = np.asarray(real_test_labels)
+        mask = np.asarray(real_test_valid_mask, dtype=bool)
+        if labels.shape != (len(x),) or mask.shape != x.shape[:2]:
+            raise ValueError('TSTR real labels or valid-mask dimensions mismatch')
+        if len(test_sample_ids) != len(x) or classifier_trees < 1:
+            raise ValueError('TSTR held-out IDs or classifier recipe mismatch')
+        positive = np.flatnonzero(mask.reshape(-1))
+        if not len(positive):
+            raise ValueError('TSTR requires held-out real packet support')
+        real_packets = x.reshape(-1, self.width)[positive]
+        real_labels = np.broadcast_to(labels[:, None], mask.shape).reshape(-1)[positive]
+        sorted_classes = tuple(sorted(map(int, classes)))
+        if len(sorted_classes) < 2 or len(set(sorted_classes)) != len(sorted_classes):
+            raise ValueError('TSTR requires at least two distinct declared classes')
+        if not set(np.unique(real_labels)).issubset(sorted_classes):
+            raise ValueError('Held-out TSTR labels are outside registered class schema')
+        generated = [self.sample_class_distribution(class_label=label, count=samples_per_class,
+                                                     seed=int(seed) + i * 104729)
+                     for i, label in enumerate(sorted_classes)]
+        synthetic_x = np.concatenate(generated, axis=0)
+        synthetic_y = np.concatenate([np.full(samples_per_class, label, dtype=np.int64)
+                                      for label in sorted_classes])
+        classifier = RandomForestClassifier(n_estimators=int(classifier_trees),
+                                            random_state=int(seed), n_jobs=1)
+        classifier.fit(synthetic_x, synthetic_y)
+        predicted = classifier.predict(real_packets)
+        return {
+            'study_role': 'amd_gan_distributional_tstr',
+            'sample_unit': 'real_packet',
+            'source_training_support': {str(label): int(samples_per_class) for label in sorted_classes},
+            'heldout_real_packet_count': int(len(real_packets)),
+            'heldout_real_class_support': {str(label): int(np.sum(real_labels == label))
+                                           for label in sorted_classes},
+            'tstr_real_accuracy': float(accuracy_score(real_labels, predicted)),
+            'tstr_real_macro_f1': float(f1_score(real_labels, predicted,
+                                                 average='macro', labels=list(sorted_classes),
+                                                 zero_division=0)),
+            'classifier_trees_native_study': int(classifier_trees),
+            'surrogate_oracle_queries': 0,
+            'target_oracle_queries': 0,
+            'note': ('TSTR tests real withheld packet records; no valid on-wire PCAP proof, '
+                     'per-record feasible ASR, or equal-budget attack comparison is implied.'),
+        }
 
     def generate(
         self,

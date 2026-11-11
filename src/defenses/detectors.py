@@ -71,7 +71,11 @@ class MahalanobisDetector(BaseDetector):
         if not isinstance(batch, (tuple, list)) or len(batch) < 2:
             raise ValueError("Detector fit expects batches shaped as (x, y)")
         x_batch, y_batch = batch[0], batch[1]
-        features = cls._features_to_numpy(wrapper.extract_features(x_batch))
+        features = cls._features_to_numpy(
+            wrapper.extract_features(x_batch, valid_mask=batch[2])
+            if isinstance(wrapper, PyTorchModelWrapper) and len(batch) >= 3
+            else wrapper.extract_features(x_batch)
+        )
         if isinstance(y_batch, torch.Tensor):
             labels = y_batch.detach().cpu().numpy()
         else:
@@ -210,7 +214,7 @@ class MahalanobisDetector(BaseDetector):
         self.n_fit_samples_ = n_samples
         return self
 
-    def score(self, x: Any, wrapper: ModelWrapper) -> np.ndarray:
+    def score(self, x: Any, wrapper: ModelWrapper, valid_mask: Any = None) -> np.ndarray:
         """Return nearest-class squared Mahalanobis distance (higher = anomaly)."""
         if self.class_means_ is None or self.precision_ is None or self.class_labels_ is None:
             raise RuntimeError("MahalanobisDetector must be fitted or loaded before score()")
@@ -225,7 +229,13 @@ class MahalanobisDetector(BaseDetector):
         for start in range(0, n_samples, self.score_batch_size):
             x_chunk = x[start : start + self.score_batch_size]
             with torch.no_grad():
-                feature_chunks.append(self._features_to_numpy(wrapper.extract_features(x_chunk)))
+                chunk_mask = None if valid_mask is None else valid_mask[start:start + self.score_batch_size]
+                features = (
+                    wrapper.extract_features(x_chunk, valid_mask=chunk_mask)
+                    if isinstance(wrapper, PyTorchModelWrapper)
+                    else wrapper.extract_features(x_chunk)
+                )
+                feature_chunks.append(self._features_to_numpy(features))
         if not feature_chunks:
             return np.empty((0,), dtype=np.float64)
         features = np.concatenate(feature_chunks, axis=0)

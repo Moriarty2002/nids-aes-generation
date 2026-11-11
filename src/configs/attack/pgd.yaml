@@ -1,9 +1,9 @@
 name: pgd
 epsilon: 0.04
 alpha: 0.01
-steps: 10
-targeted: false
-target_label: null
+steps: 40
+targeted: true
+target_label: 0
 clip_min: null
 clip_max: null
 discrete_projection: true

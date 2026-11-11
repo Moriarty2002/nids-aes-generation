@@ -2,7 +2,7 @@ enabled: true
 name: jmila_surrogate
 num_classes: 2
 requires_flatten: true
-checkpoint: null
+checkpoint: "${experiment_dir}/checkpoints/surrogates/jmila_surrogate/${model.training.defense_mode}/seed{seed}/nids.pt"
 params:
   hidden_dims: [1024, 512, 256, 128, 64, 32]
   dropout: 0.3

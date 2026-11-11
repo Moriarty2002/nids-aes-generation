@@ -23,6 +23,7 @@ class PGDAttack(FeatureSpaceAttack):
     AD/AC orchestration to explicitly optimize toward Benign (label 0 by the
     framework convention).
     """
+    hard_budget_norm = "linf"
 
     epsilon: float = 0.03
     alpha: float = 0.005
@@ -131,7 +132,7 @@ class PGDAttack(FeatureSpaceAttack):
 
         # Validate the targeted class before entering the optimization loop.
         with torch.no_grad():
-            probe_logits = model.model(x0[:1])
+            probe_logits = model.forward_differentiable(x0[:1], valid_mask=None if kwargs.get("valid_mask") is None else kwargs["valid_mask"][:1])
         if probe_logits.ndim >= 2 and probe_logits.shape[-1] > 1:
             num_classes = int(probe_logits.shape[-1])
             if effective_targeted:
@@ -156,7 +157,7 @@ class PGDAttack(FeatureSpaceAttack):
         # measured only by EvaluationEngine after generation.
         for _ in range(self.steps):
             delta.requires_grad_(True)
-            logits = model.model(x0 + delta)
+            logits = model.forward_differentiable(x0 + delta)
 
             if logits.ndim == 1 or logits.shape[-1] == 1:
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -180,7 +181,7 @@ class PGDAttack(FeatureSpaceAttack):
 
         adv = (x0 + delta).detach()
         with torch.no_grad():
-            logits = model.model(adv)
+            logits = model.forward_differentiable(adv)
             if logits.ndim == 1 or logits.shape[-1] == 1:
                 pred = (torch.sigmoid(logits) >= 0.5).long().view(-1)
             else:

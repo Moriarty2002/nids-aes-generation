@@ -6,7 +6,7 @@ pre-normalization physical source.
 """
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 import numpy as np
 import torch
 
@@ -101,3 +101,67 @@ def encode_normalized32(physical: Array, names: Sequence[str], mean: Stats | Non
         np.divide(scratch, sigma[..., j], out=scratch)
         np.copyto(target[..., j], scratch, casting="unsafe")
     return out
+
+
+
+def _as_numpy(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _restore_target_physical_protected_inplace(
+    adversarial: np.ndarray,
+    original: np.ndarray,
+    feature_names: Sequence[str],
+    *,
+    immutable_features: Sequence[str] = (),
+    valid_mask: np.ndarray | torch.Tensor | None = None,
+) -> tuple[int, int]:
+    """Last-stage physical immutability projection, in-place without drift."""
+    if adversarial.dtype != np.float64 or original.dtype != np.float64:
+        raise TypeError("Both authoritative arrays must be float64")
+    if adversarial.shape != original.shape or not adversarial.flags.writeable:
+        raise ValueError("Physical batches must match and adversarial must be writable")
+    b, t, f = layout(adversarial, feature_names)
+    names = tuple(str(n).upper() for n in feature_names)
+    adv = adversarial.reshape(b, t, f)
+    clean = original.reshape(b, t, f)
+    valid = None if valid_mask is None else _as_numpy(valid_mask).astype(bool, copy=False)
+    if valid is not None and valid.shape != (b, t):
+        raise ValueError("Invalid valid_mask shape")
+    immutable = {str(n).upper() for n in immutable_features}
+    if "DIR" in names:
+        immutable.add("DIR")
+    if immutable - set(names):
+        raise ValueError(f"Unknown immutable features: {sorted(immutable-set(names))}")
+    victim_count = 0
+    if "DIR" in names:
+        victim = np.isclose(clean[..., names.index("DIR")], 1.0, atol=1e-2, rtol=0.0)
+        if valid is not None:
+            victim &= valid
+        victim_count = int(np.count_nonzero(victim))
+        np.copyto(adv, clean, where=victim[..., None])
+    for key in immutable:
+        j = names.index(key)
+        np.copyto(adv[..., j], clean[..., j])
+    padded = 0
+    if valid is not None:
+        padded = int(np.count_nonzero(~valid))
+        np.copyto(adv, clean, where=(~valid)[..., None])
+    return victim_count, padded
+
+
+def _as_physical_shape(
+    raw: np.ndarray | torch.Tensor,
+    expected: np.ndarray | torch.Tensor,
+    names: Sequence[str],
+) -> np.ndarray:
+    """Accept flattened/sequence-equivalent physical layouts without copying."""
+    physical = _as_numpy(raw)
+    if physical.dtype != np.float64:
+        raise TypeError("Physical source must be float64, not normalized float32")
+    b, t, f = layout(expected, names)
+    if physical.shape[0] != b or physical.size != b * t * f:
+        raise ValueError("Physical batch and target batch dimensions differ")
+    return physical.reshape(tuple(expected.shape))

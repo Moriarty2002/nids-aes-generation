@@ -37,6 +37,7 @@ class FGSMAttack(FeatureSpaceAttack):
     and physical realizability checks remain post-generation work for the
     EvaluationEngine's UniversalConstraintGatekeeper.
     """
+    hard_budget_norm = "linf"
 
     epsilon: float = 0.01
     targeted: bool = False
@@ -103,7 +104,7 @@ class FGSMAttack(FeatureSpaceAttack):
         try:
             with torch.enable_grad():
                 x_leaf = x0.detach().requires_grad_(True)
-                logits = model_module(x_leaf)
+                logits = model.forward_differentiable(x_leaf, valid_mask=kwargs.get("valid_mask"))
                 if targeted:
                     assert target_label is not None
                     validate_target_label(logits, target_label)
@@ -128,7 +129,7 @@ class FGSMAttack(FeatureSpaceAttack):
                         feature_names=self.feature_names,
                     )
                     adversarial = (x0 + delta).detach()
-                    adv_logits = model_module(adversarial)
+                    adv_logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
                     predictions = predicted_labels(adv_logits)
                     success = predictions.eq(objective_labels) if targeted else predictions.ne(labels)
                     logits = logits.detach()

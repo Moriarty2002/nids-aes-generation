@@ -1,21 +1,18 @@
-"""NIDSGAN: constrained, conditional WGAN-GP feature-space evasion benchmark.
+"""NIDSGAN: Zolbayar et al., arXiv:2203.06694v1, §3/Table 3.
 
-This plugin deliberately knows only a *bound surrogate* (``self.model``).
-The real target NIDS, final float64 realizability checks, feature clipping,
-and discrete lattice projection belong to the framework, not to this module.
-
-Training and inference use only normalized float32 features.  Each generator
-output is passed through the framework's directional/padding mask; the
-training objective uses a WGAN-GP critic, targeted cross-entropy, and an L2
-hinge penalty.  The L2 budget is additionally enforced via **radial scaling**,
-which is not per-feature clipping or physical-domain projection.
-
-A train_attack worker passes (config, seed, gpu), whereas an evaluation worker
-binds the already checkpointed PyTorch surrogate through ``bind_model``.
-Therefore train() restores the *configured* surrogate checkpoint using the
-workflow's existing model factory and binds that wrapper to a local attack.
-It never trains or instantiates a new substitute or queries the true target.
+Original: adversarial classification loss plus α-weighted GAN realism and
+β-weighted L2 hinge under constrained malicious-flow evasion.
+Mandatory NIDS adaptation: authorized independently trained surrogate,
+fixed T=20 masks, strict physical finalizer/budget gate and no target oracle.
+Source experiment: Table 3 reports 800 training epochs on CICIDS/NSL-KDD;
+other architecture and loss-setting values remain declared native choices.
+Transfer access is not the paper's direct-query case; 800 is not a
+demonstrated CICIoMT-optimal value. Research YAML is authoritative and
+smoke budget may override epochs to one for CPU tests.
+Topology: flat (B,T*F) or masked sequence (B,T,F) via the local wrapper.
 """
+
+
 
 from __future__ import annotations
 
@@ -129,12 +126,13 @@ class NIDSGANAttack(FeatureSpaceAttack):
     operates_on_physical_features: ClassVar[bool] = False
     requires_gradients: ClassVar[bool] = True
     query_based: ClassVar[bool] = False
+    hard_budget_norm = "l2"
 
     epsilon: float = 0.3
     target_label: int = 0
     hidden_dim: int = 256
     depth: int = 2
-    epochs: int = 30
+    epochs: int = 800
     batch_size: int = 128
     critic_steps: int = 5
     generator_lr: float = 1e-3
@@ -217,7 +215,9 @@ class NIDSGANAttack(FeatureSpaceAttack):
                 packet_view[..., names.index(name)] = 0.0
         return native
 
-    def _surrogate_logits(self, adversarial: torch.Tensor) -> torch.Tensor:
+    def _surrogate_logits(
+        self, adversarial: torch.Tensor, valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
         """Backprop through the *bound* PyTorch surrogate, never a proxy model."""
         wrapper = self._require_model()
         if not isinstance(wrapper, PyTorchModelWrapper):
@@ -235,7 +235,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
             model_input = adversarial.reshape(adversarial.shape[0], -1, feature_count)
         else:
             model_input = adversarial
-        logits = wrapper.model(model_input)
+        logits = wrapper.forward_differentiable(model_input, valid_mask=valid_mask)
         if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
             raise TypeError("Surrogate must return class logits with shape (B, C)")
         return logits
@@ -270,6 +270,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
         optimizer: torch.optim.Optimizer,
         x: torch.Tensor,
         mask: torch.Tensor,
+        valid_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint targeted CE + Wasserstein fooling + masked L2 hinge loss."""
         optimizer.zero_grad(set_to_none=True)
@@ -279,7 +280,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
         perturbation_loss = F.relu(norms - self.epsilon).mean()
         bounded_delta = _radially_bounded(masked_delta, self.epsilon)
         adversarial = x + bounded_delta
-        logits = self._surrogate_logits(adversarial)
+        logits = self._surrogate_logits(adversarial, valid_mask)
         target = torch.full(
             (len(x),), self.target_label, dtype=torch.long, device=x.device,
         )
@@ -321,18 +322,21 @@ class NIDSGANAttack(FeatureSpaceAttack):
         with surrogate checkpoint statistics, then dropped before optimization.
         """
         # Local imports avoid an import cycle with workflow's plugin registry.
-        from workflow import (
+        from workflow.factory import (
             _build_model,
             _cfg,
             _inject_dynamic_dataset_shape,
+            _model_requires_flatten,
+        )
+        from workflow.io import (
             _load_checkpoint,
             _load_checkpoint_metadata,
-            _model_requires_flatten,
             _normalization_from_checkpoint,
-            _checkpoint_path,
         )
         from orchestrator.device import configure_process_device
         from orchestrator.runner import seed_everything
+        from workflow.experiment import ExperimentStore
+        from workflow.seeds import role_seed
 
         cfg = _cfg(config)
         surrogate_cfg = dict(cfg.get("surrogate_model") or {})
@@ -342,26 +346,46 @@ class NIDSGANAttack(FeatureSpaceAttack):
             raise ValueError("surrogate_model.checkpoint must point to a trained surrogate")
         device = configure_process_device(gpu).torch_device
         seed_everything(seed)
+        # Offline training belongs to the authorized surrogate's topology,
+        # not the frozen evaluation target's. The engine later reshapes the
+        # same ordered coordinates when target and surrogate layouts differ.
+        cfg["model"] = dict(surrogate_cfg)
         _inject_dynamic_dataset_shape(cfg)
         dataset_cfg = dict(cfg["dataset"])
         dataset = DATASETS.get(str(dataset_cfg["name"]))(
             **dict(dataset_cfg.get("params", {}))
         )
         feature_names = tuple(str(name) for name in dataset.feature_names)
-        surrogate_path = _checkpoint_path(surrogate_cfg, seed, role="surrogate_model")
+        store = ExperimentStore(cfg.get("experiment_dir"), dataset=dataset_cfg["name"])
+        source_seed = role_seed(cfg, "surrogate", seed)
+        surrogate_path = store.model_path(
+            surrogate_cfg["name"], "none", source_seed, role="surrogates",
+        )
+        store.validate_template(
+            surrogate_cfg["checkpoint"], surrogate_path, source_seed,
+            role="surrogate_model",
+        )
+        store.require("model", surrogate_path, seed=source_seed)
         surrogate_metadata = _load_checkpoint_metadata(surrogate_path)
         normalization = _normalization_from_checkpoint(
             surrogate_metadata, feature_names, role="surrogate model",
         )
         x_physical, labels = dataset.raw_arrays()
         labels = np.asarray(labels, dtype=np.int64)
-        malicious_indices = np.flatnonzero(labels != int(cls._configured_parameters(cfg).get("target_label", 0)))
+        from core.provenance import authorized_attack_training_indices
+        permitted_indices = authorized_attack_training_indices(dataset, labels, cfg, seed, role='surrogate_model')
+        malicious_indices = permitted_indices[labels[permitted_indices] != int(cls._configured_parameters(cfg).get('target_label', 0))]
         if not len(malicious_indices):
             raise ValueError("NIDSGAN training requires non-benign flows")
-        normalized = normalization.normalize(x_physical).astype(np.float32, copy=False)
+        from core.dual_representation import encode_normalized32
+        if np.asarray(x_physical).dtype != np.float64:
+            raise TypeError('NIDSGAN requires original pre-normalization float64 features')
+        # Encode only permitted training records, never test/validation data.
+        x_physical = x_physical[malicious_indices]
+        normalized = encode_normalized32(x_physical, feature_names, normalization.mean, normalization.std)
         x_tensor = torch.from_numpy(np.ascontiguousarray(normalized))
         valid = getattr(dataset, "valid_mask", None)
-        valid_tensor = None if valid is None else torch.as_tensor(valid, dtype=torch.bool)
+        valid_tensor = None if valid is None else torch.as_tensor(np.asarray(valid)[malicious_indices], dtype=torch.bool)
         if valid_tensor is not None:
             if valid_tensor.shape[0] != len(x_tensor) or valid_tensor.ndim != 2:
                 raise ValueError("dataset.valid_mask must be a (N,T) packet mask")
@@ -395,6 +419,14 @@ class NIDSGANAttack(FeatureSpaceAttack):
         attack.bind_model(wrapper)
         wrapper.model.eval()
         wrapper.model.requires_grad_(False)
+        # Capture verified, compact training provenance *before* releasing source
+        # arrays and dataset references. The actual generator checkpoint seed
+        # may differ from the authorized surrogate's model-training seed.
+        from core.provenance import trained_generator_provenance
+        artifact_provenance = trained_generator_provenance(
+            dataset, labels, cfg, seed, source_role="surrogate_model",
+            input_shape=surrogate_input_shape, feature_names=feature_names,
+        )
         # The original authoritative x_physical remains solely in the dataset.
         # There is no data-dependent physical reconstruction in this trainer.
         del x_physical, normalized, labels
@@ -404,7 +436,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
         del dataset
 
         training_loader = DataLoader(
-            Subset(training_samples, malicious_indices.tolist()),
+            training_samples,
             batch_size=attack.batch_size,
             shuffle=True,
             num_workers=0,
@@ -445,7 +477,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
                     )
                 critic.requires_grad_(False)
                 losses = attack._generator_step(
-                    generator, critic, generator_optimizer, x, mask,
+                    generator, critic, generator_optimizer, x, mask, batch_valid,
                 )
                 for name, value in zip(
                     ("loss", "adversarial_loss", "wgan_loss", "perturbation_loss"),
@@ -460,9 +492,13 @@ class NIDSGANAttack(FeatureSpaceAttack):
                 critic_optimizer.zero_grad(set_to_none=True)
             critic.requires_grad_(True)
 
-        checkpoint = Path(attack.checkpoint.format(seed=seed))
+        checkpoint = store.generator_path(
+            cls.attack_name, str(cfg["attack"].get("variant", "default")), seed,
+        )
+        store.validate_template(attack.checkpoint, checkpoint, seed, role="attack")
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "artifact_provenance": artifact_provenance,
             "attack_name": cls.attack_name,
             "seed": int(seed),
             "generator_state": {key: tensor.detach().cpu()
@@ -475,9 +511,13 @@ class NIDSGANAttack(FeatureSpaceAttack):
             "target_label": attack.target_label,
             "surrogate_requires_flatten": attack.surrogate_requires_flatten,
         }
-        temporary = checkpoint.with_name(checkpoint.name + f".tmp-{seed}")
-        torch.save(payload, temporary)
-        temporary.replace(checkpoint)
+        from uuid import uuid4
+        temporary = checkpoint.with_name(checkpoint.name + f".tmp-{uuid4().hex}")
+        try:
+            torch.save(payload, temporary)
+            temporary.replace(checkpoint)
+        finally:
+            temporary.unlink(missing_ok=True)
         # The optimizer states and critic are deliberately not part of inference.
         del payload, generator, critic, wrapper, attack
         return {
@@ -498,6 +538,8 @@ class NIDSGANAttack(FeatureSpaceAttack):
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if payload.get("attack_name") != self.attack_name or int(payload.get("seed", -1)) != seed:
             raise ValueError("NIDSGAN checkpoint attack or seed mismatch")
+        from core.provenance import verify_generator_artifact_provenance
+        verify_generator_artifact_provenance(payload, getattr(self, 'expected_provenance', None))
         if tuple(payload["feature_names"]) != tuple(self.feature_names):
             raise ValueError("NIDSGAN checkpoint feature schema mismatch")
         stored_shape = tuple(int(d) for d in payload["input_shape"])

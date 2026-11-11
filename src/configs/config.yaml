@@ -3,9 +3,10 @@ defaults:
   - model: mlp
   - model/training: default
   - attack: pgd
+  - budget: research
   - preprocessing: sota_extractor
   - detector: none
-  - optional surrogate_model: null
+  - surrogate_model: jmila_surrogate
   - _self_
   - override hydra/job_logging: disabled
   - override hydra/hydra_logging: disabled
@@ -15,22 +16,56 @@ gpu: cpu
 gpu_partitions: [cpu]
 seeds: [1, 2, 3, 4, 5]
 parallel_workers: 5
+# auto: TTY stage bars / redirected stage milestones; on: force enabled;
+# off: no status snapshots or live renderer (file logging remains active).
+progress: auto
+
+# Null = independent worker replicate; explicit integer = frozen artifact or
+# RNG role shared across experiments. For paired attack comparisons, freeze
+# target/surrogate/split, vary seeds (worker/attack). Train target and surrogate
+# under the SAME split seed but independent model seeds.
+seed_roles:
+  split: null
+  target: null
+  surrogate: null
+  attack: null
+  detector: null
 
 evaluation:
   # Bounds attacks, inference, and post-generation validation memory.
   batch_size: 256
   # Optional deterministic per-seed cap applied before normalization.
   max_samples: null
+  # When max_samples is set, use a fixed selection seed to select exactly
+  # the same held-out test IDs across different attack seeds and configs.
+  sample_selection_seed: 0
   benign_label: 0
   # In multi-class mode, an evasion is successful only when the target predicts
   # this label; confusing one attack class with another is not an evasion.
   strict_multiclass: true
   c_fp: 1.0
   c_fn: 10.0
-  strict_constraints: false
+  strict_constraints: true
+  # Transfer attacks cannot access target inference/gradients during generation.
+  attack_access: transfer
+  # Only experiments with a user-certified common budget ID may be paired.
+  comparable_budget_id: null
 
-output_dir: >-
-  ../runs/${action}/${dataset.name}/${model.name}/${eval_path:${action},${attack.name},${attack.variant}}/${now:%Y%m%d_%H%M%S}_${uuid:}
+# Validation fraction is applied to the non-test portion of the corpus.
+# Dataset adapters may expose group_ids to enforce capture/session separation.
+# Research automatically requires actual stratified splits (or verified groups),
+# complete class support in train/validation/test, and no random fallback.
+# Smoke permits documented fallbacks but never training without required classes.
+data_split:
+  test_fraction: 0.2
+  validation_fraction: 0.2
+
+# Null is allowed ONLY for the initial train_nids command; it creates a new
+# runs/experiment_<UTC timestamp>_<unique id>/ directory.
+# All subsequent actions explicitly select that experiment_dir.
+experiment_dir: null
+# Internally generated: experiment_dir/executions/<unique command id>
+output_dir: null
 
 hydra:
   output_subdir: null  # Completely disables the creation of the .hydra folder

@@ -1,0 +1,19 @@
+# Place at configs/attack/tantra.yaml (matching MIRAGE's attack group schema).
+# Paired preprocessing must re-extract float64 physical_features + valid_mask.
+name: tantra
+params:
+  # Per-worker seed resolved by the same workflow convention as MIRAGE.
+  checkpoint: ${output_dir}/checkpoints/tantra_seed{seed}.pt
+  window_size: 50
+  target_label: 0
+  max_payload: 1460
+  time_scale: 1.0
+  hidden_size: 64
+  device: cpu
+training:
+  max_train_flows: 2048
+  max_train_windows: 50000
+  epochs: 12
+  batch_size: 64
+  learning_rate: 0.001
+variant: "ws${.params.window_size}_lr${.training.learning_rate}_ep${.training.epochs}"

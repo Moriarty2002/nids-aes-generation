@@ -1,0 +1,4 @@
+# @package model.training
+strategy: sklearn
+defense_mode: none
+batch_size: 256

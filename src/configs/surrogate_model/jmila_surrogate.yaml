@@ -1,6 +1,6 @@
 enabled: true
 name: jmila_surrogate
-checkpoint: null
+checkpoint: "${experiment_dir}/checkpoints/surrogates/jmila_surrogate/none/seed{seed}/nids.pt"
 params:
   hidden_dims: [1024, 512, 256, 128, 64, 32]
   dropout: 0.3

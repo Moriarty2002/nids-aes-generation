@@ -1,27 +1,17 @@
-"""MIRAGE: offline, fail-closed TCP packet-block adversarial benchmark plugin.
+"""Mirage offline ACK-block DQN (Li et al., IEEE ICC 2025, §IV/Eq. 5).
 
-Raw adapter contract (mapping-v1): dataset.raw_traffic is a batch of flows;
-each flow is a list/tuple of mappings with `direction` (0=attacker,
-1=victim), `timestamp` (seconds), `payload` (immutable bytes), `seq`
-(unsigned TCP sequence number), `ack` (unsigned TCP acknowledgment number),
-and `flags` (TCP flags as letters, e.g. 'A', 'PA'). Other keys are retained.
-The paired preprocessor MUST accept this same mapping representation, re-extract
-physical float64 features, and export its generated `valid_mask`.
-
-This module NEVER transmits traffic or fabricates arbitrary TCP packets. It
-resegments existing attacker bytes within acknowledged packet blocks. Unknown
-packet encodings, packets needing wire-level checksum repair, retransmissions,
-partial ACKs, and unacknowledged blocks fail closed. A separate PCAP/Scapy
-adapter must be supplied by the dataset/preprocessor integration; never
-silently reinterpret one as mapping-v1.
-
-The paper describes two-output BiLSTM approximation to continuous Q(s,a), but
-DQN requires a discrete action for a Bellman max. This implementation uses a
-finite, configurable (payload-length, inter-arrival-factor) action grid and a
-2-layer bidirectional LSTM Q head over the grid. The simulator uses the 20
-most discriminative features selected *from this dataset* by a deterministic
-univariate between/within-class ranking (not an undocumented paper list).
+Original: class-specific BiLSTM DQN, encrypted-flow classifier simulator,
+ACK-scoped byte-preserving packet-block redistribution and confidence reward.
+NIDS adaptation: offline mapping-v1 TCP block replay, strict topology checks,
+train-only simulator, no frozen target queries and no wire-level claim.
+Deviation: finite packet-length/timing action grid and malicious-to-benign
+NIDS goal instead of the source's encrypted traffic privacy objective.
+Topology: raw mapping-v1 TCP flows or strict offline classic-PCAP IPv4/TCP
+(complete ACK blocks, valid checksums, no fragments or ambiguous retransmits).
+The global raw-to-canonical extractor and actual network delivery remain deferred.
 """
+
+
 
 from __future__ import annotations
 
@@ -29,6 +19,7 @@ import gc
 import math
 import os
 import random
+import struct
 from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -41,6 +32,8 @@ from torch.nn import functional as F
 
 from attacks.base import AttackResult, ProblemSpaceAttack
 from core.registry import DATASETS, register_attack
+from core.provenance import (authorized_attack_training_indices, trained_generator_provenance,
+                             verify_generator_artifact_provenance)
 
 _FORMAT_VERSION = 1
 _FORBIDDEN_PACKET_KEYS = frozenset({"wire_bytes", "raw", "checksum", "ip_checksum", "tcp_checksum",
@@ -48,6 +41,126 @@ _FORBIDDEN_PACKET_KEYS = frozenset({"wire_bytes", "raw", "checksum", "ip_checksu
                                    "payload_length", "ip_len", "total_length",
                                    "tcp_len", "ip_total_length", "frame_len"})
 _REQUIRED = frozenset({"direction", "timestamp", "payload", "seq", "ack", "flags"})
+
+
+def _pcap_tcp_packets(capture: Any) -> tuple[list[dict[str, Any]], list[tuple[int,int,int,int]], Any]:
+    """Decode a complete single-flow IPv4/TCP PCAP into Mirage's ACK-block view.
+
+    The decoder verifies original IP/TCP checksums and rejects fragmentation,
+    missing payload bytes, unsupported link types and mixed 5-tuples. These
+    are *supported offline capture* boundaries, not claims about all PCAPs.
+    """
+    from attacks.problem_space.deepred import PcapFlow, _format, _checksum
+    if not isinstance(capture, PcapFlow):
+        raise TypeError('Expected an immutable classic-PCAP capture')
+    fmt = _format(capture.global_header)
+    if not capture.records:
+        raise ValueError('Mirage cannot infer a sender from empty PCAP')
+    parsed, offsets, endpoints = [], [], []
+    for record in capture.records:
+        frame = record.frame
+        offset = 14 if fmt.link_type == 1 else 0
+        if fmt.link_type == 1 and (len(frame) < 14 or frame[12:14] != b'\x08\x00'):
+            raise ValueError('Mirage supports only Ethernet/IPv4 or raw IPv4 PCAP')
+        if len(frame) < offset + 40 or frame[offset] >> 4 != 4:
+            raise ValueError('Mirage requires complete IPv4/TCP packets')
+        ihl = (frame[offset] & 15) * 4
+        if ihl < 20 or len(frame) < offset + ihl + 20:
+            raise ValueError('Malformed IPv4/TCP header')
+        ip = frame[offset:offset+ihl]
+        total_length, fragment = struct.unpack_from('!HH', ip, 2)[0], struct.unpack_from('!H', ip, 6)[0]
+        if fragment & 0x3fff or ip[9] != 6 or offset + total_length != len(frame):
+            raise ValueError('Mirage requires an unfragmented, untruncated TCP packet without L2 trailer')
+        start = offset + ihl
+        tcp_hlen = (frame[start+12] >> 4) * 4
+        if tcp_hlen < 20 or total_length < ihl + tcp_hlen:
+            raise ValueError('Invalid TCP data offset')
+        head = frame[start:start+tcp_hlen]
+        payload = frame[start+tcp_hlen:]
+        tcp = frame[start:]
+        pseudo = ip[12:20] + struct.pack('!BBH', 0, 6, len(tcp))
+        if _checksum(ip) != 0 or _checksum(pseudo + tcp) != 0:
+            raise ValueError('Mirage requires intact original IP/TCP checksums; offloaded captures unsupported')
+        sport, dport, seq, ack = struct.unpack_from('!HHII', head, 0)
+        if not sport or not dport:
+            raise ValueError('TCP ports must be nonzero')
+        flags = head[13]
+        if flags & ~(0x10 | 0x08):
+            raise ValueError('Mirage PCAP supports established ACK/PSH segments only')
+        symbols = ('A' if flags & 0x10 else '') + ('P' if flags & 0x08 else '')
+        endpoints.append((ip[12:16], ip[16:20], sport, dport))
+        parsed.append({'timestamp': record.seconds + record.fraction/fmt.tick_rate,
+                       'payload': payload, 'seq': int(seq), 'ack': int(ack),
+                       'flags': symbols})
+        offsets.append((offset, ihl, start, tcp_hlen))
+    senders = [i for i, pkt in enumerate(parsed) if pkt['payload']]
+    if not senders:
+        raise ValueError('Mirage requires at least one data packet')
+    sender = endpoints[senders[0]]
+    reverse = (sender[1], sender[0], sender[3], sender[2])
+    for i, endpoint in enumerate(endpoints):
+        if endpoint not in (sender, reverse):
+            raise ValueError('Mirage PCAP contains unrelated TCP flows')
+        parsed[i]['direction'] = 0 if endpoint == sender else 1
+    return parsed, offsets, fmt
+
+
+def _pcap_from_mapping(original: Any, before: Sequence[Mapping[str, Any]],
+                       changed: Sequence[Mapping[str, Any]], offsets: Sequence[tuple[int,int,int,int]],
+                       fmt: Any) -> Any:
+    """Write each ACK-scoped Mirage proposal as a checksummed offline packet.
+
+    Every victim packet remains byte-identical. Sender TCP sequence values and
+    checksums are recomputed when payload lengths change; total block bytes,
+    ACK boundaries, flags, IP endpoints and ordered time are independently
+    checked by the source `_topology_verified` and by redecoding this PCAP.
+    """
+    from attacks.problem_space.deepred import PcapFlow, CaptureRecord, _checksum
+    blocks = _parse_blocks(before, 1, 65535)
+    if blocks is None or not _topology_verified(before, changed, blocks, 1, 65535):
+        raise ValueError('Mirage proposed an invalid ACK-block or byte stream')
+    changed_records = []
+    previous_tick = -1
+    for i, (rec, baseline, candidate, (offset, ihl, start, tcp_hlen)) in enumerate(
+            zip(original.records, before, changed, offsets)):
+        if candidate == baseline:
+            changed_records.append(rec)
+            tick = rec.seconds * fmt.tick_rate + rec.fraction
+        else:
+            if baseline['direction'] != 0:
+                raise ValueError('Cannot modify a victim TCP packet')
+            stamp = float(candidate['timestamp'])
+            if not math.isfinite(stamp) or stamp < 0 or stamp >= 2**32:
+                raise ValueError('Invalid offline PCAP timestamp')
+            tick = round(stamp * fmt.tick_rate)
+            seconds, fraction = divmod(tick, fmt.tick_rate)
+            frame = rec.frame
+            ip = bytearray(frame[offset:start])
+            tcp = bytearray(frame[start:start+tcp_hlen])
+            payload = candidate['payload']
+            length = len(ip) + len(tcp) + len(payload)
+            if length > 65535:
+                raise ValueError('Mirage exceeds IPv4 total-length limit')
+            struct.pack_into('!H',ip,2,length)
+            struct.pack_into('!H',ip,10,0)
+            struct.pack_into('!H',ip,10,_checksum(bytes(ip)))
+            struct.pack_into('!I',tcp,4,int(candidate['seq']))
+            struct.pack_into('!H',tcp,16,0)
+            pseudo = ip[12:20] + struct.pack('!BBH',0,6,len(tcp)+len(payload))
+            struct.pack_into('!H',tcp,16,_checksum(pseudo+tcp+payload))
+            assembled = frame[:offset] + ip + tcp + payload
+            changed_records.append(CaptureRecord(int(seconds),int(fraction),
+                                                 bytes(assembled),len(assembled)))
+        if tick < previous_tick:
+            raise ValueError('Mirage would reorder PCAP packet timestamps')
+        previous_tick = tick
+    result = PcapFlow(original.global_header,tuple(changed_records))
+    decoded, _, _ = _pcap_tcp_packets(result)
+    if any((a['payload'],a['seq'],a['ack'],a['direction']) !=
+           (b['payload'],b['seq'],b['ack'],b['direction'])
+           for a,b in zip(decoded,changed)):
+        raise ValueError('Mirage TCP PCAP reparse disagrees with constructed payload/sequence')
+    return result
 
 
 def _pristine(flow: Any) -> Any:
@@ -490,6 +603,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         if not path.is_file():
             raise FileNotFoundError(f"MIRAGE checkpoint missing: {path}; first run train_attack")
         data = torch.load(path, map_location="cpu", weights_only=True)
+        verify_generator_artifact_provenance(data, getattr(self, 'expected_provenance', None))
         if data.get("attack_name") != self.attack_name or data.get("format_version") != _FORMAT_VERSION:
             raise ValueError("Unsupported MIRAGE composite checkpoint")
         for name in ("min_payload", "max_payload", "max_history", "time_scale"):
@@ -518,14 +632,31 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
     def generate_raw(self, traffic: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Transactional per-flow repackaging with a 1D boolean feasibility proof.
 
-        Failed flows are emitted precisely as provided, with mask=False. No
-        post-hoc row alignment or victim restoration is trusted or required.
+        Input is a batch of mapping-v1 TCP flow packet lists aligned with y;
+        each packet supplies direction, timestamp, payload, seq, ack and flags.
+        ACK-scoped payload reconstruction is offline, not a live wire adapter.
+        Failed flows are emitted unchanged with mask=False.
         """
         seed = int(kwargs.get("seed", self.seed))
         self._load(seed)
         labels = np.asarray(y).reshape(-1)
         if not isinstance(traffic, (list, tuple, np.ndarray)) or len(traffic) != len(labels):
             raise ValueError("MIRAGE requires a batch of raw flows aligned with y")
+        from attacks.problem_space.deepred import PcapFlow, _read_pcap
+        capture_inputs = [isinstance(flow, (PcapFlow, str, os.PathLike)) for flow in traffic]
+        if any(capture_inputs) and not all(capture_inputs):
+            raise ValueError('Mirage cannot mix raw-PCAP and mapping-v1 inputs in a batch')
+        converted = []
+        raw_origins = []
+        raw_offsets = []
+        if all(capture_inputs):
+            for flow in traffic:
+                capture = flow if isinstance(flow, PcapFlow) else _read_pcap(flow)
+                mapping, offsets, fmt = _pcap_tcp_packets(capture)
+                converted.append(mapping)
+                raw_origins.append((capture,fmt))
+                raw_offsets.append(offsets)
+            traffic = converted
         candidate: list[Any] = []
         feasible = np.zeros(len(traffic), dtype=np.bool_)
         qnet = self._networks.get(self.target_label)
@@ -545,6 +676,13 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                         output = tuple(constructed) if isinstance(flow, tuple) else constructed
                         feasible[i] = True
                     del constructed, trace
+            if raw_origins:
+                capture, fmt = raw_origins[i]
+                if feasible[i]:
+                    output = _pcap_from_mapping(capture, flow, output,
+                                                raw_offsets[i], fmt)
+                else:
+                    output = capture
             candidate.append(output)
         # Preserve array/list/tuple batch type for the paired raw preprocessor.
         if isinstance(traffic, np.ndarray):
@@ -562,7 +700,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                             metadata={"checkpoint": str(self._loaded_path),
                                       "target_label": self.target_label,
                                       "intrinsically_feasible": int(feasible.sum()),
-                                      "raw_adapter": "mapping-v1"})
+                                      "raw_adapter": "offline_tcp_pcap" if raw_origins else "mapping-v1"})
 
     @classmethod
     def train(cls, *, config: Mapping[str, Any], seed: int, gpu: str,
@@ -585,9 +723,16 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                           if k in {"checkpoint", "target_label", "seed", "device", "min_payload",
                                    "max_payload", "max_history", "time_scale",
                                    "length_actions", "time_factors"}})
-        dataset_cfg = config["dataset"]
+        from workflow.factory import _inject_dynamic_dataset_shape
+        # Source-checkpoint topology defines this authorized training view;
+        # the raw PCAP action itself never consumes normalized model arrays.
+        source_config = dict(config)
+        source_config['model'] = dict(config['surrogate_model'])
+        _inject_dynamic_dataset_shape(source_config)
+        dataset_cfg = source_config["dataset"]
         dataset = DATASETS.get(str(dataset_cfg["name"]))(**dict(dataset_cfg.get("params", {})))
         raw_features, raw_labels = dataset.raw_arrays()
+        raw_features_shape = raw_features.shape[1:]
         del raw_features  # never retain a second corpus-sized feature tensor
         labels = np.asarray(raw_labels, dtype=np.int64).reshape(-1)
         raw_flows = getattr(dataset, "raw_traffic", None)
@@ -599,17 +744,10 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
             raise ValueError("Simulator requires at least two traffic classes")
 
         rng = np.random.default_rng(seed)
-        # Honor an explicit training partition, otherwise reserve class-wise 20%.
-        provided = getattr(dataset, "train_indices", None)
-        if provided is not None:
-            indices = np.sort(np.asarray(provided, dtype=np.int64))
-        else:
-            partitions = []
-            for label in np.unique(labels):
-                matching = np.flatnonzero(labels == label)
-                rng.shuffle(matching)
-                partitions.append(matching[:max(1, int(math.floor(0.8 * len(matching))))])
-            indices = np.sort(np.concatenate(partitions))
+        # Never choose a private random train/test split: the source surrogate's
+        # exact registered training membership is the sole simulator/DQN fit set.
+        indices = authorized_attack_training_indices(
+            dataset, labels, config, seed, role='surrogate_model')
         cap = int(training.get("max_train_flows", 2048))
         if cap < 2:
             raise ValueError("max_train_flows must be at least 2")
@@ -618,8 +756,12 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         accepted_flows: list[Any] = []
         accepted_labels: list[int] = []
         stats: list[np.ndarray] = []
+        from attacks.problem_space.deepred import PcapFlow, _read_pcap
         for idx in indices:
             flow = raw_flows[int(idx)]
+            if isinstance(flow, (PcapFlow, str, os.PathLike)):
+                capture = flow if isinstance(flow, PcapFlow) else _read_pcap(flow)
+                flow, _, _ = _pcap_tcp_packets(capture)
             if _parse_blocks(flow, defaults.min_payload, defaults.max_payload) is None:
                 continue
             accepted_flows.append(flow)
@@ -696,7 +838,10 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
 
         payload: dict[str, Any] = {
             "attack_name": "mirage", "format_version": _FORMAT_VERSION,
-            "seed": int(seed), "raw_adapter": "mapping-v1",
+            "seed": int(seed), "raw_adapter": "mapping-v1_or_verified_offline_pcap",
+            "artifact_provenance": trained_generator_provenance(
+                dataset, labels, config, seed, source_role='surrogate_model',
+                input_shape=tuple(raw_features_shape), feature_names=tuple(dataset.feature_names)),
             "min_payload": defaults.min_payload, "max_payload": defaults.max_payload,
             "max_history": defaults.max_history, "time_scale": defaults.time_scale,
             "length_actions": list(defaults.length_actions),

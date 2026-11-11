@@ -1,0 +1,7 @@
+# Research configuration uses native, attack-specific YAML parameters.
+# This is NOT a claim of matched threat budgets or reproduction of SOTA papers.
+name: research
+max_test_samples: null
+max_target_epochs: null
+max_target_batch_size: null
+attack_overrides: {}

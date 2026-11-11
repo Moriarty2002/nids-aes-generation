@@ -3,5 +3,5 @@ defaults:
 
 name: lstm
 requires_flatten: false
-checkpoint: "../runs/checkpoints/bilstm_seed{seed}/nids.pt"
-params: {hidden_size: 128, layers: 2, dropout: 0.2}
+checkpoint: "${experiment_dir}/checkpoints/targets/lstm/${model.training.defense_mode}/seed{seed}/nids.pt"
+params: {hidden_dim: 128, layers: 2, dropout: 0.2}

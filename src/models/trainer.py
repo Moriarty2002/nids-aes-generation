@@ -8,49 +8,25 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Literal, overload
 
 import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
-from torch import nn
 from torch.utils.data import DataLoader
 
-from models.wrapper import PyTorchModelWrapper
-
-DefenseMode = Literal["none", "pgd", "trades"]
-PerturbationMaskFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+from defenses.robust_optimization import (
+    PerturbationMaskFn,
+    _classification_loss,
+    _resolve_perturbation_mask,
+    make_step_fn,
+    resolve_defense_mode,
+)
+from models.wrapper import forward_model, PyTorchModelWrapper
+from orchestrator.progress import ProgressCallback
 TrainingBatch = (
     tuple[torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 )
-
-
-def _resolve_perturbation_mask(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    perturbation_mask_fn: PerturbationMaskFn | None,
-) -> torch.Tensor | None:
-    """Return a detached binary mask on the model device.
-
-    A zero means that a coordinate is outside the attacker's feasible edit
-    set. Rejecting fractional/shape-incompatible masks prevents an ostensibly
-    constrained inner maximization from changing protected packet coordinates.
-    The trainer deliberately does not import any concrete attack implementation.
-    """
-    if perturbation_mask_fn is None:
-        return None
-    with torch.no_grad():
-        proposed = perturbation_mask_fn(x, y)
-        if not isinstance(proposed, torch.Tensor):
-            raise TypeError("perturbation_mask_fn must return a torch.Tensor")
-        if proposed.shape != x.shape:
-            raise ValueError(
-                f"Perturbation mask shape {tuple(proposed.shape)} differs from input {tuple(x.shape)}"
-            )
-        if not torch.all((proposed == 0) | (proposed == 1)).item():
-            raise ValueError("Perturbation mask must contain only binary 0/1 values")
-        return proposed.detach().to(device=x.device, dtype=x.dtype)
 
 
 def _batch_packet_mask(
@@ -103,66 +79,6 @@ class TrainingSummary:
     defense_mode: str = "none"
 
 
-def _classification_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Cross entropy for multiclass/two-logit models and BCE for one-logit binary models."""
-    if logits.ndim == 1 or logits.shape[-1] == 1:
-        return nn.functional.binary_cross_entropy_with_logits(logits.reshape(-1), y.float().reshape(-1))
-    return nn.functional.cross_entropy(logits, y.long())
-
-
-def _class_probabilities(logits: torch.Tensor) -> torch.Tensor:
-    """Return categorical probabilities; represent a one-logit model as two classes."""
-    if logits.ndim == 1 or logits.shape[-1] == 1:
-        positive = torch.sigmoid(logits.reshape(-1))
-        return torch.stack((1.0 - positive, positive), dim=-1)
-    return torch.softmax(logits, dim=-1)
-
-
-def _kl_from_logits(clean_logits: torch.Tensor, other_logits: torch.Tensor) -> torch.Tensor:
-    """KL(p_clean || p_other), with probability handling for one-logit binary models."""
-    clean_prob = _class_probabilities(clean_logits).detach().clamp_min(1e-12)
-    other_prob = _class_probabilities(other_logits).clamp_min(1e-12)
-    return nn.functional.kl_div(other_prob.log(), clean_prob, reduction="batchmean")
-
-
-def _pgd_delta(
-    model: nn.Module,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    epsilon: float,
-    alpha: float,
-    steps: int,
-    perturbation_mask_fn: PerturbationMaskFn | None = None,
-) -> torch.Tensor:
-    """Generate Linf PGD perturbations inside the endpoint attacker's edit set.
-
-    Mask random starts and every ascent/projection step, so victim-to-attacker
-    packets and immutable metadata are never modified by the inner maximizer.
-    BatchNorm running statistics remain unchanged during adversarial search.
-    """
-    if epsilon < 0 or alpha <= 0 or steps < 1:
-        raise ValueError("PGD requires epsilon >= 0, alpha > 0, and steps >= 1")
-    was_training = model.training
-    edit_mask = _resolve_perturbation_mask(x, y, perturbation_mask_fn)
-    delta = torch.empty_like(x).uniform_(-epsilon, epsilon)
-    if edit_mask is not None:
-        delta.mul_(edit_mask)
-    try:
-        model.eval()
-        for _ in range(steps):
-            delta = delta.detach().requires_grad_(True)
-            logits = model(x + delta)
-            loss = _classification_loss(logits, y)
-            grad = torch.autograd.grad(loss, delta, only_inputs=True)[0]
-            with torch.no_grad():
-                delta = (delta + alpha * grad.sign()).clamp(-epsilon, epsilon)
-                if edit_mask is not None:
-                    delta.mul_(edit_mask)
-    finally:
-        model.train(was_training)
-    return delta.detach()
-
-
 def _write_training_curve_atomic(output_dir: Path | None, history: list[dict[str, float | str]]) -> None:
     """Atomically publish the complete per-epoch history for live monitoring."""
     if output_dir is None or not history:
@@ -197,138 +113,6 @@ def _write_training_curve_atomic(output_dir: Path | None, history: list[dict[str
     tmp_path.replace(destination)
 
 
-def _resolve_defense_mode(defense_mode: str | None, adversarial_training: bool) -> DefenseMode:
-    """Map the legacy boolean to PGD while accepting the explicit defense_mode API."""
-    if defense_mode is None or not str(defense_mode).strip():
-        mode = "pgd" if adversarial_training else "none"
-    else:
-        mode = str(defense_mode).strip().lower()
-        # Backward compatibility: an old config with adversarial_training=true still
-        # enables PGD even if it inherits the new default defense_mode='none'.
-        if mode == "none" and adversarial_training:
-            mode = "pgd"
-    if mode not in {"none", "pgd", "trades"}:
-        raise ValueError(f"Unsupported defense_mode={mode!r}; expected 'none', 'pgd', or 'trades'")
-    return mode  # type: ignore[return-value]
-
-
-def _trades_loss_and_logits(
-    wrapper: PyTorchModelWrapper,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    *,
-    epsilon: float,
-    step_size: float,
-    steps: int,
-    beta: float,
-    perturbation_mask_fn: PerturbationMaskFn | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute TRADES objective and the natural logits used for training metrics.
-
-    Algorithmic reference: Zhang et al., *Theoretically Principled Trade-off between
-    Robustness and Accuracy*, ICML 2019. Reference implementation:
-    https://github.com/yaodongyu/TRADES
-
-    This is a framework-specific reimplementation, not copied source. The inner
-    maximization runs in eval mode, avoiding BatchNorm running-statistic drift. The
-    outer loss is evaluated in train mode on a combined clean/adversarial batch so
-    BatchNorm statistics are updated only once per optimizer step.
-    """
-    if epsilon < 0 or step_size <= 0 or steps < 1 or beta < 0:
-        raise ValueError("TRADES requires epsilon >= 0, step_size > 0, steps >= 1, and beta >= 0")
-
-    model = wrapper.model
-    x = x.to(wrapper.device, dtype=torch.float32)
-    y = y.to(wrapper.device, dtype=torch.long)
-    was_training = model.training
-    edit_mask = _resolve_perturbation_mask(x, y, perturbation_mask_fn)
-    delta = torch.empty_like(x).uniform_(-epsilon, epsilon)
-    if edit_mask is not None:
-        delta.mul_(edit_mask)
-
-    try:
-        model.eval()
-        with torch.no_grad():
-            clean_reference_logits = model(x)
-            clean_reference_prob = _class_probabilities(clean_reference_logits).detach().clamp_min(1e-12)
-
-        # Maximize KL(clean || adversarial) under the Linf budget.
-        for _ in range(steps):
-            delta = delta.detach().requires_grad_(True)
-            adv_logits = model(x + delta)
-            adv_prob = _class_probabilities(adv_logits).clamp_min(1e-12)
-            inner_kl = nn.functional.kl_div(adv_prob.log(), clean_reference_prob, reduction="batchmean")
-            gradient = torch.autograd.grad(inner_kl, delta, only_inputs=True)[0]
-            with torch.no_grad():
-                delta = (delta + step_size * gradient.sign()).clamp(-epsilon, epsilon)
-                if edit_mask is not None:
-                    delta.mul_(edit_mask)
-    finally:
-        # Restore the exact mode that was active on entry even if inner optimization fails.
-        model.train(was_training)
-
-    adversarial = (x + delta.detach()).detach()
-    # A single forward over both views limits BatchNorm updates to one outer pass.
-    joint_logits = model(torch.cat((x, adversarial), dim=0))
-    natural_logits, adversarial_logits = joint_logits.split(x.shape[0], dim=0)
-    natural_loss = _classification_loss(natural_logits, y)
-    robust_loss = _kl_from_logits(natural_logits, adversarial_logits)
-    return natural_loss + beta * robust_loss, natural_logits
-
-
-@overload
-def trades_loss(
-    wrapper: PyTorchModelWrapper,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    epsilon: float = 0.04,
-    step_size: float = 0.01,
-    steps: int = 10,
-    beta: float = 6.0,
-    *,
-    perturbation_mask_fn: PerturbationMaskFn | None = None,
-    return_logits: Literal[False] = False,
-) -> torch.Tensor: ...
-
-
-@overload
-def trades_loss(
-    wrapper: PyTorchModelWrapper,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    epsilon: float = 0.04,
-    step_size: float = 0.01,
-    steps: int = 10,
-    beta: float = 6.0,
-    *,
-    perturbation_mask_fn: PerturbationMaskFn | None = None,
-    return_logits: Literal[True],
-) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-
-def trades_loss(
-    wrapper: PyTorchModelWrapper,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    epsilon: float = 0.04,
-    step_size: float = 0.01,
-    steps: int = 10,
-    beta: float = 6.0,
-    *,
-    perturbation_mask_fn: PerturbationMaskFn | None = None,
-    return_logits: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """TRADES loss: natural classification loss + beta * KL regularizer.
-
-    See also the official research implementation at https://github.com/yaodongyu/TRADES.
-    Defaults follow the requested NIDS-safe starting point (epsilon=0.04, K=10,
-    alpha=epsilon/4, beta=6); tune and report these values for each dataset.
-    """
-    loss, natural_logits = _trades_loss_and_logits(
-        wrapper, x, y, epsilon=epsilon, step_size=step_size, steps=steps, beta=beta,
-        perturbation_mask_fn=perturbation_mask_fn,
-    )
-    return (loss, natural_logits) if return_logits else loss
 
 
 def _resolve_early_stopping_monitor(monitor: str) -> tuple[str, bool]:
@@ -397,6 +181,7 @@ def train_classifier(
     seed: int | None = None,
     logger: logging.Logger | None = None,
     perturbation_mask_fn: PerturbationMaskFn | None = None,
+    progress: ProgressCallback | None = None,
 ) -> TrainingSummary:
     """Train a NIDS using natural, PGD adversarial, or TRADES training.
 
@@ -427,7 +212,7 @@ def train_classifier(
 
     epsilon = float(pgd_epsilon)
     alpha = float(pgd_alpha) if pgd_alpha is not None else epsilon / 4.0
-    mode = _resolve_defense_mode(defense_mode, adversarial_training)
+    mode = resolve_defense_mode(defense_mode, adversarial_training)
 
     if mode in {"pgd", "trades"} and (epsilon < 0 or alpha <= 0 or pgd_steps < 1):
         raise ValueError(
@@ -480,6 +265,7 @@ def train_classifier(
             trades_beta,
             len(train_loader),
         )
+
         if early_stopping_enabled:
             logger.info(
                 "training.early_stopping.start seed=%s monitor=%s "
@@ -490,6 +276,16 @@ def train_classifier(
                 patience,
                 min_delta,
             )
+
+    step_fn = make_step_fn(
+        mode,
+        wrapper=wrapper,
+        epsilon=epsilon,
+        alpha=alpha,
+        steps=pgd_steps,
+        trades_beta=trades_beta,
+        perturbation_mask_fn=perturbation_mask_fn,
+    )
 
     model = wrapper.model
     optimizer = torch.optim.AdamW(
@@ -521,7 +317,11 @@ def train_classifier(
         trn_preds_list: list[np.ndarray] = []
         trn_labels_list: list[np.ndarray] = []
 
-        for train_batch in train_loader:
+        train_phase = f'train_epoch_{epoch}'
+        if progress is not None:
+            progress(train_phase, completed=0, total=len(train_loader),
+                     unit='batches', epoch=epoch, epochs=epochs)
+        for train_batch_number, train_batch in enumerate(train_loader, start=1):
             if not isinstance(train_batch, (tuple, list)) or len(train_batch) not in (2, 3):
                 raise ValueError("Training batches must be (x,y) or (x,y,packet_valid_mask)")
             x, y = train_batch[:2]
@@ -549,36 +349,7 @@ def train_classifier(
                     packet_valid_mask=batch_valid_mask,
                 )
 
-            if mode == "pgd":
-                delta = _pgd_delta(
-                    model,
-                    x,
-                    y,
-                    epsilon,
-                    alpha,
-                    pgd_steps,
-                    perturbation_mask_fn=batch_mask_fn,
-                )
-                logits = model(x + delta)
-                loss = _classification_loss(logits, y)
-
-            elif mode == "trades":
-                trades_result = trades_loss(
-                    wrapper,
-                    x,
-                    y,
-                    epsilon=epsilon,
-                    step_size=alpha,
-                    steps=pgd_steps,
-                    beta=trades_beta,
-                    perturbation_mask_fn=batch_mask_fn,
-                    return_logits=True,
-                )
-                loss, logits = trades_result
-
-            else:
-                logits = model(x)
-                loss = _classification_loss(logits, y)
+            loss, logits = step_fn(model, x, y, batch_mask_fn, batch_valid_mask)
 
             loss.backward()
             optimizer.step()
@@ -593,6 +364,9 @@ def train_classifier(
 
             trn_preds_list.append(preds.detach().cpu().numpy())
             trn_labels_list.append(y.detach().cpu().numpy())
+            if progress is not None:
+                progress(train_phase, completed=train_batch_number,
+                         total=len(train_loader), unit='batches', epoch=epoch, epochs=epochs)
 
         if count == 0:
             raise ValueError("Training DataLoader yielded no samples")
@@ -626,8 +400,14 @@ def train_classifier(
             val_preds_list: list[np.ndarray] = []
             val_labels_list: list[np.ndarray] = []
 
+            validation_phase = f'validation_epoch_{epoch}'
+            if progress is not None:
+                progress(validation_phase, completed=0, total=len(validation_loader),
+                         unit='batches', epoch=epoch, epochs=epochs)
             with torch.no_grad():
-                for x, y in validation_loader:
+                for validation_batch_number, validation_batch in enumerate(validation_loader, start=1):
+                    x, y = validation_batch[:2]
+                    val_packet_mask = validation_batch[2] if len(validation_batch) == 3 else None
                     x = x.to(
                         wrapper.device,
                         dtype=torch.float32,
@@ -639,7 +419,7 @@ def train_classifier(
                         non_blocking=True,
                     )
 
-                    logits = model(x)
+                    logits = forward_model(model, x, val_packet_mask)
                     loss = _classification_loss(logits, y)
 
                     total_val_loss += float(loss) * len(x)
@@ -656,6 +436,9 @@ def train_classifier(
 
                     val_preds_list.append(preds.detach().cpu().numpy())
                     val_labels_list.append(y.detach().cpu().numpy())
+                    if progress is not None:
+                        progress(validation_phase, completed=validation_batch_number,
+                                 total=len(validation_loader), unit='batches', epoch=epoch, epochs=epochs)
 
             if n_val:
                 val_loss = total_val_loss / n_val
@@ -793,6 +576,9 @@ def train_classifier(
                     best_metric_val,
                     patience,
                 )
+            if progress is not None:
+                progress('training_stopped_early', status='completed',
+                         note=f'best_epoch={best_epoch} stopped_epoch={epoch}')
             break
 
     # Restore best weights on both early termination and normal completion.

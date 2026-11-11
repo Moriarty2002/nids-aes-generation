@@ -1,36 +1,14 @@
-"""Offline DeepRed-inspired, fail-closed PCAP perturbation attack.
+"""DeepRed offline C2 flow modification (Hajizadeh et al., WOOT 2025).
 
-Paper
------
-Hajizadeh et al., "DeepRed: A Deep Learning–Powered Command and Control
-Framework for Multi-Stage Red Teaming Against ML-based Network Intrusion
-Detection Systems", USENIX WOOT 2025, Sections 4.3–4.5.
-
-Scope and evidence
-------------------
-This is a *benchmark adaptation*, not the paper's live C2 agent. DeepRed uses
-an offline substitute model, a GAN, and feature-to-packet translation. This
-plugin implements those stages for two primary, src2dst NFStream-style
-measurements: ``src2dst_bytes`` and ``src2dst_max_ps``. The training input is
-an explicitly supplied, *unscaled* flow-feature NPZ. It implements SFP and
-single-injected-packet SPSF using a deliberately narrow, auditable PCAP
-backend: unfragmented IPv4/UDP over Ethernet or raw IPv4. No packets are
-sent; TCP, HTTP, WebSocket, IPv6, fragmented flows, and PCAPNG fail closed.
-
-For this backend, ``bytes`` is defined as the sum of IPv4 total lengths and
-``max_ps`` as the maximum IPv4 total length in the source-to-destination
-direction. The external preprocessor MUST use the same definitions to compare
-targets against extracted features. Successful IP/UDP validation does NOT
-prove application-layer semantic preservation. In particular, padding a UDP
-payload may be unacceptable to a real application. Use only on authorized,
-offline benchmark captures and separately test application functionality.
-
-Input to generate_raw: a batch of PCAP file paths or PcapFlow objects.
-The output preserves the input representation type, independently per sample.
-Rejected flows return their unmodified input and have ``False`` in the
-intrinsic mask. A configured BasePreprocessor must accept these objects and
-provide physical_features (float64) and valid_mask after re-extraction.
+Original: staged learned C2 traffic perturbations and packet-level mapping.
+NIDS adaptation: bounded offline IPv4/UDP PCAP backend with independent
+packet checksum/length checks and authorized training-only surrogate fitting.
+Remaining deviation: not live C2 transmission, TCP or generic protocol wire
+certification; success on mapped features does not certify application meaning.
+Topology: classic PCAP/PCAP-flow IPv4 UDP; deferred extractor untouched.
 """
+
+
 
 from __future__ import annotations
 
@@ -51,10 +29,12 @@ from torch.nn import functional as F
 
 from attacks.base import AttackResult, ProblemSpaceAttack
 from core.registry import register_attack
+from core.provenance import (authorized_attack_training_indices, trained_generator_provenance,
+                             verify_generator_artifact_provenance)
 
 
 _NAMES = ("src2dst_bytes", "src2dst_max_ps")
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 _MAX_PACKETS_PER_FLOW = 100_000
 
@@ -559,13 +539,12 @@ class DeepRed(ProblemSpaceAttack):
         gpu: str,
         logger: logging.Logger | None = None,
     ) -> Mapping[str, float]:
-        """Train the surrogate and GAN offline, using only training-set flows.
+        """Fit on registered train-only PCAPs using only independent surrogate feedback.
 
-        The surrogate's input target is either separately obtained oracle labels
-        in the NPZ or, in a weaker setup, dataset labels. No online NIDS oracle
-        is contacted. Both networks see raw *flow aggregates* transformed by
-        train-fitted mean/std for numeric conditioning. That transformation is
-        internal to GAN training, never substituted for a PCAP mutation.
+        The pretrained authorized surrogate labels raw training flows through
+        the registered six-feature extractor; a small differentiable two-feature
+        proxy approximates that decision for GAN gradients. The frozen target
+        is never loaded, and PCAP aggregate scaling is generator-internal only.
         """
         attack_options = config.get("attack", {})
         if not isinstance(attack_options, Mapping):
@@ -575,27 +554,73 @@ class DeepRed(ProblemSpaceAttack):
         settings = cls(**{key: value for key, value in attack_options.items()
                           if key not in {"name", "seed", "device", "config"}},
                        seed=int(seed), device=gpu, config=config)
-        if not settings.training_npz:
-            raise ValueError("attack.training_npz must point to a training-only raw-flow NPZ")
-        with np.load(settings.training_npz, allow_pickle=False) as archive:
-            physical = archive["features"]
-            labels = archive["labels"]
-            names = tuple(str(n) for n in archive["feature_names"].tolist())
-            oracle = archive["oracle_labels"] if "oracle_labels" in archive else labels
-        if names != _NAMES:
-            raise ValueError(f"Training feature_names must be {_NAMES} in that exact order")
-        if physical.dtype != np.float64 or physical.ndim != 2 or physical.shape[1] != 2:
-            raise TypeError("training features must be float64 with shape (N, 2)")
-        if len(physical) != len(labels) or len(labels) != len(oracle) or len(labels) < 4:
-            raise ValueError("Training data and labels have mismatched/insufficient lengths")
+        if settings.training_npz is not None:
+            raise ValueError('Unregistered training_npz/oracle_labels cannot prove training-only membership; '
+                             'use the registered raw-PCAP dataset and independent surrogate')
+        if settings.attacker_ip is None:
+            raise ValueError('DeepRed fitting requires an explicitly declared attacker IPv4 address')
+        from workflow.factory import _build_model, _inject_dynamic_dataset_shape
+        from workflow.io import (_load_checkpoint, _load_checkpoint_metadata,
+                                 _normalization_from_checkpoint)
+        from workflow.seeds import role_seed
+        from core.provenance import frozen_model_state_sha256
+        from core.query_meter import ModelQueryMeter
+        from core.registry import DATASETS
+        source_cfg = dict(config.get('surrogate_model') or {})
+        if not source_cfg or not source_cfg.get('enabled', True):
+            raise ValueError('DeepRed generator requires independently registered surrogate source')
+        source_config = dict(config)
+        source_config['model'] = source_cfg
+        _inject_dynamic_dataset_shape(source_config)
+        dataset_cfg = source_config['dataset']
+        dataset = DATASETS.get(str(dataset_cfg['name']))(**dict(dataset_cfg.get('params', {})))
+        raw, all_labels = dataset.raw_arrays()
+        all_labels = np.asarray(all_labels, dtype=np.int64)
+        indices = authorized_attack_training_indices(
+            dataset, all_labels, config, seed, role='surrogate_model')
+        raw_traffic = getattr(dataset, 'raw_traffic', None)
+        if raw_traffic is None or len(raw_traffic) != len(all_labels):
+            raise ValueError('DeepRed needs registered, aligned training PCAP sources')
+        attacker = ip_address(settings.attacker_ip).packed
+        physical_rows = []
+        for row in indices:
+            capture = raw_traffic[int(row)]
+            capture = _read_pcap(capture) if isinstance(capture, (str, os.PathLike)) else capture
+            if not isinstance(capture, PcapFlow):
+                raise ValueError('Raw traffic must be a verified classic-PCAP source')
+            aggregates, _, _ = _measure(capture, attacker)
+            physical_rows.append(aggregates)
+        physical = np.stack(physical_rows).astype(np.float64, copy=False)
+        labels = all_labels[indices]
+        source_seed = role_seed(config, 'surrogate', seed)
+        source_path = Path(str(source_cfg['checkpoint']).format(seed=source_seed))
+        source_meta = _load_checkpoint_metadata(source_path)
+        if tuple(source_meta['input_shape']) != tuple(raw.shape[1:]):
+            raise ValueError('Registered surrogate topology differs from DeepRed training source')
+        norm = _normalization_from_checkpoint(source_meta, tuple(dataset.feature_names), role='DeepRed surrogate')
+        source_wrapper = _build_model(source_cfg, (len(raw), *source_meta['input_shape']),
+                                      device=settings.device, num_classes=int(source_meta['num_classes']),seed=source_seed)
+        _load_checkpoint(source_wrapper, source_path, checkpoint_data=source_meta)
+        if frozen_model_state_sha256(source_wrapper) != source_meta['model_state_sha256']:
+            raise ValueError('DeepRed independent surrogate learned state mismatch')
+        model_input = np.asarray(norm.normalize(raw[indices]), dtype=np.float32)
+        with ModelQueryMeter(source_wrapper) as query_meter:
+            oracle = np.asarray(source_wrapper.predict(model_input), dtype=np.int64).reshape(-1)
+        oracle_records = int(query_meter.counts.inference_records)
+        del source_wrapper, raw, model_input
+        if len(physical) < 4:
+            raise ValueError('DeepRed requires at least four authorized training-only flows')
         if not np.isfinite(physical).all() or np.any(physical < 0):
             raise ValueError("Training data must contain finite nonnegative physical measurements")
         if not np.issubdtype(labels.dtype, np.integer) or not np.issubdtype(oracle.dtype, np.integer):
             raise TypeError("Labels and oracle_labels must use integer types")
         y = (labels.reshape(-1) != 0).astype(np.int64)
         proxy_y = (oracle.reshape(-1) != 0).astype(np.int64)
-        if len(np.unique(y)) != 2 or len(np.unique(proxy_y)) != 2 or np.count_nonzero(y) < 2:
-            raise ValueError("Both classes and at least two malicious samples are required")
+        if len(np.unique(y)) != 2 or np.count_nonzero(y) < 2:
+            raise ValueError("Registered train-only labels must contain both classes and malicious support")
+        # An authorized source model can legitimately predict only one class
+        # on difficult data. Record that limitation; never invent a second
+        # class by substituting test labels or target-oracle responses.
         mean_np = physical.mean(axis=0)
         std_np = np.maximum(physical.std(axis=0), 1.0)
         # Seed everything in the seed-local worker. No target checkpoint needed.
@@ -691,6 +716,11 @@ class DeepRed(ProblemSpaceAttack):
         destination.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
             "format_version": _FORMAT_VERSION,
+            "artifact_provenance": trained_generator_provenance(
+                dataset, all_labels, config, seed, source_role='surrogate_model',
+                input_shape=tuple(source_meta['input_shape']),
+                feature_names=tuple(dataset.feature_names)),
+            "authorized_surrogate_inference_records": oracle_records,
             "attack": settings.attack_name,
             "seed": int(seed),
             "feature_names": _NAMES,
@@ -721,16 +751,21 @@ class DeepRed(ProblemSpaceAttack):
             "deepred_generator_loss": final_g,
             "deepred_discriminator_loss": final_d,
             "deepred_training_epochs": float(settings.gan_epochs),
+            "deepred_independent_surrogate_oracle_records": float(oracle_records),
+            "deepred_source_prediction_class_count": float(len(np.unique(proxy_y))),
         }
 
     def _load(self, seed: int) -> None:
         """Load a verified, seed-local checkpoint, not a live model object."""
-        if self._generator is not None and self._loaded_seed == seed:
+        # The evaluation worker pins the first registered attack-seed checkpoint;
+        # per-batch RNG offsets must not silently switch learned generators.
+        if self._generator is not None and self._loaded_seed is not None:
             return
         path = Path(self.checkpoint.format(seed=seed))
         if not path.is_file():
             raise FileNotFoundError(f"DeepRed checkpoint missing: {path}; run train_attack first")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        verify_generator_artifact_provenance(checkpoint, getattr(self,'expected_provenance',None))
         if (checkpoint.get("format_version") != _FORMAT_VERSION
                 or checkpoint.get("attack") != "deepred"
                 or checkpoint.get("seed") != seed
@@ -777,9 +812,10 @@ class DeepRed(ProblemSpaceAttack):
                      y: Any, **kwargs: Any) -> AttackResult:
         """Mutate offline PCAPs and return a verified *per-flow* feasibility mask.
 
-        A failure never converts an unverified mutation into a successful flow:
-        rejected entries return the exact original path/object and a False bit.
-        Failure reasons are recorded without storing packet payloads in logs.
+        Input contains classic PCAP file paths or PcapFlow records with IPv4/UDP
+        packets; TCP, PCAPng and live-C2 traffic are not supported. Each result
+        retains its flow index and per-flow feasibility flag, and failures return
+        the exact original path/object. Packet payloads are not logged.
         """
         labels = np.asarray(y.detach().cpu().numpy() if isinstance(y, Tensor) else y).reshape(-1)
         if len(traffic) != len(labels):
@@ -802,7 +838,7 @@ class DeepRed(ProblemSpaceAttack):
         except ValueError as exc:
             raise ValueError("attacker_ip must be a valid IPv4 address") from exc
         # Checkpoint/setup errors are fatal, never silently treated as successes.
-        self._load(self.seed)
+        self._load(effective_seed)
         for index, (flow, label) in enumerate(zip(traffic, labels, strict=True)):
             note: dict[str, Any] = {"index": index, "feasible": False}
             if int(label) == 0:

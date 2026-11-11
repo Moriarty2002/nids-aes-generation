@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import nullcontext
+import inspect
 from dataclasses import dataclass
+import warnings
 import logging
 from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
@@ -11,12 +14,21 @@ import torch
 
 from attacks.base import AttackResult, BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
 from constraints.gatekeeper import UniversalConstraintGatekeeper
-from constraints.rules import DirectionalImmutabilityRule, RuleSet
 from defenses.base import BaseDetector
-from models.wrapper import ModelWrapper
+from models.wrapper import ModelWrapper, PyTorchModelWrapper
+from orchestrator.progress import ProgressCallback
 from preprocessing.base import BasePreprocessor
-from core.dual_representation import decode_physical64, encode_normalized32, layout
-from .metrics import detection_auroc, evaluate_predictions
+from core.ownership import verify_mapping_v1_victim_packets, mapping_v1_packet_edit_opcodes
+from core.query_meter import ModelQueryCounts, ModelQueryMeter
+from core.provenance import frozen_model_state_sha256
+from core.dual_representation import (
+    _as_physical_shape,
+    _restore_target_physical_protected_inplace,
+    decode_physical64,
+    encode_normalized32,
+    layout,
+)
+from .metrics import detection_auroc, evaluate_predictions, classification_metrics, classification_support, PhysicalDistanceAccumulator
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,17 @@ class EvaluationOutput:
     attack_result: AttackResult
     detector_clean_scores: np.ndarray | None = None
     detector_adversarial_scores: np.ndarray | None = None
+    defended_predictions: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class BatchContext:
+    """Synchronized clean batch views used throughout one evaluation iteration."""
+
+    x_batch: Any
+    y_batch: np.ndarray
+    clean_physical_batch: np.ndarray
+    valid_mask_batch: np.ndarray | torch.Tensor | None
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -62,11 +85,14 @@ def _sync_if_cuda(model: ModelWrapper) -> None:
         torch.cuda.synchronize(torch.device(device))
 
 
-def _timed_predict(model: ModelWrapper, x: Any) -> tuple[np.ndarray, float]:
+def _timed_predict(model: ModelWrapper, x: Any, valid_mask: Any = None) -> tuple[np.ndarray, float]:
     """Measure full target prediction wall time, including device synchronization."""
     _sync_if_cuda(model)
     start = perf_counter()
-    predictions = np.asarray(model.predict(x), dtype=np.int64)
+    predictions = np.asarray(
+        model.predict(x, valid_mask=valid_mask) if isinstance(model, PyTorchModelWrapper)
+        else model.predict(x), dtype=np.int64
+    )
     _sync_if_cuda(model)
     elapsed = perf_counter() - start
     return predictions, max(elapsed, np.finfo(np.float64).eps)
@@ -101,6 +127,9 @@ def _batched_predict(
     model: ModelWrapper,
     x: Any,
     batch_size: int,
+    valid_mask: Any = None,
+    *,
+    progress: ProgressCallback | None = None,
 ) -> tuple[np.ndarray, float]:
     """Predict in bounded batches and return predictions in input order."""
     n_samples = len(x)
@@ -110,9 +139,13 @@ def _batched_predict(
         batch_predictions, batch_elapsed = _timed_predict(
             model,
             _slice_batch(x, start, min(start + batch_size, n_samples)),
+            valid_mask=None if valid_mask is None else _slice_batch(valid_mask, start, min(start + batch_size, n_samples)),
         )
         predictions.append(batch_predictions)
         elapsed += batch_elapsed
+        if progress is not None:
+            progress('clean_inference', completed=min(start + batch_size, n_samples),
+                     total=n_samples, unit='flows')
     if not predictions:
         return np.empty(0, dtype=np.int64), np.finfo(np.float64).eps
     return np.concatenate(predictions), max(elapsed, np.finfo(np.float64).eps)
@@ -123,14 +156,19 @@ def _batched_detector_score(
     model: ModelWrapper,
     x: Any,
     batch_size: int,
+    valid_mask: Any = None,
 ) -> np.ndarray:
     """Score inputs through the detector in bounded batches to prevent OOM."""
     n_samples = len(x)
     scores: list[np.ndarray] = []
     for start in range(0, n_samples, batch_size):
+        kwargs = {}
+        if "valid_mask" in inspect.signature(detector.score).parameters:
+            kwargs["valid_mask"] = (
+                None if valid_mask is None else _slice_batch(valid_mask, start, min(start + batch_size, n_samples))
+            )
         batch_scores = detector.score(
-            _slice_batch(x, start, min(start + batch_size, n_samples)),
-            model,
+            _slice_batch(x, start, min(start + batch_size, n_samples)), model, **kwargs,
         )
         scores.append(np.asarray(batch_scores, dtype=np.float64).reshape(-1))
     if not scores:
@@ -138,108 +176,10 @@ def _batched_detector_score(
     return np.concatenate(scores)
 
 
-def _chunked_perturbation_distances(
-    x: np.ndarray,
-    x_adv: np.ndarray,
-    sample_mask: np.ndarray,
-    *,
-    batch_size: int = 256,
-) -> dict[str, float]:
-    """Compute distances in chunks, avoiding full-corpus float64 copies and deltas."""
-    a = np.asarray(x)
-    b = np.asarray(x_adv)
-    mask = np.asarray(sample_mask, dtype=bool)
-    if a.shape != b.shape:
-        raise ValueError(f"x and x_adv shapes differ: {a.shape} != {b.shape}")
-    if a.ndim < 2:
-        raise ValueError(f"Expected batch-shaped arrays, received {a.shape}")
-    if len(mask) != len(a):
-        raise ValueError("sample_mask and batch length must match")
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
-
-    l0_total = 0.0
-    l2_total = 0.0
-    linf_total = 0.0
-    selected_count = 0
-    for start in range(0, len(a), batch_size):
-        stop = min(start + batch_size, len(a))
-        local_mask = mask[start:stop]
-        if not np.any(local_mask):
-            continue
-        # Boolean indexing creates copies only for one bounded chunk.
-        a_chunk = a[start:stop][local_mask]
-        b_chunk = b[start:stop][local_mask]
-        delta = np.subtract(b_chunk, a_chunk, dtype=np.float64).reshape(int(local_mask.sum()), -1)
-        l0_total += float(np.count_nonzero(np.abs(delta) > 1e-12, axis=1).sum(dtype=np.int64))
-        l2_total += float(np.linalg.norm(delta, ord=2, axis=1).sum(dtype=np.float64))
-        linf_total += float(np.linalg.norm(delta, ord=np.inf, axis=1).sum(dtype=np.float64))
-        selected_count += int(local_mask.sum())
-
-    if selected_count == 0:
-        return {"mean_l0": 0.0, "mean_l2": 0.0, "mean_linf": 0.0}
-    return {
-        "mean_l0": l0_total / selected_count,
-        "mean_l2": l2_total / selected_count,
-        "mean_linf": linf_total / selected_count,
-    }
 
 
-def _restore_target_physical_protected_inplace(
-    adversarial: np.ndarray,
-    original: np.ndarray,
-    feature_names: Sequence[str],
-    *,
-    immutable_features: Sequence[str] = (),
-    valid_mask: np.ndarray | torch.Tensor | None = None,
-) -> tuple[int, int]:
-    """Last-stage physical immutability projection, in-place without drift."""
-    if adversarial.dtype != np.float64 or original.dtype != np.float64:
-        raise TypeError("Both authoritative arrays must be float64")
-    if adversarial.shape != original.shape or not adversarial.flags.writeable:
-        raise ValueError("Physical batches must match and adversarial must be writable")
-    b, t, f = layout(adversarial, feature_names)
-    names = tuple(str(n).upper() for n in feature_names)
-    adv = adversarial.reshape(b, t, f)
-    clean = original.reshape(b, t, f)
-    valid = None if valid_mask is None else _as_numpy(valid_mask).astype(bool, copy=False)
-    if valid is not None and valid.shape != (b, t):
-        raise ValueError("Invalid valid_mask shape")
-    immutable = {str(n).upper() for n in immutable_features}
-    if "DIR" in names:
-        immutable.add("DIR")
-    if immutable - set(names):
-        raise ValueError(f"Unknown immutable features: {sorted(immutable-set(names))}")
-    victim_count = 0
-    if "DIR" in names:
-        victim = np.isclose(clean[..., names.index("DIR")], 1.0, atol=1e-2, rtol=0.0)
-        if valid is not None:
-            victim &= valid
-        victim_count = int(np.count_nonzero(victim))
-        np.copyto(adv, clean, where=victim[..., None])
-    for key in immutable:
-        j = names.index(key)
-        np.copyto(adv[..., j], clean[..., j])
-    padded = 0
-    if valid is not None:
-        padded = int(np.count_nonzero(~valid))
-        np.copyto(adv, clean, where=(~valid)[..., None])
-    return victim_count, padded
 
 
-def _as_physical_shape(
-    raw: np.ndarray | torch.Tensor,
-    expected: np.ndarray | torch.Tensor,
-    names: Sequence[str],
-) -> np.ndarray:
-    """Accept flattened/sequence-equivalent physical layouts without copying."""
-    physical = _as_numpy(raw)
-    if physical.dtype != np.float64:
-        raise TypeError("Physical source must be float64, not normalized float32")
-    b, t, f = layout(expected, names)
-    if physical.shape[0] != b or physical.size != b * t * f:
-        raise ValueError("Physical batch and target batch dimensions differ")
-    return physical.reshape(tuple(expected.shape))
 
 
 def _violation_counts(gate_result: Any) -> dict[str, float]:
@@ -274,6 +214,7 @@ class EvaluationEngine:
         attack_model: ModelWrapper | None = None,
         preprocessor: BasePreprocessor | None = None,
         attack_normalization: FeatureNormalization | None = None,
+        surrogate_input_shape: Sequence[int] | None = None,
         target_normalization: FeatureNormalization | None = None,
         class_labels: Sequence[int] | None = None,
         class_names: Sequence[str] | None = None,
@@ -289,29 +230,46 @@ class EvaluationEngine:
         logger: logging.Logger | None = None,
     ) -> None:
         self.target_model = target_model
-        self.attack_model = attack_model or target_model
-        self.attack = attack.bind_model(self.attack_model)
+        # Enforce the benchmark-wide target-isolation policy even when the
+        # engine is called directly, bypassing workflow configuration.
+        if (getattr(attack, 'requires_gradients', False) or (isinstance(attack, FeatureSpaceAttack) and getattr(attack, 'query_based', False))) and attack_model is None:
+            raise ValueError('Query- and gradient-based attacks require a separately authorized surrogate')
+        if attack_model is target_model:
+            raise ValueError('Attack generation may never bind the target model')
+        if attack_model is not None:
+            # Independent models may have exactly the same architecture and
+            # hyperparameters. Only *shared live storage* is forbidden: it
+            # would expose target-owned weights to attacker-side autograd.
+            target_nn = getattr(target_model, 'model', None)
+            surrogate_nn = getattr(attack_model, 'model', None)
+            if isinstance(target_nn, torch.nn.Module) and isinstance(surrogate_nn, torch.nn.Module):
+                def tensor_storages(module: torch.nn.Module) -> set[tuple[str, int]]:
+                    return {
+                        (str(t.device), int(t.untyped_storage().data_ptr()))
+                        for t in (*module.parameters(), *module.buffers())
+                        if t.numel() and t.untyped_storage().data_ptr()
+                    }
+
+                if tensor_storages(target_nn) & tensor_storages(surrogate_nn):
+                    raise ValueError('Attacker and target share underlying PyTorch parameter or buffer storage')
+            for name in ('model', 'estimator'):
+                underlying = getattr(target_model, name, None)
+                if underlying is not None and underlying is getattr(attack_model, name, None):
+                    raise ValueError('Attacker and target share underlying model storage')
+            # A distinct wrapper/checkpoint path does not confer independence:
+            # reject byte-identical learned states regardless of path or seed.
+            if (isinstance(getattr(target_model, 'model', None), torch.nn.Module) or
+                    getattr(target_model, 'estimator', None) is not None) and (
+                    isinstance(getattr(attack_model, 'model', None), torch.nn.Module) or
+                    getattr(attack_model, 'estimator', None) is not None):
+                if frozen_model_state_sha256(target_model) == frozen_model_state_sha256(attack_model):
+                    raise ValueError('Attack surrogate has exactly the frozen target model state')
+        if attack_model is None and getattr(attack, 'model', None) is not None:
+            raise ValueError('Model-independent attack must not arrive pre-bound to a model')
+        self.attack_model = attack_model
+        self.attack = attack.bind_model(attack_model) if attack_model is not None else attack
+        self.surrogate_input_shape = tuple(int(dim) for dim in surrogate_input_shape) if surrogate_input_shape else None
         self.gatekeeper = gatekeeper
-        # Differential packet comparisons have no positional meaning after
-        # raw packet insertion/deletion. Construct a separate immutable oracle
-        # policy instead of mutating the feature-space Gatekeeper's RuleSet.
-        # All non-differential physical rules and the exact normalized/physical
-        # encoding verification remain active for problem-space candidates.
-        if isinstance(self.attack, ProblemSpaceAttack):
-            aligned_rules = tuple(
-                rule for rule in gatekeeper.rules.rules
-                if not isinstance(rule, DirectionalImmutabilityRule)
-            )
-            self._problem_space_gatekeeper = UniversalConstraintGatekeeper(
-                rules=RuleSet(aligned_rules),
-                strict=gatekeeper.strict,
-                normalization_mean=gatekeeper.normalization_mean,
-                normalization_std=gatekeeper.normalization_std,
-                logger=gatekeeper.logger,
-                discrete_diagnostics=gatekeeper.discrete_diagnostics,
-            )
-        else:
-            self._problem_space_gatekeeper = None
         self.preprocessor = preprocessor
         self.attack_normalization = attack_normalization
         self.target_normalization = target_normalization
@@ -322,6 +280,13 @@ class EvaluationEngine:
         self.c_fp = float(c_fp)
         self.c_fn = float(c_fn)
         self.strict_constraints = gatekeeper.strict if strict_constraints is None else bool(strict_constraints)
+        if not self.strict_constraints:
+            warnings.warn(
+                "strict_constraints=false enables NON-STRICT DIAGNOSTIC scoring of "
+                "physically rejected adversarial candidates. Its ungated outputs "
+                "are not valid SOTA feasible-attack evidence.",
+                UserWarning, stacklevel=2,
+            )
         self.strict_multiclass = bool(strict_multiclass)
         self.detector = detector
         if max_samples is not None and max_samples < 1:
@@ -345,6 +310,7 @@ class EvaluationEngine:
         raw_traffic: Any | None = None,
         valid_mask: np.ndarray | torch.Tensor | None = None,
         attack_kwargs: Mapping[str, Any] | None = None,
+        progress: ProgressCallback | None = None,
     ) -> EvaluationOutput:
         """Generate, validate, score, and summarize one evaluation batch.
 
@@ -354,6 +320,19 @@ class EvaluationEngine:
         """
         y_np = _as_numpy(y).astype(np.int64, copy=False)
         x_target = x
+        if valid_mask is not None:
+            valid_mask = _as_numpy(valid_mask)
+            if valid_mask.dtype != np.bool_ or valid_mask.ndim != 2 or valid_mask.shape[0] != len(y_np):
+                raise ValueError("valid_mask must be a boolean (N,T) packet occupancy array")
+        if valid_mask is not None:
+            _, clean_t, _ = layout(x_target, feature_names)
+            if valid_mask.shape != (len(y_np), clean_t):
+                raise ValueError("Clean packet occupancy has the wrong (N,T) shape")
+            lengths = valid_mask.sum(axis=1)
+            if not np.all(valid_mask == (np.arange(clean_t)[None, :] < lengths[:, None])):
+                raise ValueError("Clean valid_mask must contain a contiguous real-packet prefix")
+        if not self.strict_multiclass:
+            raise ValueError("strict_multiclass=false is unsupported: benign-target evasion is always strict")
         if clean_physical is None:
             raise ValueError(
                 "Dual-authoritative evaluation requires clean_physical captured BEFORE "
@@ -410,9 +389,29 @@ class EvaluationEngine:
                     "from pre-normalization float64 physical source"
                 )
 
-        baseline_pred, baseline_elapsed = _batched_predict(
-            self.target_model, x_target, self.batch_size
+        # Fail preflight before querying even the clean evaluation target.
+        final_attack_budget = (
+            self.attack.final_budget_contract()
+            if isinstance(self.attack, FeatureSpaceAttack) else None
         )
+        if final_attack_budget is not None:
+            if self.attack_normalization is None:
+                provided = dict(attack_kwargs or {})
+                if provided.get("normalization_mean") is None or provided.get("normalization_std") is None:
+                    raise ValueError("A bounded attack must declare its authorized normalization")
+
+        if progress is not None:
+            progress('clean_inference', completed=0, total=len(y_np), unit='flows')
+        with ModelQueryMeter(self.target_model) as clean_meter:
+            baseline_pred, baseline_elapsed = _batched_predict(
+                self.target_model, x_target, self.batch_size, valid_mask=valid_mask,
+                progress=progress,
+            )
+        target_clean_counts = clean_meter.counts
+        target_adv_counts = ModelQueryCounts()
+        target_detector_clean_counts = ModelQueryCounts()
+        target_detector_adv_counts = ModelQueryCounts()
+        surrogate_counts = ModelQueryCounts()
         if len(baseline_pred) != len(y_np):
             raise ValueError("Target baseline predictions and labels have different lengths")
 
@@ -442,11 +441,21 @@ class EvaluationEngine:
 
         effective_attack_kwargs = dict(attack_kwargs or {})
         if self.attack_normalization is not None and not isinstance(self.attack, ProblemSpaceAttack):
-            effective_attack_kwargs.setdefault("normalization_mean", self.attack_normalization.mean)
-            effective_attack_kwargs.setdefault("normalization_std", self.attack_normalization.std)
+            # Attack kwargs cannot override checkpoint-authorized surrogate normalization.
+            for name, correct in (("normalization_mean", self.attack_normalization.mean),
+                                  ("normalization_std", self.attack_normalization.std)):
+                if name in effective_attack_kwargs and not np.array_equal(
+                    np.asarray(effective_attack_kwargs[name]), np.asarray(correct)
+                ):
+                    raise ValueError(f"Attack-supplied {name} differs from authorized surrogate normalization")
+                effective_attack_kwargs[name] = correct
 
         success_batches: list[np.ndarray] = []
         query_batches: list[np.ndarray] = []
+        distance_accumulator: PhysicalDistanceAccumulator | None = (
+            PhysicalDistanceAccumulator(feature_names)
+            if isinstance(self.attack, FeatureSpaceAttack) else None
+        )
         accepted_batches: list[np.ndarray] = []
         scored_batches: list[np.ndarray] = []
         adversarial_prediction_batches: list[np.ndarray] = []
@@ -456,6 +465,8 @@ class EvaluationEngine:
         baseline_score_batches: list[np.ndarray] = []
         query_score_batches: list[np.ndarray] = []
         violation_counts: Counter[str] = Counter()
+        verified_raw_edit_totals = np.zeros(3, dtype=np.int64)
+        verified_raw_edit_flow_count = 0
         first_feature_names: tuple[str, ...] | None = None
         first_feature_shape: tuple[int, ...] | None = None
         x_adv_target: np.ndarray | None = None
@@ -469,16 +480,27 @@ class EvaluationEngine:
                 "to implement extract_features(x)"
             )
 
+        if progress is not None:
+            progress('generate_and_gate', completed=0, total=n_samples, unit='flows')
         for start in range(0, n_samples, self.batch_size):
             stop = min(start + self.batch_size, n_samples)
             batch_kwargs = dict(effective_attack_kwargs)
             if batch_kwargs.get("seed") is not None:
                 batch_kwargs["seed"] = int(batch_kwargs["seed"]) + start
 
+            x_batch = _slice_batch(x_target, start, stop)
+            y_batch = y_np[start:stop]
             clean_target_physical = _as_physical_shape(
                 _slice_physical_source(clean_physical, start, stop),
-                _slice_batch(x_target, start, stop),
+                x_batch,
                 feature_names,
+            )
+            valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
+            batch_context = BatchContext(
+                x_batch=x_batch,
+                y_batch=y_batch,
+                clean_physical_batch=clean_target_physical,
+                valid_mask_batch=valid_mask_batch,
             )
             
             physical_feature_attack = (
@@ -495,7 +517,7 @@ class EvaluationEngine:
                 # In-place generator mutations must never corrupt the pristine baseline
                 # or a shared/memory-mapped physical dataset.
                 attack_batch_input = np.array(
-                    clean_target_physical,
+                    batch_context.clean_physical_batch,
                     dtype=np.float64,
                     copy=True,
                     order="C",
@@ -513,42 +535,81 @@ class EvaluationEngine:
                     # Transfer attacks may require surrogate-specific normalization.
                     # Physical generators do not need this intermediate conversion.
                     attack_batch_input = encode_normalized32(
-                        clean_target_physical,
+                        batch_context.clean_physical_batch,
                         feature_names,
                         self.attack_normalization.mean,
                         self.attack_normalization.std,
                     )
+
+            # Bijective model-topology adaptation is a view, not re-extraction
+            # or a float32->float64 inverse. Attack results are reshaped back
+            # to the fixed target topology before final physical validation.
+            if (self.surrogate_input_shape is not None
+                    and isinstance(self.attack, FeatureSpaceAttack)):
+                if int(np.prod(self.surrogate_input_shape)) != int(np.prod(x_batch.shape[1:])):
+                    raise ValueError('Target and surrogate input widths do not match')
+                attack_batch_input = attack_batch_input.reshape(
+                    (stop - start, *self.surrogate_input_shape)
+                )
 
             expected_batch_size = stop - start
             # The authoritative mask is per-batch, not the entire corpus.
             # Explicitly override a stale mask supplied through attack_kwargs.
             # Padding must be invisible to randomized starts and PGD like updates,
             # in addition to the existing final float64 physical restoration.
-            valid_mask_batch = None if valid_mask is None else _slice_batch(valid_mask, start, stop)
-            if valid_mask_batch is not None:
-                _, expected_time_steps, _ = layout(attack_batch_input, feature_names)
-                if tuple(valid_mask_batch.shape) != (expected_batch_size, expected_time_steps):
+            if batch_context.valid_mask_batch is not None:
+                _, expected_time_steps, _ = layout(
+                    x_batch if isinstance(self.attack, ProblemSpaceAttack) else attack_batch_input,
+                    feature_names,
+                )
+                if tuple(batch_context.valid_mask_batch.shape) != (expected_batch_size, expected_time_steps):
                     raise ValueError(
-                        f"valid_mask batch shape {tuple(valid_mask_batch.shape)} != "
+                        f"valid_mask batch shape {tuple(batch_context.valid_mask_batch.shape)} != "
                         f"{(expected_batch_size, expected_time_steps)}"
                     )
-                batch_kwargs["valid_mask"] = valid_mask_batch
+                batch_kwargs["valid_mask"] = batch_context.valid_mask_batch
             else:
                 # run(valid_mask=None) means no padding mask; never leak one
                 # inherited from a different experiment via attack_kwargs.
                 batch_kwargs.pop("valid_mask", None)
             if isinstance(self.attack, FeatureSpaceAttack):
-                batch_kwargs["_clean_authoritative_physical"] = clean_target_physical
+                batch_kwargs["_clean_authoritative_physical"] = batch_context.clean_physical_batch.reshape(
+                    attack_batch_input.shape
+                )
                 batch_kwargs["_discrete_diagnostic_logger"] = self.logger
                 batch_kwargs["_discrete_diagnostic_config"] = getattr(self, "discrete_diagnostics", None)
-            batch_result = self.attack.generate(
-                attack_batch_input,
-                _slice_batch(y, start, stop),
-                **batch_kwargs,
+            attack_batch_raw = attack_batch_input if isinstance(self.attack, ProblemSpaceAttack) else None
+            # Surrogate-only scoped mask: all optimizer forward paths, including
+            # direct attack.model.forward_differentiable(), see correct occupancy.
+            mask_context = (
+                self.attack_model.attack_mask_context(batch_context.valid_mask_batch)
+                if isinstance(self.attack_model, PyTorchModelWrapper)
+                else nullcontext()
             )
+            # Independent metering is scoped strictly to generation. The
+            # target guard is active even for an attack retaining a hidden
+            # reference to the target; the evaluator does not supply one.
+            with ModelQueryMeter(self.target_model, forbidden=True):
+                with ModelQueryMeter(self.attack_model) as attack_meter:
+                    with mask_context:
+                        batch_result = self.attack.generate(
+                            attack_batch_input, batch_context.y_batch, **batch_kwargs,
+                        )
+            surrogate_counts.add(attack_meter.counts)
+            # Per-sample plugin counts are *inference record evaluations*.
+            # Gradient forwards have their own category and are not disguised
+            # as black-box score queries. Validate query-based plugin claims
+            # against independently measured inference counts.
+            if (self.attack_model is not None and
+                    (self.attack.query_based or getattr(self.attack, 'attack_name', '') == 'tdtce')):
+                claimed = batch_result.queries
+                if claimed is None or np.asarray(claimed).ndim != 1 or (
+                    int(np.asarray(claimed).sum()) != attack_meter.counts.inference_records
+                ):
+                    raise ValueError('Attack query telemetry contradicts independently metered surrogate inference')
             del attack_batch_input
             if self.logger:
-                self.logger.info(
+                self.logger.debug(
                     "evaluation.attack_batch batch=%d:%d generated=%d success=%s queries=%s",
                     start, stop, expected_batch_size,
                     "yes" if batch_result.success_mask is not None else "no",
@@ -584,14 +645,16 @@ class EvaluationEngine:
                         "Attack queries length changed or does not match its input batch: "
                         f"expected {expected_batch_size}, got {len(query_batch)}"
                     )
-                query_batches.append(query_batch)
+                if query_batch.dtype.kind not in "iu" or np.any(query_batch < 0):
+                    raise ValueError("Attack queries must be nonnegative integers for every attempt")
+                query_batches.append(query_batch.astype(np.int64, copy=False))
 
             x_adv_source: np.ndarray | None = None
             processed: Any | None = None
             # For raw packet attacks, only the generated packet occupancy is
             # authoritative. The clean valid_mask is still passed to the attack
             # above, but must never determine which generated packets are scored.
-            gate_valid_mask_batch = valid_mask_batch
+            gate_valid_mask_batch = batch_context.valid_mask_batch
             if batch_result.raw_adversarial is not None:
                 if self.preprocessor is None:
                     raise RuntimeError("Problem-space evaluation requires a preprocessor")
@@ -606,7 +669,7 @@ class EvaluationEngine:
                         "before normalization for dual-authoritative evaluation"
                     )
                 x_adv_physical = _as_physical_shape(
-                    raw_physical, _slice_batch(x_target, start, stop), batch_feature_names
+                    raw_physical, batch_context.x_batch, batch_feature_names
                 )
                 # Packet insertion can populate previously padded positions.
                 # Reusing the clean mask would silently hide those packets from
@@ -614,8 +677,8 @@ class EvaluationEngine:
                 # must come from re-extracting the generated raw traffic.
                 generated_valid_mask = getattr(processed, "valid_mask", None)
                 if generated_valid_mask is None:
-                    if valid_mask_batch is not None and not bool(
-                        np.all(_as_numpy(valid_mask_batch))
+                    if batch_context.valid_mask_batch is not None and not bool(
+                        np.all(_as_numpy(batch_context.valid_mask_batch))
                     ):
                         raise RuntimeError(
                             "Problem-space preprocessing must export processed.valid_mask "
@@ -639,8 +702,8 @@ class EvaluationEngine:
                         )
                     gate_valid_mask_batch = generated_valid_mask
                     if self.logger is not None:
-                        if valid_mask_batch is not None:
-                            original_valid = _as_numpy(valid_mask_batch).astype(bool, copy=False)
+                        if batch_context.valid_mask_batch is not None:
+                            original_valid = _as_numpy(batch_context.valid_mask_batch).astype(bool, copy=False)
                             self.logger.info(
                                 "evaluation.problem_space_occupancy batch=%d:%d "
                                 "injected_positions=%d removed_positions=%d",
@@ -661,7 +724,7 @@ class EvaluationEngine:
                 if x_adv_source.dtype != np.float32:
                     raise TypeError("Attack model representation must be float32")
                 x_adv_physical = _as_physical_shape(
-                    batch_result.authoritative_physical, x_adv_source, batch_feature_names
+                    batch_result.authoritative_physical, x_batch, batch_feature_names
                 )
                 if not x_adv_physical.flags.writeable or not x_adv_physical.flags.c_contiguous:
                     x_adv_physical = np.array(x_adv_physical, dtype=np.float64, copy=True, order="C")
@@ -672,9 +735,9 @@ class EvaluationEngine:
                 # Feature-space adversaries must not rewrite victim packets,
                 # immutable metadata, or padding in the physical reference.
                 _restore_target_physical_protected_inplace(
-                    x_adv_physical, clean_target_physical, batch_feature_names,
+                    x_adv_physical, batch_context.clean_physical_batch, batch_feature_names,
                     immutable_features=getattr(self.attack, "immutable_features", ()),
-                    valid_mask=valid_mask_batch,
+                    valid_mask=batch_context.valid_mask_batch,
                 )
             elif isinstance(self.attack, ProblemSpaceAttack):
                 # A raw-traffic attack may legitimately inject into previously
@@ -725,8 +788,8 @@ class EvaluationEngine:
                 # authoritative physical corpus without using system RAM.
                 authoritative_physical_output[start:stop] = x_adv_physical
 
-            x_clean_batch = _slice_batch(x_target, start, stop)
-            y_batch = y_np[start:stop]
+            x_clean_batch = batch_context.x_batch
+            y_batch = batch_context.y_batch
             baseline_batch = baseline_pred[start:stop]
             # Raw packet mutations can insert/remove packets and shift all later
             # positions. A row-wise comparison against the clean physical tensor
@@ -754,19 +817,38 @@ class EvaluationEngine:
                         f"with shape {(expected_batch_size,)}, got "
                         f"{intrinsic.dtype} and {intrinsic.shape}"
                     )
-                if self._problem_space_gatekeeper is None:
-                    raise RuntimeError("Problem-space oracle was not initialized")
-                gatekeeper = self._problem_space_gatekeeper
-            else:
-                intrinsic = None
-                gatekeeper = self.gatekeeper
+                # For mapping-v1 inputs, independently verify victim packet
+                # identity/order at the raw level, not by shifted feature rows.
+                mapping_ownership = verify_mapping_v1_victim_packets(
+                    attack_batch_raw, batch_result.raw_adversarial
+                )
+                if mapping_ownership is not None:
+                    intrinsic = intrinsic & mapping_ownership
+                    violation_counts['problem_space_victim_ownership'] += int(
+                        np.count_nonzero(~mapping_ownership)
+                    )
 
-            gate = gatekeeper.validate(
+            else:
+                raw_intrinsic = batch_result.intrinsic_feasible_mask
+                intrinsic = None
+                if raw_intrinsic is not None:
+                    intrinsic = _as_numpy(raw_intrinsic)
+                    if intrinsic.dtype != np.bool_ or intrinsic.shape != (expected_batch_size,):
+                        raise ValueError(
+                            "Feature-space intrinsic_feasible_mask must be boolean "
+                            f"with shape {(expected_batch_size,)}"
+                        )
+
+            gate = self.gatekeeper.validate(
                 x_adv_batch,
                 first_feature_names,
                 authoritative_physical=x_adv_physical,
-                original_physical=None if problem_space else clean_target_physical,
+                original_physical=None if problem_space else batch_context.clean_physical_batch,
                 valid_mask=gate_valid_mask_batch,
+                is_problem_space=problem_space,
+                attack_budget=final_attack_budget,
+                budget_normalization_mean=batch_kwargs.get("normalization_mean"),
+                budget_normalization_std=batch_kwargs.get("normalization_std"),
             )
             accepted_batch = np.asarray(gate.accepted, dtype=bool).reshape(-1)
             if intrinsic is not None:
@@ -775,13 +857,23 @@ class EvaluationEngine:
                 accepted_batch &= intrinsic
                 n_intrinsic_violations = int(np.count_nonzero(~intrinsic))
                 if n_intrinsic_violations:
-                    violation_counts["problem_space_intrinsic_feasibility"] += n_intrinsic_violations
+                    violation_counts[
+                        "problem_space_intrinsic_feasibility" if problem_space
+                        else "feature_space_intrinsic_feasibility"
+                    ] += n_intrinsic_violations
             if len(accepted_batch) != expected_batch_size:
                 raise RuntimeError(
                     "Gatekeeper accepted mask length does not match the generated batch: "
                     f"expected {expected_batch_size}, got {len(accepted_batch)}"
                 )
             accepted_batches.append(accepted_batch)
+            if problem_space and mapping_ownership is not None:
+                raw_edits = mapping_v1_packet_edit_opcodes(attack_batch_raw, batch_result.raw_adversarial)
+                if raw_edits is not None:
+                    # Only independently verified, gatekeeper-accepted flows
+                    # contribute to feasible mapping-v1 opcode counts.
+                    verified_raw_edit_totals += raw_edits[accepted_batch].sum(axis=0)
+                    verified_raw_edit_flow_count += int(accepted_batch.sum())
             for violation in gate.violations:
                 rule = str(getattr(violation, "rule", "unknown"))
                 indices = getattr(violation, "indices", ())
@@ -790,42 +882,75 @@ class EvaluationEngine:
                 except (TypeError, ValueError):
                     continue
 
-            if self.detector is not None:
-                clean_scores = np.asarray(
-                    self.detector.score(x_clean_batch, self.target_model),
-                    dtype=np.float64,
-                ).reshape(-1)
-                adversarial_scores = np.asarray(
-                    self.detector.score(x_adv_batch, self.target_model),
-                    dtype=np.float64,
-                ).reshape(-1)
-                if len(clean_scores) != expected_batch_size or len(adversarial_scores) != expected_batch_size:
-                    raise RuntimeError("Detector must return exactly one score per evaluation sample")
-                clean_detector_batches.append(clean_scores)
-                adversarial_detector_batches.append(adversarial_scores)
-
+            # Gatekeeper admission comes BEFORE target-dependent adversarial
+            # detector scoring. Rejected samples retain NaN score placeholders
+            # to keep all reporting arrays aligned with the original sample IDs.
             score_mask_batch = (
                 accepted_batch if self.strict_constraints else np.ones(expected_batch_size, dtype=bool)
             )
+            if self.detector is not None:
+                with ModelQueryMeter(self.target_model) as detector_clean_meter:
+                    clean_scores = _batched_detector_score(
+                        self.detector, self.target_model, x_clean_batch, self.batch_size,
+                        valid_mask=batch_context.valid_mask_batch,
+                    )
+                target_detector_clean_counts.add(detector_clean_meter.counts)
+                adversarial_scores = np.full(expected_batch_size, np.nan, dtype=np.float64)
+                if np.any(score_mask_batch):
+                    with ModelQueryMeter(self.target_model) as detector_adv_meter:
+                        adversarial_scores[score_mask_batch] = _batched_detector_score(
+                            self.detector, self.target_model,
+                            x_adv_batch[score_mask_batch], self.batch_size,
+                            valid_mask=(None if gate_valid_mask_batch is None
+                                        else gate_valid_mask_batch[score_mask_batch]),
+                        )
+                    target_detector_adv_counts.add(detector_adv_meter.counts)
+                if len(clean_scores) != expected_batch_size:
+                    raise RuntimeError('Detector must score every clean evaluation example')
+                clean_detector_batches.append(clean_scores)
+                adversarial_detector_batches.append(adversarial_scores)
             scored_batches.append(score_mask_batch)
             if queries_available:
                 query_score_batches.append(query_batch[score_mask_batch])
             if np.any(score_mask_batch):
-                adversarial_predictions_batch = _batched_predict(
-                    self.target_model,
-                    x_adv_batch[score_mask_batch],
-                    self.batch_size,
-                )[0]
+                with ModelQueryMeter(self.target_model) as target_adv_meter:
+                    adversarial_predictions_batch = _batched_predict(
+                        self.target_model,
+                        x_adv_batch[score_mask_batch],
+                        self.batch_size,
+                        valid_mask=(None if gate_valid_mask_batch is None
+                                    else gate_valid_mask_batch[score_mask_batch]),
+                    )[0]
+                target_adv_counts.add(target_adv_meter.counts)
                 adversarial_prediction_batches.append(adversarial_predictions_batch)
                 y_score_batches.append(y_batch[score_mask_batch])
                 baseline_score_batches.append(baseline_batch[score_mask_batch])
 
-            del batch_result, x_adv_batch, x_adv_physical, clean_target_physical
+            if distance_accumulator is not None:
+                # A rejected sample has no target prediction. It still counts
+                # as an eligible generation attempt, but never as a success.
+                batch_adv_pred = np.full(expected_batch_size, -1, dtype=np.int64)
+                if np.any(score_mask_batch):
+                    batch_adv_pred[score_mask_batch] = adversarial_predictions_batch
+                desired = self.benign_label if self.target_label is None else self.target_label
+                batch_eligible = (baseline_batch == y_batch) & (y_batch != desired)
+                batch_success = batch_eligible & accepted_batch & (batch_adv_pred == desired)
+                distance_accumulator.update(
+                    batch_context.clean_physical_batch, x_adv_physical,
+                    batch_context.valid_mask_batch,
+                    eligible=batch_eligible, accepted=accepted_batch,
+                    successful=batch_success,
+                )
+
+            del batch_result, x_adv_batch, x_adv_physical, batch_context, attack_batch_raw
             del x_clean_batch, y_batch, baseline_batch
             if x_adv_source is not None:
                 del x_adv_source
             if processed is not None:
                 del processed
+            # Only count fully generated, independently gated, permissibly scored batches.
+            if progress is not None:
+                progress('generate_and_gate', completed=stop, total=n_samples, unit='flows')
 
         if x_adv_target is None or first_feature_names is None or first_feature_shape is None:
             raise ValueError("Evaluation requires at least one generated sample")
@@ -859,7 +984,14 @@ class EvaluationEngine:
             success_mask=np.concatenate(success_batches) if success_available else None,
             queries=np.concatenate(query_batches) if queries_available else None,
             feature_names=actual_feature_names,
-            metadata={**first_metadata, "physical_authority": (
+            metadata={**first_metadata, "final_budget": (
+                None if final_attack_budget is None else {
+                    "epsilon": final_attack_budget.epsilon,
+                    "norm": final_attack_budget.norm,
+                    "domain": final_attack_budget.domain,
+                    "normalization_owner": "authorized_attack_or_surrogate",
+                }
+            ), "physical_authority": (
                 "retained_in_caller_sink" if authoritative_physical_output is not None
                 else "batch_local_not_retained"
             )},
@@ -877,16 +1009,17 @@ class EvaluationEngine:
             & (adv_score != self.benign_label)
             & (adv_score != desired_label)
         )
-        successful_full = np.zeros(n_samples, dtype=bool)
-        successful_full[score_mask] = successful
+        eligible_full = (baseline_pred == y_np) & (y_np != desired_label)
+        # Independent physical admission is necessary for benchmark success.
+        # Rejected attempts remain in the denominator as unsuccessful attempts.
+        successful_full = eligible_full & accepted & (adversarial_pred_full == desired_label)
 
         metric_labels = self.class_labels
         if metric_labels is None:
-            observed = (
-                np.unique(np.concatenate([y_score, base_score, adv_score]))
-                if len(y_score)
-                else np.asarray([], dtype=np.int64)
-            )
+            # Direct engine users without a declared schema still require a
+            # valid universe when every candidate is rejected. Use the clean
+            # full-test population, never only the scored accepted subset.
+            observed = np.unique(np.concatenate((y_np, baseline_pred, adv_score)))
             metric_labels = tuple(int(value) for value in observed)
 
         # Avoid full-size x_score/x_adv_score Boolean-indexed copies. Distances
@@ -910,16 +1043,97 @@ class EvaluationEngine:
             c_fp=self.c_fp,
             c_fn=self.c_fn,
         )
-        metrics.update(
-            _chunked_perturbation_distances(
-                _as_numpy(x_target),
-                x_adv_target,
-                successful_full,
-                batch_size=self.batch_size,
-            )
-        )
+        if distance_accumulator is not None:
+            metrics.update(distance_accumulator.summary())
+            metrics["distance_domain_physical_aligned"] = 1.0
+        else:
+            # Variable-length raw topology is not aligned edit cost. Do not
+            # silently label normalized coordinate distances as physical edits.
+            metrics["distance_domain_physical_aligned"] = 0.0
+            if verified_raw_edit_flow_count:
+                metrics['raw_mapping_v1_verified_accepted_flow_count'] = float(verified_raw_edit_flow_count)
+                for name, value in zip(('inserted', 'deleted', 'replaced'), verified_raw_edit_totals):
+                    metrics[f'raw_mapping_v1_sequence_opcode_{name}_packet_count'] = float(value)
+                    metrics[f'raw_mapping_v1_sequence_opcode_{name}_per_accepted_flow'] = float(value/verified_raw_edit_flow_count)
+            else:
+                metrics['raw_mapping_v1_verified_accepted_flow_count'] = 0.0
+            for key in ("mean_l0", "mean_l2", "mean_linf"):
+                metrics[key] = float("nan")
 
+
+        # Gated full-test defended outcomes use *clean* target predictions for
+        # rejected candidates. They are NOT adversarial predictions.
+        defended_predictions = baseline_pred.copy()
+        defended_predictions[accepted & score_mask] = adversarial_pred_full[accepted & score_mask]
+        groups = {
+            "full_test_clean": (y_np, baseline_pred),
+            "full_test_constraint_gated_defended": (y_np, defended_predictions),
+            "accepted_subset_clean": (y_np[accepted], baseline_pred[accepted]),
+            "accepted_subset_adversarial": (
+                y_np[accepted], adversarial_pred_full[accepted]
+            ),
+        }
+        for prefix, (true_subset, pred_subset) in groups.items():
+            if len(true_subset) and np.any(pred_subset < 0):
+                raise RuntimeError("Accepted population lacks target predictions")
+            summary = classification_metrics(true_subset, pred_subset, metric_labels).as_dict()
+            for key, value in summary.items():
+                metrics[f"{prefix}_{key}"] = float(value)
+            # Persist all schema class counts for this exact metric population,
+            # including an empty accepted-only subset. These are descriptive
+            # counts, never alternative ASR denominators.
+            support = classification_support(true_subset, pred_subset, metric_labels)
+            metrics[f"{prefix}_schema_complete"] = float(support['schema_complete'])
+            metrics[f"{prefix}_predicted_only_class_count"] = float(len(support['predicted_only_classes']))
+            for label, count in support['ground_truth_support'].items():
+                metrics[f"{prefix}_support_class_{label}"] = float(count)
+            for label, count in support['predicted_counts'].items():
+                metrics[f"{prefix}_predicted_count_class_{label}"] = float(count)
+        metrics["full_test_sample_count"] = float(n_samples)
+        metrics["accepted_subset_sample_count"] = float(accepted.sum())
+        # Independent oracle metering is authoritative for model operations;
+        # attack-provided per-record counts are separately validated where
+        # exact attribution is available (Square/A2PM/TDTCE).
+        metrics.update(surrogate_counts.metrics('surrogate_generation'))
+        metrics.update(target_clean_counts.metrics('target_clean'))
+        metrics.update(target_adv_counts.metrics('target_adversarial_scored'))
+        metrics.update(target_detector_clean_counts.metrics('target_detector_clean'))
+        metrics.update(target_detector_adv_counts.metrics('target_detector_adversarial_scored'))
+        metrics['query_accounting_contract_version'] = 2.0
+        # The authoritative scalar query denominator is ALL generated records.
+        # A batch of B forward-evaluated records costs B example queries, while
+        # one call remains one invocation. Gradient-bearing forwards are never
+        # silently added to black-box score queries.
+        metrics['all_attempts_total_queries'] = float(surrogate_counts.inference_records)
+        metrics['all_attempts_mean_queries'] = float(
+            surrogate_counts.inference_records / n_samples if n_samples else float('nan')
+        )
+        metrics['query_telemetry_available'] = float(queries_available is True)
+        metrics['per_sample_inference_query_attribution_available'] = float(queries_available is True)
+        if queries_available:
+            all_queries = np.asarray(attack_result.queries, dtype=np.int64)
+            metrics['all_attempts_plugin_reported_inference_records'] = float(all_queries.sum(dtype=np.int64))
+        else:
+            metrics['all_attempts_plugin_reported_inference_records'] = float('nan')
+        # The lower-level evaluator's legacy fields describe *plugin* arrays,
+        # not independently metered model operations; keep their population
+        # explicit instead of presenting them as authoritative generic queries.
+        for old, new in (
+            ('mean_queries', 'scored_subset_plugin_reported_mean_inference_queries'),
+            ('mean_queries_to_evasion', 'scored_subset_plugin_reported_mean_inference_queries_to_evasion'),
+        ):
+            if old in metrics:
+                metrics[new] = metrics.pop(old)
+        metrics["final_hard_budget_checked"] = float(final_attack_budget is not None)
+        if final_attack_budget is not None:
+            metrics["final_hard_budget_epsilon"] = float(final_attack_budget.epsilon)
+            metrics["final_hard_budget_failure_count"] = float(
+                violation_counts.get(
+                    f"attack_budget_{final_attack_budget.norm}_{final_attack_budget.domain}", 0
+                )
+            )
         metrics["strict_constraints"] = float(self.strict_constraints)
+        metrics["strict_feasible_benchmark"] = float(self.strict_constraints)
         metrics["strict_multiclass"] = float(self.strict_multiclass)
         metrics["attack_to_attack_failure_count"] = float(np.sum(attack_to_attack))
         metrics["attack_to_attack_failure_rate"] = float(
@@ -935,25 +1149,56 @@ class EvaluationEngine:
             for rule, count in sorted(violation_counts.items())
         }
         metrics.update(violation_metrics)
+        eligible_count = int(np.count_nonzero(eligible_full))
+        feasible_eligible_count = int(np.count_nonzero(eligible_full & accepted))
+        feasible_success_count = int(np.count_nonzero(successful_full))
+        # The primary ASR includes all initially-correct non-target attempts,
+        # not only the easy subset accepted by the constraint oracle.
+        if not self.strict_constraints:
+            metrics['asr_unconstrained_diagnostic'] = float(metrics.get('asr', 0.0))
+        metrics['asr'] = float(feasible_success_count / eligible_count) if eligible_count else float('nan')
+        metrics['asr_conditional_on_feasibility'] = (
+            float(feasible_success_count / feasible_eligible_count)
+            if feasible_eligible_count else float('nan')
+        )
+        metrics['attack_eligible_sample_count'] = float(eligible_count)
+        metrics['feasible_eligible_sample_count'] = float(feasible_eligible_count)
+        metrics['realizability_rate_eligible'] = (
+            float(feasible_eligible_count / eligible_count) if eligible_count else float('nan')
+        )
+        for label in metric_labels:
+            name = (self.class_names[label] if self.class_names is not None
+                    and 0 <= label < len(self.class_names) else f'class_{label}')
+            class_eligible = eligible_full & (y_np == label)
+            denominator = int(np.count_nonzero(class_eligible))
+            metrics[f'asr_eligible_count_class_{label}'] = float(denominator)
+            metrics[f'asr_feasible_eligible_count_class_{label}'] = float(np.count_nonzero(class_eligible & accepted))
+            metrics[f'asr_success_count_class_{label}'] = float(np.count_nonzero(successful_full & (y_np == label)))
+            metrics[f'asr_{name}'] = (
+                float(np.count_nonzero(successful_full & (y_np == label)) / denominator)
+                if denominator else float('nan')
+            )
         metrics["gatekeeper_violation_total"] = float(sum(violation_metrics.values()))
-        metrics["successful_sample_count"] = float(np.sum(successful))
+        metrics["successful_sample_count"] = float(np.count_nonzero(successful_full))
         if self.detector is not None:
             assert detector_clean_scores is not None and detector_adversarial_scores is not None
             metrics["detector_enabled"] = 1.0
+            # Matched pairs are the only defensible detector comparison.
             metrics["detection_auroc"] = detection_auroc(
-                detector_clean_scores, detector_adversarial_scores
-            )
+                detector_clean_scores[accepted], detector_adversarial_scores[accepted]
+            ) if np.any(accepted) else float('nan')
+            metrics['detection_auroc_realizable'] = metrics['detection_auroc']
             metrics["detector_clean_score_mean"] = float(np.mean(detector_clean_scores))
-            metrics["detector_adversarial_score_mean"] = float(np.mean(detector_adversarial_scores))
-            metrics["detection_auroc_realizable"] = detection_auroc(
-                detector_clean_scores, detector_adversarial_scores[accepted]
+            metrics["detector_adversarial_score_mean"] = (
+                float(np.mean(detector_adversarial_scores[accepted])) if np.any(accepted) else float('nan')
             )
+            metrics['detector_scored_adversarial_count'] = float(np.count_nonzero(score_mask))
             metrics["detector_adversarial_score_mean_realizable"] = (
                 float(np.mean(detector_adversarial_scores[accepted])) if np.any(accepted) else float("nan")
             )
         else:
             metrics["detector_enabled"] = 0.0
-        if self.attack_model is not self.target_model:
+        if self.attack_model is not None and self.attack_model is not self.target_model:
             metrics["transfer_attack"] = 1.0
         if self.logger:
             self.logger.info(
@@ -975,5 +1220,5 @@ class EvaluationEngine:
             attack_result=attack_result,
             detector_clean_scores=detector_clean_scores,
             detector_adversarial_scores=detector_adversarial_scores,
+            defended_predictions=defended_predictions,
         )
-

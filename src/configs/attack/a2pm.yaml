@@ -1,9 +1,12 @@
-# Example Hydra attack configuration. Adjust packet-local indices to the
-# actual ordered dataset.feature_names (never to flattened T*F positions).
-# Illustrative six-feature schema: index 0 is immutable DIR, index 5 is a
-# protected categorical context/lock. Do not use these indices blindly.
+# Active CICIoMT2024 order: 0=PL, 1=IAT, 2=DIR, 3=WIN, 4=FLG, 5=TTL.
+# PL/WIN/TTL are integral physical states sampled from observed training
+# combinations (categorical pattern adaptation, not wire categorical types).
+# DIR/FLG are immutable; IAT is continuous float64 physical time. Indices
+# are packet-local and MUST be reviewed when dataset.feature_names changes.
+# .6/.4 pattern probabilities follow an author-repository *example*, not an
+# original-paper optimal setting for CICIoMT2024.
 name: a2pm
-variant: "a2pm_int{.params.interval_probability}_comb{.params.combination_probability}_iter{.params.max_iterations}"
+variant: "a2pm_v4_int${.params.interval_probability}_comb${.params.combination_probability}_r${.params.interval_ratio}_max${.params.max_ratio}_pat${.params.patience}_iter${.params.max_iterations}"
 
 params:
   continuous_idx: [1]
@@ -12,7 +15,12 @@ params:
   interval_probability: 0.6
   combination_probability: 0.4
   max_iterations: 20
+  # Source: A2PM official IntervalPattern configuration example; not CICIoMT-optimal.
+  interval_ratio: 0.1
+  max_ratio: 0.3
+  # Source: A2PMethod fit_generate documentation example; no test-time partial_fit.
+  patience: 2
   target_label: 0
 
 discrete_projection: false
-checkpoint: null
+checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"

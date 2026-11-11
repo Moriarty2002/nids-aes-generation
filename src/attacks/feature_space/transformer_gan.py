@@ -1,25 +1,17 @@
-"""Transformer-GAN feature-space attack scaffold for offline NIDS benchmarking.
+"""Transformer-GAN NIDS Model2 (Laudanna et al., IJIS 2025, Table 6/§4.6).
 
-The generator and discriminator follow the sequence-level Transformer concept in
-Laudanna et al., *Transformer or Autoencoder? Who is the ultimate adversary for
-attack detectors?*  Their layer widths and disputed objective are NOT copied.
-
-Representation contract
------------------------
-* Model input and generated candidate: normalized torch.float32.
-* Constraint authority: an independent copy of the original physical float64 
-  sample, obtained from EvaluationEngine before any normalization.
-* FeatureSpaceAttack's inherited finalizer must reconcile the two representations
-  (physical bounds, lattice projection, immutable restoration and re-encoding).
-
-The attack is NOT COMPLETE:
-to recreate the original attack we still need the:
-- balancing weight (alpha) for the  generator loss function: Loss_G = Loss_BCE + lambda*Loss_MSE.
-- target tensor of the MSE loss function
-- interger size, distributions and mechanism of the noise concatenated to the input of the generator
-
-* **Transformer-GAN**
-  * **Paper:** *Transformer or Autoencoder? Who is the ultimate adversary for attack detectors?* - Laudanna et al.,International Journal of Information Security 2025
+Original: alternating Transformer generator/discriminator on NIDS records;
+2-head attention, 32-unit feed-forward block, and MSE described for G.
+Mandatory adaptation: masked 20-packet train-only generator and independent
+surrogate; no study's held-out test/black-box target DR for model selection.
+Remaining uncertainty: paper's G-MSE target and classifier-alignment detail
+cannot be certified; this plugin retains BCE fool-D + masked MSE, hence a
+functioning custom placeholder, NOT the paper-original Model2 method.
+Table 6 Model2 pools token states globally before a Dense(input)->Dense(32)->
+Dense(2) generator head; this adapter instead projects every packet token to F
+features to preserve first-20 topology, protected packets and physical finalization.
+Research role: custom_placeholder; excluded from primary original-method comparisons.
+Topology: flat (B,T*F) or masked (B,T,F), packet order unchanged.
 """
 
 from __future__ import annotations
@@ -37,6 +29,7 @@ from torch import nn
 
 from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import DATASETS, register_attack
+from core.provenance import trained_generator_provenance, verify_generator_artifact_provenance
 from orchestrator.device import configure_process_device
 
 
@@ -76,6 +69,7 @@ class _TransformerGenerator(nn.Module):
         num_heads: int,
         num_layers: int,
         noise_dim: int,
+        feedforward_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.num_features = num_features
@@ -84,7 +78,7 @@ class _TransformerGenerator(nn.Module):
         layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
             nhead=num_heads,
-            dim_feedforward=4 * model_dim,
+            dim_feedforward=feedforward_dim or 4 * model_dim,
             dropout=0.0,
             activation="gelu",
             batch_first=True,
@@ -125,7 +119,8 @@ class _TransformerDiscriminator(nn.Module):
     """
 
     def __init__(
-        self, num_features: int, model_dim: int, num_heads: int, num_layers: int
+        self, num_features: int, model_dim: int, num_heads: int, num_layers: int,
+        feedforward_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.num_features = num_features
@@ -133,7 +128,7 @@ class _TransformerDiscriminator(nn.Module):
         layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
             nhead=num_heads,
-            dim_feedforward=4 * model_dim,
+            dim_feedforward=feedforward_dim or 4 * model_dim,
             dropout=0.0,
             activation="gelu",
             batch_first=True,
@@ -258,6 +253,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
         num_heads: int = 4,
         num_layers: int = 2,
         noise_dim: int = 32,
+        feedforward_dim: int | None = None,
         loss_config: Mapping[str, Any] | None = None,
         categorical_schema: Mapping[str, Any] | None = None,
         feature_names: Sequence[str] = (),
@@ -270,6 +266,8 @@ class TransformerGANAttack(FeatureSpaceAttack):
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        if feedforward_dim is not None and int(feedforward_dim) < 1:
+            raise ValueError("feedforward_dim must be positive")
         if min(model_dim, num_heads, num_layers, noise_dim) <= 0:
             raise ValueError("Transformer dimensions, layer count and noise_dim must be > 0")
         if model_dim % num_heads:
@@ -316,6 +314,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
         self.num_heads = int(num_heads)
         self.num_layers = int(num_layers)
         self.noise_dim = int(noise_dim)
+        self.feedforward_dim = 4 * self.model_dim if feedforward_dim is None else int(feedforward_dim)
         self.loss_config = _plain_config(loss_config or {})
         self.categorical_schema = _plain_config(categorical_schema or {})
         self.feature_names = names
@@ -376,16 +375,15 @@ class TransformerGANAttack(FeatureSpaceAttack):
         path = self._checkpoint_path(checkpoint_seed)
         if not path.is_file():
             raise FileNotFoundError(
-                f"Transformer-GAN checkpoint missing: {path}; training losses are "
-                "currently unspecified, so no valid checkpoint can be produced yet"
+                f"Transformer-GAN checkpoint missing: {path}; run train_attack using the same attack.checkpoint template"
             )
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(payload, dict) or payload.get("attack_name") != self.attack_name:
             raise ValueError("Checkpoint is not a Transformer-GAN artifact")
+        verify_generator_artifact_provenance(payload, getattr(self, 'expected_provenance', None))
         if payload.get("format_version") != 1 or payload.get("training_complete") is not True:
             raise RuntimeError(
-                "Transformer-GAN checkpoint is incomplete or incompatible; "
-                "the missing loss formulation must be integrated before evaluation"
+                "Transformer-GAN checkpoint is incomplete or incompatible; retrain with the configured loss"
             )
         trained_width = int(payload["num_features"])
         if num_features is not None and trained_width != num_features:
@@ -398,16 +396,17 @@ class TransformerGANAttack(FeatureSpaceAttack):
         if not self.feature_names:
             self.feature_names = names
         num_features = trained_width
-        expected = (self.model_dim, self.num_heads, self.num_layers, self.noise_dim)
+        expected = (self.model_dim, self.num_heads, self.num_layers,
+                    self.noise_dim, self.feedforward_dim)
         actual = tuple(int(payload[k]) for k in (
             "model_dim", "num_heads", "num_layers", "noise_dim"
-        ))
+        )) + (int(payload.get("feedforward_dim", 4 * int(payload["model_dim"]))),)
         if expected != actual:
             raise ValueError("Transformer hyperparameters disagree with checkpoint")
 
         generator = _TransformerGenerator(
             num_features, self.model_dim, self.num_heads,
-            self.num_layers, self.noise_dim,
+            self.num_layers, self.noise_dim, self.feedforward_dim,
         )
         generator.load_state_dict(payload["generator_state"], strict=True)
         self._generator = generator.to(device).eval()
@@ -572,15 +571,33 @@ class TransformerGANAttack(FeatureSpaceAttack):
 
         constructor = DATASETS.get(str(dataset_cfg["name"]))
         params = dict(dataset_cfg.get("params", {}))
+        source_role = ('surrogate_model' if isinstance(config.get('surrogate_model'), Mapping)
+                       and config['surrogate_model'].get('enabled', True) else 'model')
+        classifier = config.get(source_role, {})
+        if not isinstance(classifier, Mapping) or not classifier.get('checkpoint'):
+            raise ValueError(f"{source_role}.checkpoint is required for generator training")
+        import json as _json
+        source_path = Path(str(classifier['checkpoint']).format(seed=seed))
+        sidecar_path = source_path.parent / 'training_provenance.json'
+        if not sidecar_path.is_file():
+            raise ValueError(f"Missing authorised classifier training sidecar: {sidecar_path}")
+        sidecar = _json.loads(sidecar_path.read_text(encoding='utf-8'))
+        source_shape = tuple(int(v) for v in sidecar.get('input_shape', ()))
+        if len(source_shape) not in (1, 2):
+            raise ValueError('Training source has no valid input_shape metadata; retrain classifier')
         try:
             if "flatten" in inspect.signature(constructor).parameters:
-                params["flatten"] = False  # A GAN trains on tokens, not a flat vector.
+                params["flatten"] = len(source_shape) == 1
         except (TypeError, ValueError):
             pass
         dataset = constructor(**params)
         if not callable(getattr(dataset, "raw_arrays", None)):
             raise TypeError("Registered dataset must provide raw_arrays()")
         raw, labels = dataset.raw_arrays()
+        from core.provenance import authorized_attack_training_indices
+        training_indices = authorized_attack_training_indices(
+            dataset, np.asarray(labels), config, seed, role=source_role,
+        )
         raw = np.asarray(raw)
         labels = np.asarray(labels)
         if raw.dtype != np.float64:
@@ -607,7 +624,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
             raise ValueError("Dataset valid_mask must be boolean [batch, time]")
         if not valid.any():
             raise ValueError("All training tokens are padding")
-        mean, std = _physical_normalization(sequences, valid)
+        mean, std = _physical_normalization(sequences[training_indices], valid[training_indices])
         # Dataset-fitted statistics are the default. A known target normalizer
         # can instead be supplied explicitly to prevent train/eval drift.
         override_mean = attack_cfg.get("normalization_mean")
@@ -626,6 +643,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
             num_heads=int(attack_cfg.get("num_heads", 4)),
             num_layers=int(attack_cfg.get("num_layers", 2)),
             noise_dim=int(attack_cfg.get("noise_dim", 32)),
+            feedforward_dim=attack_cfg.get("feedforward_dim"),
             loss_config=dict(attack_cfg.get("loss_config") or {}),
             categorical_schema=dict(attack_cfg.get("categorical_schema") or {}),
             feature_names=names,
@@ -639,10 +657,11 @@ class TransformerGANAttack(FeatureSpaceAttack):
         )
         generator = _TransformerGenerator(
             len(names), settings.model_dim, settings.num_heads,
-            settings.num_layers, settings.noise_dim,
+            settings.num_layers, settings.noise_dim, settings.feedforward_dim,
         ).to(device)
         discriminator = _TransformerDiscriminator(
-            len(names), settings.model_dim, settings.num_heads, settings.num_layers
+            len(names), settings.model_dim, settings.num_heads, settings.num_layers,
+            settings.feedforward_dim,
         ).to(device)
         learning_rate = float(attack_cfg.get("learning_rate", 1e-4))
         batch_size = int(attack_cfg.get("batch_size", 64))
@@ -651,14 +670,15 @@ class TransformerGANAttack(FeatureSpaceAttack):
         if learning_rate <= 0 or batch_size < 1 or epochs < 1:
             raise ValueError("learning_rate, batch_size and epochs must be positive")
         
-        optim_g = torch.optim.Adam(generator.parameters(), lr=learning_rate)
-        optim_d = torch.optim.Adam(discriminator.parameters(), lr=learning_rate)
+        # Laudanna et al. section 4.6 reports Adam (0.5, 0.999) for NIDS Model2.
+        optim_g = torch.optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+        optim_d = torch.optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
         permutation_rng = np.random.default_rng(int(seed))
         
-        # Bypass template evaluation to prevent generating a second Hydra UUID
-        directory = Path(str(config.get("output_dir", "runs"))).expanduser() / "checkpoints"
-        directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / f"transformer_gan_seed{int(seed)}.pt"
+        if not attack_cfg.get('checkpoint'):
+            raise ValueError('Transformer-GAN requires an explicit stable attack.checkpoint template')
+        destination = settings._checkpoint_path(seed)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         
         completed = False
 
@@ -669,7 +689,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
             )
         try:
             for epoch in range(epochs):
-                indices = permutation_rng.permutation(len(sequences))
+                indices = permutation_rng.permutation(training_indices)
                 for start in range(0, len(indices), batch_size):
                     rows = indices[start : start + batch_size]
                     clean_np = (sequences[rows] - mean) / std
@@ -808,7 +828,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
                 "format_version": 1,
                 "attack_name": cls.attack_name,
                 "training_complete": completed,
-                "training_status": "complete" if completed else "loss_pending",
+                "training_status": "complete" if completed else "training_interrupted",
                 "seed": int(seed),
                 "num_features": len(names),
                 "input_shape": tuple(raw.shape[1:]),
@@ -818,6 +838,7 @@ class TransformerGANAttack(FeatureSpaceAttack):
                 "num_heads": settings.num_heads,
                 "num_layers": settings.num_layers,
                 "noise_dim": settings.noise_dim,
+                "feedforward_dim": settings.feedforward_dim,
                 "normalization_mean": torch.from_numpy(mean.copy()),
                 "normalization_std": torch.from_numpy(std.copy()),
                 "generator_state": {
@@ -831,6 +852,10 @@ class TransformerGANAttack(FeatureSpaceAttack):
                 "loss_config_json": json.dumps(settings.loss_config, sort_keys=True),
                 "categorical_schema_json": json.dumps(
                     settings.categorical_schema, sort_keys=True
+                ),
+                "artifact_provenance": trained_generator_provenance(
+                    dataset, labels, config, seed, source_role=source_role,
+                    input_shape=tuple(raw.shape[1:]), feature_names=names,
                 ),
             }
             _save_checkpoint(destination, payload)

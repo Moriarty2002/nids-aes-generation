@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix
+from evaluator.metrics import classification_support
 
 
 class FlushFileHandler(logging.FileHandler):
@@ -30,7 +31,8 @@ class FlushFileHandler(logging.FileHandler):
             self.handleError(record)
 
 
-def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO) -> logging.Logger:
+def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO, *,
+                 console: bool = True) -> logging.Logger:
     """Configures an isolated logger writing to a dedicated, crash-resilient file."""
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,9 +54,10 @@ def setup_logger(name: str, log_file: Path | str, level: int = logging.INFO) -> 
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    if console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
     logger.info("logger.ready file=%s level=%s", log_path, logging.getLevelName(level))
 
     return logger
@@ -155,6 +158,17 @@ class ExperimentReporter:
             f.write("=" * 60 + "\n\n")
             f.write("Classification Report:\n")
             f.write(clf_report + "\n\n")
+            # This human-facing text corresponds to the reporter's scored-only
+            # subset, not to the main full-test or accepted-paired populations.
+            support = classification_support(
+                np.asarray(y_true, dtype=np.int64), np.asarray(y_pred, dtype=np.int64),
+                labels=(range(len(self.class_names)) if self.class_names else None),
+            )
+            f.write("Scored-only class support (not full-test):\n")
+            for class_id, count in support['ground_truth_support'].items():
+                f.write(f"  class {class_id}: ground_truth={count}, predicted={support['predicted_counts'][class_id]}\n")
+            f.write(f"  absent ground-truth classes: {support['missing_ground_truth_classes']}\n")
+            f.write(f"  predicted-only classes: {support['predicted_only_classes']}\n\n")
             f.write("Evaluation Metrics:\n")
             f.write("-" * 30 + "\n")
             for k, v in sorted(metrics.items()):

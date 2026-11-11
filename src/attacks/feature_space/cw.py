@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Carlini-Wagner L2 feature-space attack for network intrusion detection.
 
 Adapted conceptually from the objective in Carlini & Wagner, "Towards Evaluating
@@ -7,9 +5,12 @@ the Robustness of Neural Networks" (IEEE S&P 2017). Original authors' code:
 https://github.com/carlini/nn_robust_attacks. This is an independent PyTorch
 reimplementation, not copied repository code: it uses direct Adam optimization
 of a masked perturbation delta with box clipping for standardized tabular data
-instead of the tanh change-of-variables commonly used for image inputs.
+when bounds are unreported. Explicit finite per-feature bounds use the original
+tanh change-of-variables; frozen packet coordinates are fixed by the mask.
 Protocol/RFC constraints remain exclusively in the post-generation gatekeeper.
 """
+from __future__ import annotations
+
 
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -26,6 +27,64 @@ from ._linf_utils import immutable_feature_mask, resolve_target, validate_target
 from ._optimization_utils import class_scores, input_predictions, project_box_delta, resolve_bounds, restore_module_modes, restore_saved_modes
 
 
+def _inverse_tanh_box(x: Tensor, lower: Tensor, upper: Tensor) -> Tensor:
+    """Initialize the original C&W box variable from finite feature intervals.
+
+    The small interior offset avoids infinite atanh at an exact wire boundary.
+    Immutable positions still use the pristine value, not this relaxation.
+    """
+    width = (upper - lower).clamp_min(1e-12)
+    coordinate = ((x - lower) / width * 2 - 1).clamp(-0.999999, 0.999999)
+    return torch.atanh(coordinate)
+
+
+def _tanh_box_candidate(variable: Tensor, lower: Tensor, upper: Tensor) -> Tensor:
+    """Differentiable bounded C&W candidate before independent packet finalization."""
+    return lower + (torch.tanh(variable) + 1) * 0.5 * (upper - lower)
+
+
+def _normalized_wire_bounds(x0: Tensor, names: Sequence[str],
+                            physical_ranges: dict[str, tuple[float, float]],
+                            mean: Any, std: Any, editable: Tensor) -> tuple[Tensor, Tensor] | None:
+    """Map declared physical wire limits into the *surrogate's* normalized box.
+
+    This is a forward transformation of public schema limits, never an inverse
+    reconstruction of original float64 packets. Noneditable coordinates get
+    dummy finite bounds because the optimizer masks them to their exact input.
+    """
+    if not names or mean is None or std is None or not physical_ranges:
+        return None
+    width = len(names)
+    if x0.shape[-1] % width:
+        raise ValueError('C&W packet width disagrees with feature_names')
+    feature_positions = [names[i % width].upper() for i in range(x0.shape[-1])]
+    mu = torch.as_tensor(mean, device=x0.device, dtype=x0.dtype).flatten()
+    sigma = torch.as_tensor(std, device=x0.device, dtype=x0.dtype).flatten()
+    if mu.numel() == width:
+        mu = mu.repeat(x0.shape[-1] // width)
+        sigma = sigma.repeat(x0.shape[-1] // width)
+    if mu.numel() != x0.shape[-1] or torch.any(sigma <= 0) or not torch.isfinite(sigma).all():
+        raise ValueError('C&W cannot map wire bounds under this normalization')
+    shape = (1,) * (x0.ndim - 1) + (x0.shape[-1],)
+    mu, sigma = mu.reshape(shape), sigma.reshape(shape)
+    low = x0.detach().clone() - 1.0
+    high = x0.detach().clone() + 1.0
+    for j, name in enumerate(feature_positions):
+        if not bool(editable[...,j].any()):
+            continue
+        if name not in physical_ranges:
+            return None
+        a, b = physical_ranges[name]
+        if not (np.isfinite(a) and np.isfinite(b) and b > a):
+            return None
+        low[...,j] = (float(a) - mu[...,j]) / sigma[...,j]
+        high[...,j] = (float(b) - mu[...,j]) / sigma[...,j]
+    if not (torch.isfinite(low).all() and torch.isfinite(high).all()
+            and bool(torch.all(high > low))):
+        return None
+    return low, high
+
+
 @dataclass
 @register_attack("cw")
 class CWL2Attack(FeatureSpaceAttack):
@@ -36,8 +95,9 @@ class CWL2Attack(FeatureSpaceAttack):
     sign attacks, both the squared norm and margin use per-sample sums; no
     ``reduction='mean'`` loss scales the effective objective with batch size.
 
-    Adam updates a delta parameter directly. Every update is projected through
-    the configured feature box and the mandatory victim-packet mask. Best-success
+    Adam optimizes a tanh box variable when finite declared bounds exist;
+    otherwise it optimizes a native perturbation delta directly. Every update
+    preserves the mandatory victim-packet mask. Best-success
     tracking returns the lowest-L2 successful example found per flow, even when
     later optimizer steps move away from the target class.
     """
@@ -148,6 +208,26 @@ class CWL2Attack(FeatureSpaceAttack):
         ).to(device=x0.device, dtype=x0.dtype)
         mask = mask * immutable_feature_mask(x0, self.feature_names, self.immutable_features)
         lower, upper = resolve_bounds(x0, self.feature_names, self.clip_min, self.clip_max)
+        bounds_source = 'explicit_normalized' if self.clip_min is not None and self.clip_max is not None else 'unbounded_native_relaxation'
+        if self.clip_min is None and self.clip_max is None:
+            derived = _normalized_wire_bounds(x0, self.feature_names, self.clip_ranges,
+                                              kwargs.get('normalization_mean'),
+                                              kwargs.get('normalization_std'), mask.bool())
+            if derived is not None:
+                lower, upper = derived
+                bounds_source = 'declared_physical_wire_ranges_forward_normalized'
+
+        # The original box reparameterization is valid only when an explicit,
+        # finite normalized feature interval exists. Current native recipes
+        # leave bounds unspecified; those keep the direct continuous relaxation
+        # and are NOT represented as exact image-domain C&W optimization.
+        lower_tensor = torch.broadcast_to(torch.as_tensor(lower, dtype=x0.dtype, device=x0.device), x0.shape)
+        upper_tensor = torch.broadcast_to(torch.as_tensor(upper, dtype=x0.dtype, device=x0.device), x0.shape)
+        tanh_domain = bool(torch.isfinite(lower_tensor).all() and
+                           torch.isfinite(upper_tensor).all() and
+                           torch.all(upper_tensor > lower_tensor))
+        if tanh_domain:
+            initial_variable = _inverse_tanh_box(x0, lower_tensor, upper_tensor)
 
         batch_size = int(x0.shape[0])
         constants = torch.full((batch_size,), float(self.initial_const), dtype=x0.dtype, device=x0.device)
@@ -164,16 +244,21 @@ class CWL2Attack(FeatureSpaceAttack):
             # Some callers wrap the engine in no_grad; C&W still needs input gradients.
             with torch.enable_grad():
                 for search_step in range(self.binary_search_steps):
-                    delta = nn.Parameter(torch.zeros_like(x0))
-                    optimizer = torch.optim.Adam([delta], lr=float(self.learning_rate))
+                    variable = nn.Parameter(initial_variable.clone() if tanh_domain
+                                            else torch.zeros_like(x0))
+                    optimizer = torch.optim.Adam([variable], lr=float(self.learning_rate))
                     round_success = torch.zeros(batch_size, dtype=torch.bool, device=x0.device)
                     previous_loss = float("inf")
 
                     for step in range(self.max_steps):
                         optimizer.zero_grad(set_to_none=True)
-                        applied_delta = project_box_delta(x0, delta, mask, lower, upper)
+                        if tanh_domain:
+                            bounded = _tanh_box_candidate(variable, lower_tensor, upper_tensor)
+                            applied_delta = (bounded - x0) * mask
+                        else:
+                            applied_delta = project_box_delta(x0, variable, mask, lower, upper)
                         adversarial = x0 + applied_delta
-                        logits = model_module(adversarial)
+                        logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
                         scores = class_scores(logits)
                         if search_step == 0 and step == 0:
                             if targeted:
@@ -211,17 +296,17 @@ class CWL2Attack(FeatureSpaceAttack):
 
                         gradient = torch.autograd.grad(
                             objective,
-                            delta,
+                            variable,
                             only_inputs=True,
                             retain_graph=False,
                             create_graph=False,
                         )[0]
-                        delta.grad = gradient
+                        variable.grad = gradient
                         optimizer.step()
-                        # Project the parameter itself after every update. This prevents
-                        # optimizer momentum from accumulating edits to frozen features.
-                        with torch.no_grad():
-                            delta.copy_(project_box_delta(x0, delta, mask, lower, upper))
+                        if not tanh_domain:
+                            # Only the unbounded native relaxation needs clipping.
+                            with torch.no_grad():
+                                variable.copy_(project_box_delta(x0, variable, mask, lower, upper))
 
                         if self.abort_early and (step + 1) % self.abort_check_every == 0:
                             current_loss = float(objective.detach().cpu())
@@ -243,9 +328,12 @@ class CWL2Attack(FeatureSpaceAttack):
                     # Evaluate the post-optimizer state too, so the final Adam update
                     # in each binary-search round is not silently skipped.
                     with torch.no_grad():
-                        final_delta = project_box_delta(x0, delta, mask, lower, upper)
+                        if tanh_domain:
+                            final_delta = (_tanh_box_candidate(variable, lower_tensor, upper_tensor) - x0) * mask
+                        else:
+                            final_delta = project_box_delta(x0, variable, mask, lower, upper)
                         final_adversarial = x0 + final_delta
-                        final_logits = model_module(final_adversarial)
+                        final_logits = model.forward_differentiable(final_adversarial, valid_mask=kwargs.get("valid_mask"))
                         final_predictions = input_predictions(final_logits)
                         final_success = (
                             final_predictions.eq(int(target_label)) & labels.ne(int(target_label))
@@ -279,7 +367,7 @@ class CWL2Attack(FeatureSpaceAttack):
                 adversarial = fallback_adversarial.detach().clone()
                 adversarial[best_success] = best_adversarial[best_success]
                 with torch.no_grad():
-                    final_logits = model_module(adversarial)
+                    final_logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
                     final_predictions = input_predictions(final_logits)
                     success = (
                         final_predictions.eq(int(target_label)) & labels.ne(int(target_label))
@@ -302,6 +390,7 @@ class CWL2Attack(FeatureSpaceAttack):
             feature_names=self.feature_names or None,
             metadata={
                 "attack": self.attack_name,
+                "box_bounds_source": bounds_source,
                 "targeted": bool(targeted),
                 "target_label": target_label,
                 "confidence": float(self.confidence),
@@ -313,5 +402,6 @@ class CWL2Attack(FeatureSpaceAttack):
                 "mean_l2_perturbation": float(final_l2.mean().detach().cpu()),
                 "total_optimizer_steps": int(total_iterations),
                 "margin_reduction": "sum",
+                "optimization_variable": "tanh_box" if tanh_domain else "direct_unbounded_NIDS_relaxation",
             },
         )

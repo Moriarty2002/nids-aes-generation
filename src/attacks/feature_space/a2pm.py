@@ -1,21 +1,12 @@
-"""Class-conditional A2PM for normalized feature-space NIDS benchmarking.
+"""A2PM (Vitorino et al., Future Internet 2022; official A2PM library).
 
-The fitted pattern states are *physical float64* training observations; only
-normalized float32 candidates are perturbed and sent to the target model.
-Physical finalization, immutable restoration, and any optional lattice
-projection belong exclusively to FeatureSpaceAttack's generate wrapper.
-
-This is a fixed-state, query-based adaptation of A2PM's interval/combination
-patterns, not a drop-in reimplementation of the upstream A2PMethod API (which
-also supports online partial_fit, momentum and configurable pattern sequences)
-because otherwise the attack would be non-deterministic and not reproducible, depending 
-from the order of appearence of the samples in the batch. 
-The original A2PMethod is designed for online learning, while this implementation 
-is designed for offline training and evaluation.
-
-* **A2PM**
-  * **Paper:** *Adaptative Perturbation Patterns: Realistic Adversarial Learning for Robust Intrusion Detection* - Vitorino et al., Future Internet 2022
-  * **Repository:** [https://github.com/vitorinojoao/a2pm](https://github.com/vitorinojoao/a2pm)
+Original: fitted per-class IntervalPattern then CombinationPattern, bounded
+interval ratios and configurable stopping patience (author library examples).
+NIDS: fit only authorized train physical float64, then propose normalized
+float32 from frozen patterns with DIR/FLG, victim and padding protection.
+Remaining: packet-level fixed-state combination adaptation, no test partial_fit;
+.6/.4 pattern probabilities and .1/.3 ratios are author examples, not optima.
+Topology: flat (B,T*F) and masked sequence (B,T,F) with registered F order.
 """
 
 from __future__ import annotations
@@ -31,10 +22,37 @@ import numpy as np
 import torch
 
 from attacks.base import AttackResult, FeatureSpaceAttack
+from core.provenance import (authorized_attack_training_indices, trained_generator_provenance,
+                             verify_generator_artifact_provenance)
 from core.registry import DATASETS, register_attack
+from core.exceptions import ConfigurationError
 
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 4
+
+
+def _interval_step(before: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor,
+                   rng: np.random.Generator, *, ratio: float,
+                   max_ratio: float | None) -> torch.Tensor:
+    """Propose from a full class-trained interval, then bound the candidate.
+
+    Ratio samples multiply the *whole interval*, never the remaining distance
+    to one boundary. Integer/lattice repair remains the physical finalizer's job.
+    """
+    if max_ratio is None:
+        step_fraction = np.full(tuple(before.shape), ratio, dtype=np.float32)
+    else:
+        step_fraction = rng.uniform(ratio, max_ratio, size=tuple(before.shape)).astype(np.float32)
+    fraction = torch.as_tensor(step_fraction, device=before.device)
+    baseline = torch.maximum(torch.minimum(before, upper), lower)
+    # At either learned bound the proposal must point inward; choose direction
+    # randomly only in the interior (the finalizer enforces physical fields).
+    upward = torch.as_tensor(rng.random(tuple(before.shape)) < .5, device=before.device)
+    upward = torch.where(baseline <= lower, torch.ones_like(upward), upward)
+    upward = torch.where(baseline >= upper, torch.zeros_like(upward), upward)
+    magnitude = fraction * (upper - lower)
+    return torch.maximum(torch.minimum(torch.where(upward, baseline + magnitude,
+                                                   baseline - magnitude), upper), lower)
 
 
 def _checkpoint_path(template: str | Path, seed: int) -> Path:
@@ -49,21 +67,6 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
-def _training_indices(labels: np.ndarray, seed: int) -> np.ndarray:
-    """Match AMD-GAN's reproducible 80/20 class-stratified fitting subset.
-
-    The dataset registry exposes raw arrays rather than a uniform split API.
-    Using the same split policy as AMD-GAN avoids learning from every held-out
-    example merely because this attack trains a statistical state, not a network.
-    """
-    rng = np.random.default_rng(seed)
-    chosen: list[np.ndarray] = []
-    for label in np.unique(labels):
-        positions = np.flatnonzero(labels == label)
-        rng.shuffle(positions)
-        count = min(len(positions), max(1, math.ceil(0.8 * len(positions))))
-        chosen.append(positions[:count])
-    return np.sort(np.concatenate(chosen)).astype(np.int64)
 
 
 def _read_classifier_schema(
@@ -126,6 +129,9 @@ class A2PMAttack(FeatureSpaceAttack):
         interval_probability: float = 0.6,
         combination_probability: float = 0.4,
         max_iterations: int = 20,
+        interval_ratio: float = 0.1,
+        max_ratio: float | None = 0.3,
+        patience: int = 2,
         target_label: int = 0,
         seed: int = 42,
         feature_names: Sequence[str] = (),
@@ -163,6 +169,9 @@ class A2PMAttack(FeatureSpaceAttack):
         self.interval_probability = float(interval_probability)
         self.combination_probability = float(combination_probability)
         self.max_iterations = int(max_iterations)
+        self.interval_ratio = float(interval_ratio)
+        self.max_ratio = None if max_ratio is None else float(max_ratio)
+        self.patience = int(patience)
 
         chosen = self.continuous_idx + self.categorical_idx
         if any(i < 0 for i in chosen) or len(chosen) != len(set(chosen)):
@@ -175,6 +184,12 @@ class A2PMAttack(FeatureSpaceAttack):
             raise ValueError("combination_probability must be between zero and one")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be positive")
+        if not 0 < self.interval_ratio <= 1:
+            raise ValueError("interval_ratio must be in (0, 1]")
+        if self.max_ratio is not None and not self.interval_ratio <= self.max_ratio <= 1:
+            raise ValueError("max_ratio must be in [interval_ratio, 1]")
+        if self.patience < 0:
+            raise ValueError("patience must be nonnegative (0 disables early stopping)")
         if len(set(self.feature_names)) != len(self.feature_names):
             raise ValueError("feature_names must be unique")
         self._loaded_path: Path | None = None
@@ -208,7 +223,16 @@ class A2PMAttack(FeatureSpaceAttack):
         if max(self.continuous_idx + self.categorical_idx) >= len(names):
             raise ValueError("Pattern index outside packet width")
         locks = self._locked_indices(names)
-        immutable = set(self.immutable_features) | ({"DIR"} if "DIR" in names else set())
+        # In the active six-column packet schema PL/WIN/TTL are integral
+        # observed-state substitutions, IAT is continuous, and DIR/FLG are
+        # immutable context. No upstream A2PM category-head choice grants edit
+        # permission to a wire-immutable field.
+        active = {"PL", "IAT", "DIR", "WIN", "FLG", "TTL"}
+        if not set(names).issubset(active | {"FEAT_PAD_MASK"}):
+            raise ValueError("Unknown packet feature schema; classify feature types before using A2PM")
+        if set(names) & active and any(names[i] != "IAT" for i in self.continuous_idx):
+            raise ValueError("A2PM continuous_idx must select physical IAT for the active schema")
+        immutable = set(self.immutable_features) | ({"DIR", "FLG", "FEAT_PAD_MASK"} & set(names))
         if immutable - set(names):
             raise ValueError(f"Unknown immutable names: {sorted(immutable - set(names))}")
         # Immutable or locked fields may appear in the *conditioning* records,
@@ -216,6 +240,10 @@ class A2PMAttack(FeatureSpaceAttack):
         forbidden = {names.index(name) for name in immutable}
         if forbidden.intersection(self.continuous_idx):
             raise ValueError("Immutable packet fields cannot be continuous attack features")
+        if forbidden.intersection(self.categorical_idx) - set(locks) - {
+            names.index(name) for name in self.immutable_features if name in names
+        }:
+            raise ValueError("Immutable DIR/FLG categorical context must be locked or declared immutable")
         return locks
 
     @classmethod
@@ -246,11 +274,16 @@ class A2PMAttack(FeatureSpaceAttack):
         accepted = {
             "continuous_idx", "categorical_idx", "locked_features",
             "interval_probability", "combination_probability", "max_iterations",
+            "interval_ratio", "max_ratio", "patience",
             "target_label", "feature_names", "immutable_features", "clip_ranges",
             "discrete_projection", "checkpoint",
         }
         options = {k: v for k, v in {**nested, **attack_cfg}.items() if k in accepted}
         settings = cls(config=config, seed=seed, **options)
+        # An A2PM state is trained only against the registered independent
+        # surrogate. The frozen evaluation target never supplies pattern labels.
+        if not isinstance(config.get('surrogate_model'), Mapping) or not config['surrogate_model'].get('enabled', True):
+            raise ConfigurationError('A2PM offline fitting requires an independently trained surrogate_model')
         shape, mean, std, checkpoint_names = _read_classifier_schema(config, seed)
 
         dataset_cfg = config.get("dataset")
@@ -302,7 +335,9 @@ class A2PMAttack(FeatureSpaceAttack):
         if valid.shape != packets.shape[:2]:
             raise ValueError("Training valid_mask disagrees with packet layout")
 
-        chosen = _training_indices(labels, seed)
+        source_role = ('surrogate_model' if isinstance(config.get('surrogate_model'), Mapping)
+                       and config['surrogate_model'].get('enabled', True) else 'model')
+        chosen = authorized_attack_training_indices(dataset, labels, config, seed, role=source_role)
         mutable_categories = tuple(i for i in settings.categorical_idx if i not in locks
                                    and settings.feature_names[i] not in settings.immutable_features
                                    and settings.feature_names[i] != "DIR")
@@ -329,9 +364,16 @@ class A2PMAttack(FeatureSpaceAttack):
 
         if not states:
             raise ValueError("A2PM training found no valid malicious class observations")
+        # The existing generator provenance contract pins exact training IDs,
+        # source checkpoint/state, physical transform, class mapping and recipe.
+        artifact_provenance = trained_generator_provenance(
+            dataset, labels, config, seed, source_role='surrogate_model',
+            input_shape=shape, feature_names=settings.feature_names,
+        )
         destination = settings._checkpoint_for_seed(seed)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "artifact_provenance": artifact_provenance,
             "attack_name": "a2pm",
             "format_version": _FORMAT_VERSION,
             "seed": int(seed),
@@ -343,6 +385,9 @@ class A2PMAttack(FeatureSpaceAttack):
             "locked_idx": locks,
             "mutable_categorical_idx": mutable_categories,
             "combination_columns": combination_columns,
+            "interval_ratio": settings.interval_ratio,
+            "max_ratio": settings.max_ratio,
+            "patience": settings.patience,
             "normalization_mean": torch.from_numpy(np.ascontiguousarray(mean)),
             "normalization_std": torch.from_numpy(np.ascontiguousarray(std)),
             "states": states,
@@ -364,11 +409,9 @@ class A2PMAttack(FeatureSpaceAttack):
         }
 
     def _checkpoint_for_seed(self, seed: int) -> Path:
-        template = self.checkpoint
-        if not template:
-            root = "runs" if self.config is None else str(self.config.get("output_dir", "runs"))
-            template = str(Path(root) / "checkpoints" / "a2pm_seed{seed}.pt")
-        return _checkpoint_path(template, seed)
+        if not self.checkpoint:
+            raise ConfigurationError('A2PM requires an explicit registered attack.checkpoint')
+        return _checkpoint_path(self.checkpoint, seed)
 
     def _load_patterns(self, seed: int) -> None:
         """Pin a trained worker seed on first use; batch RNG seeds may differ.
@@ -388,11 +431,21 @@ class A2PMAttack(FeatureSpaceAttack):
             raise ValueError("Unsupported A2PM checkpoint format")
         if int(state.get("seed", -1)) != seed:
             raise ValueError("A2PM checkpoint seed mismatch")
+        # This fails closed even if an otherwise plausible v4 payload is
+        # copied from another split, independently trained surrogate, or seed.
+        verify_generator_artifact_provenance(
+            state, getattr(self, 'expected_provenance', None),
+        )
         names = tuple(state["feature_names"])
         if self.feature_names and tuple(self.feature_names) != names:
             raise ValueError("A2PM checkpoint feature schema mismatch")
         self.feature_names = names
         locks = self._validate_schema(names)
+        for parameter, expected in (("interval_ratio", self.interval_ratio),
+                                    ("max_ratio", self.max_ratio),
+                                    ("patience", self.patience)):
+            if state.get(parameter) != expected:
+                raise ValueError(f"A2PM checkpoint {parameter} mismatch; retrain")
         for setting, expected in (
             ("continuous_idx", self.continuous_idx),
             ("categorical_idx", self.categorical_idx),
@@ -507,7 +560,7 @@ class A2PMAttack(FeatureSpaceAttack):
         locks = self._locked_indices(self.feature_names)
         mutable = tuple(i for i in self.categorical_idx if i not in locks
                         and self.feature_names[i] not in self.immutable_features
-                        and self.feature_names[i] != "DIR")
+                        and self.feature_names[i] not in {"DIR", "FLG"})
         columns = mutable + tuple(i for i in locks if i not in mutable)
 
         runtime_mean = kwargs.get("normalization_mean")
@@ -542,6 +595,7 @@ class A2PMAttack(FeatureSpaceAttack):
         success = baseline == target
         active = np.logical_and(~success, labels != target)
         attempts = 0
+        stagnant_iterations = 0
         stop_reason = "all_evaded_or_ineligible" if not active.any() else "max_iterations"
         interval_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         combination_cache: dict[tuple[int, int], dict[tuple[float, ...], torch.Tensor]] = {}
@@ -580,13 +634,10 @@ class A2PMAttack(FeatureSpaceAttack):
                                 interval_cache[cache_key] = (lower, upper)
                             lower, upper = interval_cache[cache_key]
                             before = proposed[chosen, time][:, indices]
-                            base = torch.maximum(torch.minimum(before, upper), lower)
-                            epsilon = torch.from_numpy(
-                                1.0 - rng.random(base.shape, dtype=np.float32)
-                            ).to(device)
-                            upward = torch.from_numpy(rng.random(base.shape) < 0.5).to(device)
-                            after = torch.where(upward, base + epsilon * (upper - base),
-                                                base - epsilon * (base - lower))
+                            after = _interval_step(
+                                before, lower, upper, rng,
+                                ratio=self.interval_ratio, max_ratio=self.max_ratio,
+                            )
                             allowed = permitted[chosen, time][:, indices]
                             proposed[chosen[:, None], time, indices] = torch.where(allowed, after, before)
 
@@ -620,8 +671,11 @@ class A2PMAttack(FeatureSpaceAttack):
             changed = torch.any(candidate.reshape(len(x0), -1) != adv.reshape(len(x0), -1), dim=1)
             changed_ids = np.flatnonzero(active & changed.detach().cpu().numpy())
             if not len(changed_ids):
-                stop_reason = "no_new_evasions"
-                break
+                stagnant_iterations += 1
+                if self.patience > 0 and stagnant_iterations >= self.patience:
+                    stop_reason = "no_new_evasions"
+                    break
+                continue
             proposed_predictions = self._predict(candidate[changed_ids], original_is_tensor)
             counts[changed_ids] += 1
             new_success = proposed_predictions == target
@@ -629,7 +683,8 @@ class A2PMAttack(FeatureSpaceAttack):
             adv = candidate
             active = np.logical_and(~success, labels != target)
             attempts += 1
-            if not new_success.any():
+            stagnant_iterations = 0 if new_success.any() else stagnant_iterations + 1
+            if self.patience > 0 and stagnant_iterations >= self.patience:
                 stop_reason = "no_new_evasions"
                 break
             if not active.any():
@@ -644,6 +699,9 @@ class A2PMAttack(FeatureSpaceAttack):
             metadata={
                 "attack": "a2pm", "iterations": attempts,
                 "max_iterations": self.max_iterations,
+                "interval_ratio": self.interval_ratio,
+                "max_ratio": self.max_ratio,
+                "patience": self.patience,
                 "stop_reason": stop_reason,
                 "checkpoint": str(self._loaded_path),
                 "learned_classes": len(self._states),

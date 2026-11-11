@@ -1,0 +1,13 @@
+# Brockmann et al. (LCN 2025): constrained random candidate followed by
+# Pointwise removal/magnitude minimization; source query caps were for a
+# different flow-feature schema. These normalized NIDS budgets are local.
+name: nids_constrained_pointwise
+feature_names: ${dataset.feature_names}
+immutable_features: ${dataset.immutable_features}
+clip_ranges: ${dataset.clip_ranges}
+epsilon: 0.03
+init_queries: 10
+max_queries: 1000
+binary_steps: 10
+target_label: 0
+variant: "uniform_packet_pointwise_eps${.epsilon}_init${.init_queries}_q${.max_queries}_bs${.binary_steps}"

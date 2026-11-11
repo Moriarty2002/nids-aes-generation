@@ -1,3 +1,16 @@
+"""TDTCE: Sui et al., The Computer Journal (2026), Algorithms 1–2.
+
+Original: VAE latent diffusion with AdaLN-G/TDiT and five losses: reconstruction,
+KL, adversarial, noise prediction and Mahalanobis regularization.
+Mandatory NIDS adaptation: ordered T=20 packet masks, independent train-fitted
+surrogate, physical finalizer; no original target-query/SVGP imitation.
+Source recipe: Table 1 AdaLN-G I, 6 blocks/p=4, but patches now group
+ordered packet tokens rather than the paper's 16x16 image cells. The paper's
+classifier-query SVGP and its full PCAP mapping are prohibited/unavailable;
+loss weights, beta schedule and training duration are declared NIDS choices.
+Topology: flat (B,T*F) and masked (B,T,F), no PCAP wire certification.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -16,6 +29,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from attacks.base import AttackResult, FeatureSpaceAttack
+from core.provenance import authorized_attack_training_indices
 from core.registry import DATASETS, NIDS, register_attack
 from models.wrapper import PyTorchModelWrapper
 from orchestrator.device import configure_process_device
@@ -45,6 +59,36 @@ def _sinusoidal_embedding(timesteps: Tensor, dimension: int, max_period: float =
     if dimension % 2:
         embedding = F.pad(embedding, (0, 1))
     return embedding
+
+
+def ddpm_forward_noising(clean_latent: Tensor, noise: Tensor, alpha_bar: Tensor) -> Tensor:
+    """Sui et al. Eq. 1 forward marginal (DDPM): exact latent/noise shape.
+
+    Valid packet masking is applied by the caller before and after noising;
+    this function never creates physical features or performs model queries.
+    """
+    if clean_latent.shape != noise.shape:
+        raise ValueError('Latent and sampled noise must have identical shape')
+    return torch.sqrt(alpha_bar) * clean_latent + torch.sqrt(1.0 - alpha_bar) * noise
+
+
+def ddpm_reverse_step(noisy_latent: Tensor, predicted_noise: Tensor, *,
+                      alpha: Tensor, beta: Tensor, alpha_bar: Tensor,
+                      posterior_sigma: Tensor, posterior_noise: Tensor | None) -> Tensor:
+    """Sui et al. Eq. 2, with DDPM posterior sigma for t>1.
+
+    The caller provides its independently seeded noise sample and implements
+    the final noiseless t=1 step. No classifier oracle is consulted here.
+    """
+    if noisy_latent.shape != predicted_noise.shape:
+        raise ValueError('Latent and predicted noise shapes must agree')
+    if torch.any(posterior_sigma > 0) and posterior_noise is None:
+        raise ValueError('Nonzero posterior variance requires an explicit noise draw')
+    if posterior_noise is not None and posterior_noise.shape != noisy_latent.shape:
+        raise ValueError('Posterior noise must match latent shape')
+    mean = (noisy_latent - beta / torch.sqrt(1.0-alpha_bar).clamp_min(1e-8)
+            * predicted_noise) / torch.sqrt(alpha)
+    return mean if posterior_noise is None else mean + posterior_sigma * posterior_noise
 
 
 class SparseMultiheadAttention(nn.Module):
@@ -562,24 +606,6 @@ def _estimate_benign_mahalanobis(
     return benign_mean.astype(np.float32), inverse_variance, "diagonal"
 
 
-def _training_split(labels: np.ndarray, seed: int) -> np.ndarray:
-    """Return a deterministic stratified training split, with a small-data fallback."""
-    indices = np.arange(len(labels), dtype=np.int64)
-    if len(indices) < 2:
-        raise ValueError("TDTCE training needs at least two dataset samples")
-    try:
-        train_indices, _ = train_test_split(
-            indices,
-            test_size=0.2,
-            random_state=int(seed),
-            stratify=labels,
-        )
-        return np.sort(np.asarray(train_indices, dtype=np.int64))
-    except ValueError:
-        generator = np.random.default_rng(int(seed))
-        generator.shuffle(indices)
-        train_count = max(1, min(len(indices) - 1, int(round(0.8 * len(indices)))))
-        return np.sort(indices[:train_count])
 
 
 def _checkpoint_path(template: str | Path, seed: int) -> Path:
@@ -591,18 +617,12 @@ def _load_classifier_checkpoint(
     seed: int,
     device: torch.device,
 ) -> tuple[dict[str, Any], dict[str, Any], PyTorchModelWrapper]:
-    """Load the configured surrogate (or target) PyTorch model checkpoint."""
-    surrogate_raw = config.get("surrogate_model")
-    use_surrogate = isinstance(surrogate_raw, Mapping) and bool(surrogate_raw.get("enabled", True))
-    if use_surrogate:
-        classifier_config = dict(surrogate_raw)
-        role = "surrogate_model"
-    else:
-        raw_model = config.get("model")
-        if not isinstance(raw_model, Mapping):
-            raise ValueError("TDTCE training requires a model or enabled surrogate_model configuration")
-        classifier_config = dict(raw_model)
-        role = "model"
+    """Use the explicitly trained surrogate; never load target weights offline."""
+    surrogate_raw = config.get('surrogate_model')
+    if not isinstance(surrogate_raw, Mapping) or not surrogate_raw.get('enabled', True):
+        raise ValueError('TDTCE offline training requires a separate enabled surrogate_model')
+    classifier_config = dict(surrogate_raw)
+    role = 'surrogate_model'
 
     checkpoint_value = classifier_config.get("checkpoint")
     if not checkpoint_value:
@@ -742,14 +762,16 @@ class TDTCEAttack(FeatureSpaceAttack):
     """
 
     attack_name: ClassVar[str] = "tdtce"
-    query_based: ClassVar[bool] = False
+    query_based: ClassVar[bool] = True  # includes post-generation surrogate predictions
     requires_gradients: ClassVar[bool] = False
+    hard_budget_norm = "linf"
 
     epsilon: float = 0.04
+    source_recipe_status: str = "paper_table1_GI_packet_adaptation"
     timesteps: int = 50
     hidden_dim: int = 64
-    num_blocks: int = 4
-    patch_size: int = 1
+    num_blocks: int = 6
+    patch_size: int = 4
     adaln_mode: str = "adaln_g"
     learning_rate: float = 1e-3
     epochs: int = 30
@@ -781,6 +803,8 @@ class TDTCEAttack(FeatureSpaceAttack):
     _alpha_bars: Tensor | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.source_recipe_status != 'paper_table1_GI_packet_adaptation':
+            raise ValueError('TDTCE source recipe identity must be the declared paper-GI packet adaptation')
         if self.epsilon < 0:
             raise ValueError("epsilon must be >= 0")
         if self.timesteps < 1 or self.hidden_dim < 1 or self.num_blocks < 1:
@@ -839,7 +863,7 @@ class TDTCEAttack(FeatureSpaceAttack):
         params = {
             name: attack_cfg[name]
             for name in (
-                "epsilon", "timesteps", "hidden_dim", "num_blocks", "patch_size",
+                "epsilon", "source_recipe_status", "timesteps", "hidden_dim", "num_blocks", "patch_size",
                 "adaln_mode", "learning_rate", "epochs", "batch_size", "latent_dim",
                 "num_heads", "attention_window", "dropout", "weight_rec", "weight_kl",
                 "weight_adv", "weight_pre", "weight_mahal",                 "targeted", "target_label",
@@ -856,7 +880,9 @@ class TDTCEAttack(FeatureSpaceAttack):
         input_shape = tuple(int(value) for value in classifier_checkpoint["input_shape"])
         dataset = _instantiate_training_dataset(config, input_shape)
         raw_features, labels = dataset.raw_arrays()
-        raw_features = np.asarray(raw_features, dtype=np.float32)
+        raw_features = np.asarray(raw_features)
+        if raw_features.dtype != np.float64:
+            raise TypeError('TDTCE requires pre-normalization float64 physical data')
         labels = np.asarray(labels, dtype=np.int64).reshape(-1)
         if len(raw_features) != len(labels):
             raise ValueError("Dataset features and labels have different sample counts")
@@ -897,7 +923,8 @@ class TDTCEAttack(FeatureSpaceAttack):
                 f"is incompatible with dataset samples {input_shape}"
             ) from exc
 
-        train_indices = _training_split(labels, int(seed))
+        source_role = 'surrogate_model'  # _load_classifier_checkpoint admits only an authorized surrogate
+        train_indices = authorized_attack_training_indices(dataset, labels, config, seed, role=source_role)
         target_label = int(settings.target_label)
         classifier_num_classes = int(classifier_checkpoint["num_classes"])
         if not 0 <= target_label < classifier_num_classes:
@@ -1057,10 +1084,7 @@ class TDTCEAttack(FeatureSpaceAttack):
                 )
                 noise = torch.randn_like(latent) * token_mask_3d
                 alpha_bar_t = alpha_bars[sampled_timesteps - 1].reshape(-1, 1, 1)
-                noisy_latent = (
-                    torch.sqrt(alpha_bar_t) * latent
-                    + torch.sqrt(1.0 - alpha_bar_t) * noise
-                ) * token_mask_3d
+                noisy_latent = ddpm_forward_noising(latent, noise, alpha_bar_t) * token_mask_3d
                 predicted_noise = tdit(
                     noisy_latent, sampled_timesteps, y_batch, valid_mask=token_valid_mask
                 )
@@ -1112,7 +1136,10 @@ class TDTCEAttack(FeatureSpaceAttack):
 
                 malicious_mask = y_batch != target_label
                 if bool(malicious_mask.any()):
-                    surrogate_logits = surrogate.model(generated_for_classifier[malicious_mask])
+                    surrogate_logits = surrogate.forward_differentiable(
+                        generated_for_classifier[malicious_mask],
+                        valid_mask=token_valid_mask[malicious_mask],
+                    )
                     adversarial_loss = _forward_targeted_loss(
                         surrogate_logits,
                         y_batch[malicious_mask],
@@ -1180,10 +1207,21 @@ class TDTCEAttack(FeatureSpaceAttack):
         output_dir = Path(str(output_dir_value)).expanduser()
         checkpoint_dir = output_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = checkpoint_dir / f"tdtce_seed{int(seed)}.pt"
+        configured_checkpoint = config.get("attack", {}).get("checkpoint")
+        checkpoint_path = (
+            _checkpoint_path(str(configured_checkpoint), int(seed))
+            if configured_checkpoint else checkpoint_dir / f"tdtce_seed{int(seed)}.pt"
+        )
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+        from core.provenance import trained_generator_provenance
         payload: dict[str, Any] = {
-            "format_version": 1,
+            "artifact_provenance": trained_generator_provenance(
+                dataset, labels, config, seed, source_role='surrogate_model',
+                input_shape=input_shape, feature_names=feature_names,
+            ),
+            "format_version": 2,
+            "source_recipe_status": settings.source_recipe_status,
             "attack_name": "tdtce",
             "seed": int(seed),
             "input_shape": list(input_shape),
@@ -1207,6 +1245,7 @@ class TDTCEAttack(FeatureSpaceAttack):
             "covariance_mode": covariance_mode,
             "model_config": {
                 "feature_dim": feature_dim,
+                "source_recipe_status": settings.source_recipe_status,
                 "latent_dim": latent_dim,
                 "hidden_dim": settings.hidden_dim,
                 "num_blocks": settings.num_blocks,
@@ -1273,12 +1312,16 @@ class TDTCEAttack(FeatureSpaceAttack):
         path = self._resolve_checkpoint_path(seed)
         if not path.is_file():
             raise FileNotFoundError(
-                f"TDTCE generator checkpoint was not found: {path}. Run action=train_attack first, "
-                "and set attack.checkpoint to the training output when it differs from output_dir."
+                f"TDTCE generator checkpoint missing: {path}; train_attack and evaluate_attack must use the same stable attack.checkpoint"
             )
         checkpoint = dict(torch.load(path, map_location=device, weights_only=False))
         if checkpoint.get("attack_name") != "tdtce":
             raise ValueError(f"Checkpoint {path} is not a TDTCE generator checkpoint")
+        if (int(checkpoint.get('format_version', -1)) != 2
+                or checkpoint.get('source_recipe_status') != self.source_recipe_status):
+            raise ValueError('TDTCE checkpoint predates the versioned GI packet algorithm or has different recipe identity; retrain')
+        from core.provenance import verify_generator_artifact_provenance
+        verify_generator_artifact_provenance(checkpoint, getattr(self, 'expected_provenance', None))
         input_shape = tuple(int(value) for value in checkpoint.get("input_shape", ()))
         model_cfg = dict(checkpoint.get("model_config", {}))
         feature_dim = int(checkpoint.get("feature_dim", model_cfg.get("feature_dim", 0)))
@@ -1499,28 +1542,25 @@ class TDTCEAttack(FeatureSpaceAttack):
                     beta_t = self._betas[timestep - 1]
                     alpha_t = self._alphas[timestep - 1]
                     alpha_bar_t = self._alpha_bars[timestep - 1]
-                    reverse_mean = (
-                        latent
-                        - beta_t / torch.sqrt(1.0 - alpha_bar_t).clamp_min(1e-8)
-                        * predicted_noise
-                    ) / torch.sqrt(alpha_t)
                     if timestep > 1:
                         alpha_bar_previous = self._alpha_bars[timestep - 2]
-                        posterior_variance = (
+                        posterior_sigma = torch.sqrt((
                             beta_t * (1.0 - alpha_bar_previous)
                             / (1.0 - alpha_bar_t).clamp_min(1e-8)
-                        ).clamp_min(0.0)
+                        ).clamp_min(0.0))
                         reverse_noise = torch.randn(
-                            reverse_mean.shape,
-                            device=device,
-                            dtype=reverse_mean.dtype,
+                            latent.shape, device=device, dtype=latent.dtype,
                             generator=torch_generator,
                         )
-                        latent = reverse_mean + torch.sqrt(posterior_variance) * reverse_noise
                     else:
-                        latent = reverse_mean
-                    latent = (latent.detach()) * token_mask_3d
-                    del predicted_noise, timestep_batch, reverse_mean
+                        posterior_sigma = torch.zeros_like(beta_t)
+                        reverse_noise = None
+                    latent = ddpm_reverse_step(
+                        latent, predicted_noise, alpha=alpha_t, beta=beta_t,
+                        alpha_bar=alpha_bar_t, posterior_sigma=posterior_sigma,
+                        posterior_noise=reverse_noise,
+                    ).detach() * token_mask_3d
+                    del predicted_noise, timestep_batch
 
                 decoded_generator = self._vae.decode(
                     latent, output_ndim=x_batch_generator.ndim
@@ -1576,7 +1616,7 @@ class TDTCEAttack(FeatureSpaceAttack):
         return AttackResult(
             adversarial=adversarial,
             success_mask=success.astype(bool, copy=False),
-            queries=np.zeros(len(adversarial), dtype=np.int64),
+            queries=np.ones(len(adversarial), dtype=np.int64),
             feature_names=self.feature_names or None,
             metadata={
                 "attack": "tdtce",

@@ -38,6 +38,7 @@ class BIMAttack(FeatureSpaceAttack):
     schema fields. Non-differentiable protocol rules remain outside this loop
     and are measured by the evaluation gatekeeper after generation.
     """
+    hard_budget_norm = "linf"
 
     epsilon: float = 0.01
     alpha: float = 0.002
@@ -112,7 +113,7 @@ class BIMAttack(FeatureSpaceAttack):
             with torch.enable_grad():
                 for step in range(self.steps):
                     delta = (delta * mask).detach().requires_grad_(True)
-                    logits = model_module(x0 + delta)
+                    logits = model.forward_differentiable(x0 + delta, valid_mask=kwargs.get("valid_mask"))
                     if step == 0 and targeted:
                         assert target_label is not None
                         validate_target_label(logits, target_label)
@@ -144,7 +145,7 @@ class BIMAttack(FeatureSpaceAttack):
 
                 with torch.no_grad():
                     adversarial = (x0 + delta.detach()).detach()
-                    adv_logits = model_module(adversarial)
+                    adv_logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
                     predictions = predicted_labels(adv_logits)
                     success = predictions.eq(objective_labels) if targeted else predictions.ne(labels)
                     adv_logits = adv_logits.detach()

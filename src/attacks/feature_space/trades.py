@@ -19,6 +19,7 @@ class TRADESAttack(FeatureSpaceAttack):
     """
 
     attack_name = "trades"
+    hard_budget_norm = "linf"
     requires_gradients = True
 
     def __init__(

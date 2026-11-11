@@ -4,12 +4,15 @@ targeted: true
 target_label: null
 confidence: 0.0
 learning_rate: 0.01
-max_steps: 2
-binary_search_steps: 2
+max_steps: 100
+binary_search_steps: 5
 initial_const: 0.01
 abort_early: true
 abort_check_every: 3
 clip_min: null
 clip_max: null
 immutable_features: ${dataset.immutable_features}
+# Physical schema ranges are forward-normalized using the registered surrogate
+# normalizer. No image [0,1] box or float32-to-physical inversion is assumed.
+clip_ranges: ${dataset.clip_ranges}
 variant: "steps${attack.max_steps}_bs${attack.binary_search_steps}_c${attack.initial_const}"

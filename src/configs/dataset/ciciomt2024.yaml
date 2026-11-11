@@ -1,7 +1,7 @@
 name: ciciomt2024
 immutable_features: [DIR, FLG]
 clip_ranges:
-  WIN: [-1.0, 65535.0]
+  WIN: [0.0, 65535.0]
   TTL: [0.0, 255.0]
   PL: [0.0, 1500.0]
   IAT: [0.0, 1.0e6]
@@ -14,7 +14,7 @@ params:
   task_mode: auto
   # Selected automatically from model.requires_flatten/model.name at runtime.
   flatten: null
-  max_length: null
+  max_length: 20
   feat_pad_column: FEAT_PAD
   include_padding_indicator: false
   padding_indicator_name: FEAT_PAD_MASK

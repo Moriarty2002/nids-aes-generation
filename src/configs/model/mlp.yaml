@@ -1,7 +1,7 @@
 # configs/model/mlp.yaml
 name: mlp
 requires_flatten: true
-checkpoint: null
+checkpoint: "${experiment_dir}/checkpoints/targets/mlp/${model.training.defense_mode}/seed{seed}/nids.pt"
 params:
   hidden_dims: [256, 128]
   dropout: 0.2

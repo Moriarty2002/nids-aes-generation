@@ -1,9 +1,9 @@
 # Hydra attack group: place under conf/attack/mirage.yaml
-# Evaluation remains independent: the engine runs preprocessor + gatekeeper.
+# Raw-PCAP preprocessing is deferred; this path change does not certify it.
 name: mirage
 params:
   # Keep {seed} for the workflow's per-seed checkpoint resolver.
-  checkpoint: ${output_dir}/checkpoints/mirage_seed{seed}.pt
+  checkpoint: ${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt
   target_label: 0
   min_payload: 1
   max_payload: 1460
