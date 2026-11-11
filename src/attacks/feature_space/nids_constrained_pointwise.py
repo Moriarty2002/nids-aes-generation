@@ -26,6 +26,7 @@ from attacks.base import AttackResult, FeatureSpaceAttack
 from core.dual_representation import encode_normalized32, layout, stats_views
 from core.registry import register_attack
 from constraints.rules import RuleSet
+from models.wrapper import PyTorchModelWrapper
 
 
 @dataclass
@@ -154,7 +155,13 @@ class NIDSConstrainedPointwiseAttack(FeatureSpaceAttack):
             # counts this even if it fails or does not improve the attack.
             shaped = proposal.reshape((1,) + tuple(original.shape[1:]))
             model_input = encode_normalized32(shaped, self.feature_names, mean, std)
-            prediction = np.asarray(self._require_model().predict(model_input)).reshape(-1)
+            model = self._require_model()
+            # Each source decision evaluates one record, so a sequence surrogate
+            # needs that record's exact occupancy rather than the engine batch.
+            prediction = np.asarray(
+                model.predict(model_input, valid_mask=mask_np[i:i+1])
+                if isinstance(model, PyTorchModelWrapper) else model.predict(model_input)
+            ).reshape(-1)
             if prediction.size != 1:
                 raise ValueError('Pointwise surrogate returned an invalid decision batch')
             calls[i] += 1

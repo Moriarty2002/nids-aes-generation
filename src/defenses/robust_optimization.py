@@ -109,7 +109,9 @@ def _trades_loss_and_logits(
     y = y.to(wrapper.device, dtype=torch.long)
     was_training = model.training
     edit_mask = _resolve_perturbation_mask(x, y, perturbation_mask_fn)
-    delta = torch.empty_like(x).uniform_(-epsilon, epsilon)
+    # TRADES Algorithm 1: Gaussian .001 start, masked/projected for NIDS.
+    # Only the inner search is aligned here; outer-loss fidelity belongs to F4.
+    delta = (.001 * torch.randn_like(x)).clamp(-epsilon, epsilon)
     if edit_mask is not None:
         delta.mul_(edit_mask)
 

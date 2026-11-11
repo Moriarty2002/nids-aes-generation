@@ -10,13 +10,18 @@ from attacks.base import AttackResult, FeatureSpaceAttack
 from core.exceptions import IncompatibleThreatModelError
 from core.registry import register_attack
 from models.wrapper import PyTorchModelWrapper, ensure_gradient_compatible
-from ._linf_utils import immutable_feature_mask
+from ._linf_utils import (classification_loss, immutable_feature_mask,
+                         project_linf_delta, validate_target_label)
 
 
 @dataclass
 @register_attack("pgd")
 class PGDAttack(FeatureSpaceAttack):
-    """Projected-gradient feature-space attack.
+    """Madry random-start projected sign-gradient optimization.
+
+    Necessary NIDS adaptation: the independent surrogate receives exact packet
+    masks; protected coordinates and the normalized L∞/declared box restrict
+    optimization. Physical acceptance remains independent after generation.
 
     ``target_label`` turns PGD into a targeted attack automatically. This keeps
     attack optimization independent of the universal gatekeeper while allowing
@@ -39,12 +44,12 @@ class PGDAttack(FeatureSpaceAttack):
     requires_gradients = True
 
     def __post_init__(self) -> None:
-        if self.epsilon < 0:
-            raise ValueError("epsilon must be >= 0")
-        if self.alpha < 0:
-            raise ValueError("alpha must be >= 0")
-        if self.steps <= 0:
-            raise ValueError("steps must be > 0")
+        if not np.isfinite(self.epsilon) or self.epsilon < 0:
+            raise ValueError("epsilon must be finite and >= 0")
+        if not np.isfinite(self.alpha) or self.alpha < 0:
+            raise ValueError("alpha must be finite and >= 0")
+        if not isinstance(self.steps, int) or self.steps <= 0:
+            raise ValueError("steps must be an integer > 0")
         self.feature_names = tuple(str(name).upper() for name in self.feature_names)
         self.immutable_features = tuple(str(name).upper() for name in self.immutable_features)
         if len(set(self.feature_names)) != len(self.feature_names):
@@ -64,21 +69,10 @@ class PGDAttack(FeatureSpaceAttack):
         delta: torch.Tensor,
         perturbation_mask: torch.Tensor,
     ) -> torch.Tensor:
-        delta = delta.clamp(-self.epsilon, self.epsilon)
-
-        if self.clip_min is not None or self.clip_max is not None:
-            lower: float | Sequence[float] | np.ndarray = (
-                self.clip_min if self.clip_min is not None else -torch.inf
-            )
-            upper: float | Sequence[float] | np.ndarray = (
-                self.clip_max if self.clip_max is not None else torch.inf
-            )
-            lower_value = torch.as_tensor(lower, device=x0.device, dtype=x0.dtype)
-            upper_value = torch.as_tensor(upper, device=x0.device, dtype=x0.dtype)
-
-            delta = torch.clamp(x0 + delta, min=lower_value, max=upper_value) - x0
-
-        return delta * perturbation_mask
+        return project_linf_delta(
+            x0, delta, perturbation_mask, epsilon=self.epsilon,
+            clip_min=self.clip_min, clip_max=self.clip_max, feature_names=self.feature_names,
+        )
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Generate bounded adversarial features using projected gradients."""
@@ -133,19 +127,14 @@ class PGDAttack(FeatureSpaceAttack):
         # Validate the targeted class before entering the optimization loop.
         with torch.no_grad():
             probe_logits = model.forward_differentiable(x0[:1], valid_mask=None if kwargs.get("valid_mask") is None else kwargs["valid_mask"][:1])
-        if probe_logits.ndim >= 2 and probe_logits.shape[-1] > 1:
-            num_classes = int(probe_logits.shape[-1])
-            if effective_targeted:
-                assert target_label is not None
-                if not 0 <= target_label < num_classes:
-                    raise ValueError(
-                        f"target_label={target_label} is outside the model class range [0, {num_classes - 1}]"
-                    )
+        if effective_targeted:
+            assert target_label is not None
+            validate_target_label(probe_logits, target_label)
 
         seed = kwargs.get("seed")
         generator: torch.Generator | None = None
         if seed is not None:
-            generator = torch.Generator(device=model.device.type)
+            generator = torch.Generator(device=model.device)
             generator.manual_seed(int(seed))
 
         delta = torch.empty_like(x0)
@@ -157,14 +146,8 @@ class PGDAttack(FeatureSpaceAttack):
         # measured only by EvaluationEngine after generation.
         for _ in range(self.steps):
             delta.requires_grad_(True)
-            logits = model.forward_differentiable(x0 + delta)
-
-            if logits.ndim == 1 or logits.shape[-1] == 1:
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits.view(-1), target.float().view(-1)
-                )
-            else:
-                loss = torch.nn.functional.cross_entropy(logits, target)
+            logits = model.forward_differentiable(x0 + delta, valid_mask=kwargs.get("valid_mask"))
+            loss = classification_loss(logits, target)
 
             grad = torch.autograd.grad(loss, delta, only_inputs=True, retain_graph=False)[0].detach()
             with torch.no_grad():
@@ -181,7 +164,7 @@ class PGDAttack(FeatureSpaceAttack):
 
         adv = (x0 + delta).detach()
         with torch.no_grad():
-            logits = model.forward_differentiable(adv)
+            logits = model.forward_differentiable(adv, valid_mask=kwargs.get("valid_mask"))
             if logits.ndim == 1 or logits.shape[-1] == 1:
                 pred = (torch.sigmoid(logits) >= 0.5).long().view(-1)
             else:

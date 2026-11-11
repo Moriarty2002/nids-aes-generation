@@ -2,20 +2,25 @@ from __future__ import annotations
 from typing import Any
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import register_attack
+from models.wrapper import PyTorchModelWrapper, ensure_gradient_compatible
+from ._optimization_utils import class_scores, restore_module_modes, restore_saved_modes
 from ._linf_utils import immutable_feature_mask
 
 
 @register_attack("trades")
 class TRADESAttack(FeatureSpaceAttack):
-    """TRADES KL-divergence adversarial generator for surrogate augmentation when using Empirical Adversarial Training.
-        
-        It is implemented as an attack as a workaround to allow for the use of the same interface as other attacks, but it is not a traditional attack in the sense that it does not aim to generate adversarial examples that fool a model. 
-        Instead, it generates adversarial examples that are used to augment the training data against a surrogate model to feed them to a non differentiable model.
+    """TRADES Algorithm 1 inner KL maximization, used for defense augmentation.
+
+    Original mechanism: .001 Gaussian start and projected sign ascent of
+    KL(clean || adversarial). Necessary NIDS adaptation: normalized packet
+    coordinates, exact occupancy/edit masks and an independent surrogate replace
+    images and the source classifier. Physical acceptance stays external.
+    A one-logit NIDS head represents Bernoulli probabilities via scores [0,z].
+    This defense primitive is never a primary per-flow evasion method.
     """
 
     attack_name = "trades"
@@ -38,21 +43,19 @@ class TRADESAttack(FeatureSpaceAttack):
         self.steps = int(steps)
         self.trades_beta = float(trades_beta)
         self.immutable_features = tuple(str(f).upper() for f in immutable_features)
+        if not np.isfinite(self.epsilon) or self.epsilon < 0:
+            raise ValueError("epsilon must be finite and >= 0")
+        if not np.isfinite(self.alpha) or self.alpha < 0:
+            raise ValueError("alpha must be finite and >= 0")
+        if not isinstance(steps, int) or steps < 1:
+            raise ValueError("steps must be an integer >= 1")
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         model_wrapper = self._require_model()
+        ensure_gradient_compatible(model_wrapper)
+        if not isinstance(model_wrapper, PyTorchModelWrapper):
+            raise TypeError("TRADES inner optimization requires a PyTorchModelWrapper")
         x_clean = torch.as_tensor(x, dtype=torch.float32, device=model_wrapper.device)
-        
-        # Calculate clean surrogate outputs (probabilities)
-        with torch.no_grad():
-            clean_logits = model_wrapper.forward_differentiable(x_clean)
-            clean_probs = F.softmax(clean_logits, dim=-1)
-            clean_probs = clean_probs.detach()
-            del clean_logits
-
-        # Initialize perturbation with uniform noise
-        delta = torch.zeros_like(x_clean).uniform_(-self.epsilon, self.epsilon)
-        delta.requires_grad_(True)
 
         # Build feature mask to respect immutable features
         feature_names = tuple(kwargs.get("feature_names", self.feature_names))
@@ -69,31 +72,34 @@ class TRADESAttack(FeatureSpaceAttack):
             self.immutable_features,
         )
 
-        criterion_kl = nn.KLDivLoss(reduction="batchmean")
+        seed = kwargs.get("seed")
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=model_wrapper.device).manual_seed(int(seed))
+        delta = .001 * torch.randn(x_clean.shape, device=x_clean.device,
+                                   dtype=x_clean.dtype, generator=generator)
+        delta = delta.clamp(-self.epsilon, self.epsilon) * mask
+        saved_modes = restore_module_modes(model_wrapper.model)
 
-        # Inner-loop KL divergence maximization
-        with torch.enable_grad():
-            for _ in range(self.steps):
-                x_adv = x_clean + delta * mask
-                adv_logits = model_wrapper.forward_differentiable(x_adv)
-                adv_log_probs = F.log_softmax(adv_logits, dim=-1)
+        try:
+            with torch.no_grad():
+                clean_logits = model_wrapper.forward_differentiable(x_clean, valid_mask=kwargs.get("valid_mask"))
+                clean_probs = F.softmax(class_scores(clean_logits), dim=-1).detach()
+            with torch.enable_grad():
+                for _ in range(self.steps):
+                    delta = delta.detach().requires_grad_(True)
+                    x_adv = x_clean + delta * mask
+                    adv_logits = model_wrapper.forward_differentiable(x_adv, valid_mask=kwargs.get("valid_mask"))
+                    adv_log_probs = F.log_softmax(class_scores(adv_logits), dim=-1)
 
-                # Maximize KL divergence between clean prediction and perturbed prediction
-                loss = criterion_kl(adv_log_probs, clean_probs)
-                grad = torch.autograd.grad(
-                    loss, delta, only_inputs=True, retain_graph=False, create_graph=False
-                )[0].detach()
+                    loss = F.kl_div(adv_log_probs, clean_probs, reduction="batchmean")
+                    grad = torch.autograd.grad(loss, delta, only_inputs=True)[0].detach()
 
-                with torch.no_grad():
-                    delta.add_(self.alpha * grad.sign())
-                    delta.clamp_(-self.epsilon, self.epsilon)
-                delta = delta.detach().requires_grad_(True)
-                adv_logits = adv_logits.detach()
-                adv_log_probs = adv_log_probs.detach()
-                loss = loss.detach()
-                del x_adv, adv_logits, adv_log_probs, loss, grad
+                    with torch.no_grad():
+                        delta = (delta + self.alpha * grad.sign()).clamp(-self.epsilon, self.epsilon) * mask
+        finally:
+            restore_saved_modes(saved_modes)
 
         with torch.no_grad():
             x_final = (x_clean + delta.detach() * mask).detach().cpu().numpy()
-        del delta, clean_probs, mask, criterion_kl
         return AttackResult(adversarial=x_final, feature_names=feature_names)

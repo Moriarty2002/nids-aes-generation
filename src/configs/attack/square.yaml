@@ -1,8 +1,0 @@
-name: square
-immutable_features: ${dataset.immutable_features}
-epsilon: 0.03
-max_queries: 1000
-p_init: 0.8
-targeted: false
-target_label: null
-variant: "eps${attack.epsilon}_queries${attack.max_queries}"

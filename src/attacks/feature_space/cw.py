@@ -24,7 +24,7 @@ from core.exceptions import IncompatibleThreatModelError
 from core.registry import register_attack
 from models.wrapper import PyTorchModelWrapper, ensure_gradient_compatible
 from ._linf_utils import immutable_feature_mask, resolve_target, validate_target_label
-from ._optimization_utils import class_scores, input_predictions, project_box_delta, resolve_bounds, restore_module_modes, restore_saved_modes
+from ._optimization_utils import class_scores, project_box_delta, resolve_bounds, restore_module_modes, restore_saved_modes
 
 
 def _inverse_tanh_box(x: Tensor, lower: Tensor, upper: Tensor) -> Tensor:
@@ -54,6 +54,9 @@ def _normalized_wire_bounds(x0: Tensor, names: Sequence[str],
     """
     if not names or mean is None or std is None or not physical_ranges:
         return None
+    for a, b in physical_ranges.values():
+        if np.isnan(a) or np.isnan(b) or a > b or np.isposinf(a) or np.isneginf(b):
+            raise ValueError('Invalid C&W declared physical bounds')
     width = len(names)
     if x0.shape[-1] % width:
         raise ValueError('C&W packet width disagrees with feature_names')
@@ -67,8 +70,11 @@ def _normalized_wire_bounds(x0: Tensor, names: Sequence[str],
         raise ValueError('C&W cannot map wire bounds under this normalization')
     shape = (1,) * (x0.ndim - 1) + (x0.shape[-1],)
     mu, sigma = mu.reshape(shape), sigma.reshape(shape)
-    low = x0.detach().clone() - 1.0
-    high = x0.detach().clone() + 1.0
+    # Protected values can be huge after constant-field normalization: x±1
+    # collapses in float32. Their box is irrelevant because the edit mask
+    # restores x exactly; a fixed dummy interval must not disable source tanh.
+    low = torch.full_like(x0, -1.0)
+    high = torch.full_like(x0, 1.0)
     for j, name in enumerate(feature_positions):
         if not bool(editable[...,j].any()):
             continue
@@ -170,6 +176,21 @@ class CWL2Attack(FeatureSpaceAttack):
         ).max(dim=1).values
         return (real_scores - other_scores + float(confidence)).clamp_min(0.0)
 
+    def _successful(self, scores: Tensor, labels: Tensor, *,
+                    targeted: bool, target_label: int | None) -> Tensor:
+        """Author compare(): adjust the designated logit before argmax.
+
+        This preserves the author's class-index tie rule at the confidence
+        boundary, for best-L2 tracking AND each record's constant search.
+        """
+        adjusted = scores.detach().clone()
+        designated = torch.full_like(labels, int(target_label)) if targeted else labels
+        rows = torch.arange(len(labels), device=scores.device)
+        adjusted[rows, designated] += -self.confidence if targeted else self.confidence
+        predictions = adjusted.argmax(dim=1)
+        return (predictions.eq(designated) & labels.ne(designated)
+                if targeted else predictions.ne(labels))
+
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         model = self._require_model()
         ensure_gradient_compatible(model)
@@ -244,6 +265,10 @@ class CWL2Attack(FeatureSpaceAttack):
             # Some callers wrap the engine in no_grad; C&W still needs input gradients.
             with torch.enable_grad():
                 for search_step in range(self.binary_search_steps):
+                    # Author l2_attack.py repeats the best upper constant on
+                    # the last round when at least ten search rounds are used.
+                    if self.binary_search_steps >= 10 and search_step == self.binary_search_steps - 1:
+                        constants = upper_const.clone()
                     variable = nn.Parameter(initial_variable.clone() if tanh_domain
                                             else torch.zeros_like(x0))
                     optimizer = torch.optim.Adam([variable], lr=float(self.learning_rate))
@@ -279,12 +304,8 @@ class CWL2Attack(FeatureSpaceAttack):
                         per_sample_objective = per_sample_l2_sq + constants * margin
                         objective = per_sample_objective.sum()
 
-                        predictions = input_predictions(logits)
-                        successful = (
-                            predictions.eq(int(target_label)) & labels.ne(int(target_label))
-                            if targeted
-                            else predictions.ne(labels)
-                        )
+                        successful = self._successful(scores, labels, targeted=targeted,
+                                                      target_label=target_label)
                         total_iterations += 1
                         with torch.no_grad():
                             round_success |= successful
@@ -334,12 +355,8 @@ class CWL2Attack(FeatureSpaceAttack):
                             final_delta = project_box_delta(x0, variable, mask, lower, upper)
                         final_adversarial = x0 + final_delta
                         final_logits = model.forward_differentiable(final_adversarial, valid_mask=kwargs.get("valid_mask"))
-                        final_predictions = input_predictions(final_logits)
-                        final_success = (
-                            final_predictions.eq(int(target_label)) & labels.ne(int(target_label))
-                            if targeted
-                            else final_predictions.ne(labels)
-                        )
+                        final_success = self._successful(class_scores(final_logits), labels,
+                                                        targeted=targeted, target_label=target_label)
                         final_l2_sq = final_delta.reshape(batch_size, -1).square().sum(dim=1)
                         round_success |= final_success
                         improved = final_success & (final_l2_sq < best_l2_sq)
@@ -348,8 +365,7 @@ class CWL2Attack(FeatureSpaceAttack):
                             best_adversarial[improved] = final_adversarial[improved]
                         fallback_adversarial = final_adversarial.detach()
                         final_logits = final_logits.detach()
-                        final_predictions = final_predictions.detach()
-                        del final_logits, final_predictions, final_delta, final_l2_sq
+                        del final_logits, final_delta, final_l2_sq
 
                     if search_step + 1 < self.binary_search_steps:
                         upper_const = torch.where(round_success, torch.minimum(upper_const, constants), upper_const)
@@ -368,17 +384,12 @@ class CWL2Attack(FeatureSpaceAttack):
                 adversarial[best_success] = best_adversarial[best_success]
                 with torch.no_grad():
                     final_logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
-                    final_predictions = input_predictions(final_logits)
-                    success = (
-                        final_predictions.eq(int(target_label)) & labels.ne(int(target_label))
-                        if targeted and target_label is not None
-                        else final_predictions.ne(labels)
-                    )
+                    success = self._successful(class_scores(final_logits), labels,
+                                               targeted=targeted, target_label=target_label)
                     final_delta = adversarial - x0
                     final_l2 = final_delta.reshape(batch_size, -1).norm(p=2, dim=1)
                     final_logits = final_logits.detach()
-                    final_predictions = final_predictions.detach()
-                    del final_logits, final_predictions, final_delta
+                    del final_logits, final_delta
         finally:
             restore_saved_modes(saved_modes)
 

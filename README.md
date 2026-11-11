@@ -98,7 +98,7 @@ The execution graph strictly separates adversarial generation, physical protocol
                 │
                 ▼
         [Attack Optimization] ── Targeted optimization toward Benign (Label 0)
-          ├── Continuous Generation (float32): PGD, TRADES, C&W, Square, TDTCE (Diffusion)
+          ├── Continuous Generation (float32): PGD, TRADES, C&W, TDTCE (Diffusion)
           ├── Physical Projection (float64): Discretization (optional) & immutable restorations
           ├── Feature-Space: PGD / TdTce / etc. on normalized vectors
           └── Problem-Space: PCAP mutation -> SOTA Feature Extractor
@@ -147,7 +147,7 @@ The execution graph strictly separates adversarial generation, physical protocol
 * **Physical Source Authority:** Datasets (e.g., `SequenceParquetDataset`) natively extract padding and sequence attributes in `float64` to preserve pristine physical metrics before canonical model normalization. 
 
 #### 5. Threat Models & Attack Engines (`attacks/`)
-* **Feature-Space Pipeline (`attacks/feature_space/`):** Implements gradient-based (PGD, BIM, C&W, TRADES), gradient-free (Square Attack), and generative attacks (TDTCE - Latent Diffusion).
+* **Feature-Space Pipeline (`attacks/feature_space/`):** Implements gradient-based (PGD, BIM, C&W, TRADES), decision-based (NIDS constrained Pointwise), and generative attacks (TDTCE - Latent Diffusion).
 * **TRADES as an Attack Plugin (`TRADESAttack`):** Uses TRADES' inner KL-divergence maximization loop to explore prediction boundary instability. This creates transfer-capable adversarial samples for robustifying non differentiable models during EAT.
 * **Autograd Isolation:** Iterative gradient attacks enforce strict tensor detaching (`logits.detach()`, `loss.detach()`, `grad.detach()`), zeroing, and `del` calls per step to prevent autograd graph memory leaks. Non-gradient forward passes execute inside `with torch.no_grad():`.
 * **Dual Representation Intercept:** `FeatureSpaceAttack` wrappers intercept continuous `float32` adversarial outputs, project them into a `float64` workspace to snap discrete features (PL, TTL, WIN) to perfect integers, and flawlessly restore immutable victim bytes. 
@@ -177,7 +177,7 @@ The execution graph strictly separates adversarial generation, physical protocol
 nids-adv-benchmark/
 ├── configs/                          # Hierarchical Hydra configurations
 │   ├── config.yaml                   # Core runtime options and output paths
-│   ├── attack/                       # Attack parameters (pgd.yaml, square.yaml, trades.yaml)
+│   ├── attack/                       # Attack parameters (pgd.yaml, nids_constrained_pointwise.yaml, trades.yaml)
 │   ├── dataset/                      # Dataset configurations and label schemas
 │   ├── model/                        # Model architectures and training parameters
 │   └── preprocessing/                # PCAP feature extractor configurations
@@ -210,7 +210,7 @@ nids-adv-benchmark/
 │
 ├── attacks/
 │   ├── base.py                       # BaseAttack, FeatureSpaceAttack, ProblemSpaceAttack
-│   ├── feature_space/                # Feature attacks (PGD, Square, TdTce, C&W, etc.)
+│   ├── feature_space/                # Feature attacks (PGD, NIDS constrained Pointwise, TdTce, C&W, etc.)
 │   └── problem_space/                # PCAP mutators and flow injectors
 │
 ├── evaluator/

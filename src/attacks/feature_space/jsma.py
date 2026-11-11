@@ -85,11 +85,10 @@ class JSMAAttack(FeatureSpaceAttack):
     negative values and do not share the [0,1] domain assumed by many image
     implementations.
 
-    By default at most ``ceil(D * max_perturbation_ratio)`` distinct features
-    are selected per flow. Each feature is selected at most once, so the
-    selected-feature budget is a transparent upper bound on L0. If one feature
-    remains in the budget, a vectorized single-feature saliency fallback handles
-    that final coordinate. Pair scoring itself is fully vectorized over D x D.
+    Papernot Algorithm 2 permits at most floor(D * ratio / 2) pair updates.
+    Unsaturated coordinates remain available for subsequent pairs; there is no
+    single-coordinate fallback. Bounds and edit masks replace the image domain,
+    and only an independent surrogate supplies forward derivatives.
     """
 
     theta: float = 0.1
@@ -193,7 +192,7 @@ class JSMAAttack(FeatureSpaceAttack):
         batch_size = int(x0.shape[0])
         flat_dim = int(x0[0].numel())
         if self.max_perturbed_features is None:
-            l0_budget = int(np.ceil(flat_dim * float(self.max_perturbation_ratio)))
+            l0_budget = int(np.floor(flat_dim * float(self.max_perturbation_ratio)))
         else:
             l0_budget = min(int(self.max_perturbed_features), flat_dim)
         l0_budget = min(l0_budget, flat_dim)
@@ -201,7 +200,7 @@ class JSMAAttack(FeatureSpaceAttack):
             original_modes = restore_module_modes(model.model)
             try:
                 with torch.no_grad():
-                    clean_logits = model.forward_differentiable(x0)
+                    clean_logits = model.forward_differentiable(x0, valid_mask=kwargs.get("valid_mask"))
                     clean_scores = _saliency_scores(clean_logits)
                     if torch.any((labels < 0) | (labels >= clean_scores.shape[1])):
                         raise ValueError("Ground-truth labels are outside the model's class range")
@@ -234,13 +233,12 @@ class JSMAAttack(FeatureSpaceAttack):
         clean_predictions = torch.empty(batch_size, dtype=torch.long, device=x0.device)
         target_classes = torch.empty_like(labels)
         iteration_count = 0
-        features_selected_total = torch.zeros(batch_size, dtype=torch.long, device=x0.device)
         try:
             # JSMA needs gradients even when the caller wraps evaluation in
             # torch.no_grad(). Eval mode fixes BatchNorm and disables Dropout.
             with torch.enable_grad():
                 with torch.no_grad():
-                    clean_logits = model.forward_differentiable(x0)
+                    clean_logits = model.forward_differentiable(x0, valid_mask=kwargs.get("valid_mask"))
                     clean_scores = _saliency_scores(clean_logits)
                     clean_predictions = input_predictions(clean_logits)
                     class_count = int(clean_scores.shape[1])
@@ -276,6 +274,7 @@ class JSMAAttack(FeatureSpaceAttack):
                     chunk_size = int(len(clean_chunk))
                     adv_chunk = clean_chunk.detach().clone()
                     selected = torch.zeros_like(mask_chunk, dtype=torch.bool)
+                    saturated = torch.zeros_like(mask_chunk, dtype=torch.bool)
 
                     if effective_targeted:
                         assert target_label is not None
@@ -284,7 +283,7 @@ class JSMAAttack(FeatureSpaceAttack):
                         eligible = clean_pred_chunk.eq(labels_chunk)
                     stalled = torch.zeros(chunk_size, dtype=torch.bool, device=x0.device)
 
-                    step_limit = (l0_budget + 1) // 2
+                    step_limit = l0_budget // 2
                     if self.max_iterations is not None:
                         step_limit = min(step_limit, int(self.max_iterations))
 
@@ -338,7 +337,7 @@ class JSMAAttack(FeatureSpaceAttack):
                         other_gradient = (jacobian.sum(dim=1) - jacobian[row_idx, target_chunk]) * mask_chunk.to(x0.dtype)
 
                         current_flat = current.reshape(chunk_size, flat_dim).detach()
-                        available = mask_chunk & ~selected
+                        available = mask_chunk & ~saturated
                         can_increase = current_flat < (upper_chunk - self.saliency_epsilon)
                         can_decrease = current_flat > (lower_chunk + self.saliency_epsilon)
 
@@ -382,30 +381,9 @@ class JSMAAttack(FeatureSpaceAttack):
                         choose_decrease = dec_best > inc_best
                         pair_saliency = torch.maximum(inc_best, dec_best)
                         pair_flat_index = torch.where(choose_decrease, dec_flat_index, inc_flat_index)
-                        has_pair = active & (features_selected_total[batch_start:batch_stop] < l0_budget) & (pair_saliency > self.saliency_epsilon)
-                        remaining = l0_budget - features_selected_total[batch_start:batch_stop]
-                        has_pair &= remaining >= 2
-
-                        # If exactly one coordinate remains in the L0 budget,
-                        # use the same derivative sign rules with a vector saliency map.
-                        valid_single_inc = (
-                            available & can_increase & active.unsqueeze(1) & (target_gradient > 0) & (other_gradient < 0)
-                        ) if self.direction in {"auto", "increase"} else torch.zeros_like(available)
-                        valid_single_dec = (
-                            available & can_decrease & active.unsqueeze(1) & (target_gradient < 0) & (other_gradient > 0)
-                        ) if self.direction in {"auto", "decrease"} else torch.zeros_like(available)
-                        single_inc = torch.where(valid_single_inc, target_gradient * (-other_gradient), 0.0)
-                        single_dec = torch.where(valid_single_dec, (-target_gradient) * other_gradient, 0.0)
-                        single_inc_best, single_inc_index = single_inc.max(dim=1)
-                        single_dec_best, single_dec_index = single_dec.max(dim=1)
-                        use_single_decrease = single_dec_best > single_inc_best
-                        single_best = torch.maximum(single_inc_best, single_dec_best)
-                        single_index = torch.where(use_single_decrease, single_dec_index, single_inc_index)
-                        has_single = active & (remaining == 1) & (single_best > self.saliency_epsilon)
-
-                        has_candidate = has_pair | has_single
-                        stalled |= active & ~has_candidate
-                        if not bool(has_candidate.any()):
+                        has_pair = active & (pair_saliency > self.saliency_epsilon)
+                        stalled |= active & ~has_pair
+                        if not bool(has_pair.any()):
                             break
 
                         # Apply the chosen updates. The delta is multiplied by the
@@ -427,16 +405,6 @@ class JSMAAttack(FeatureSpaceAttack):
                                 current_delta[pair_rows, second] += pair_direction
                                 selected[pair_rows, first] = True
                                 selected[pair_rows, second] = True
-                            if bool(has_single.any()):
-                                single_rows = update_rows[has_single]
-                                single_direction = torch.where(
-                                    use_single_decrease[has_single],
-                                    torch.full_like(single_index[has_single], -1, dtype=x0.dtype),
-                                    torch.ones_like(single_index[has_single], dtype=x0.dtype),
-                                ) * float(self.theta)
-                                current_delta[single_rows, single_index[has_single]] += single_direction
-                                selected[single_rows, single_index[has_single]] = True
-
                             current_delta = current_delta * mask_chunk
                             candidate_flat = clean_chunk + current_delta
                             clipped_flat = torch.maximum(torch.minimum(candidate_flat, upper_chunk), lower_chunk)
@@ -446,7 +414,8 @@ class JSMAAttack(FeatureSpaceAttack):
                             adv_chunk = torch.where(selected & mask_chunk, clipped_flat, clean_chunk)
                             current_delta = (adv_chunk - clean_chunk) * mask_chunk
                             adv_chunk = (clean_chunk + current_delta).detach()
-                            features_selected_total[batch_start:batch_stop] = selected.sum(dim=1)
+                            # Algorithm 2 removes a coordinate only on saturation.
+                            saturated |= selected & ((adv_chunk <= lower_chunk) | (adv_chunk >= upper_chunk))
                         logits = logits.detach()
                         scores = scores.detach()
                         current_predictions = current_predictions.detach()
@@ -471,7 +440,7 @@ class JSMAAttack(FeatureSpaceAttack):
                     adv_flat_all[batch_start:batch_stop] = adv_chunk
 
             with torch.no_grad():
-                final_logits = model.forward_differentiable(adversarial)
+                final_logits = model.forward_differentiable(adversarial, valid_mask=kwargs.get("valid_mask"))
                 final_predictions = input_predictions(final_logits)
                 if effective_targeted:
                     assert target_label is not None

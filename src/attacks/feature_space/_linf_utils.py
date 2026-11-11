@@ -115,6 +115,12 @@ def project_linf_delta(
     delta = delta.clamp(min=-float(epsilon), max=float(epsilon)) * mask
     lower = _bound_tensor(clip_min, x0, feature_names, default=-float("inf"))
     upper = _bound_tensor(clip_max, x0, feature_names, default=float("inf"))
+    lower_tensor = torch.as_tensor(lower, device=x0.device, dtype=x0.dtype)
+    upper_tensor = torch.as_tensor(upper, device=x0.device, dtype=x0.dtype)
+    if (torch.isnan(lower_tensor).any() or torch.isnan(upper_tensor).any()
+            or torch.isposinf(lower_tensor).any() or torch.isneginf(upper_tensor).any()
+            or torch.any(lower_tensor > upper_tensor)):
+        raise ValueError("Invalid normalized box: clip_min must be <= clip_max without NaN")
     candidate = torch.clamp(x0 + delta, min=lower, max=upper)
     projected = (candidate - x0) * mask
     # Explicitly retain both properties after projection, including at each BIM step.
