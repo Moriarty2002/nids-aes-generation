@@ -1,6 +1,9 @@
 """DeepRed offline C2 flow modification (Hajizadeh et al., WOOT 2025).
 
-Original: staged learned C2 traffic perturbations and packet-level mapping.
+Original: WOOT25 Fig3/Algorithms1-2 noise-only positive feature replacement GAN.
+Local: BCE means, Adam settings/LeakyReLU slope, two src2dst aggregates and
+standardized discriminator inputs; no auxiliary proxy CE/minimality objective.
+Replacement-to-action rounding/caps are a separate fail-closed NIDS adaptation.
 NIDS adaptation: bounded offline IPv4/UDP PCAP backend with independent
 packet checksum/length checks and authorized training-only surrogate fitting.
 Remaining deviation: not live C2 transmission, TCP or generic protocol wire
@@ -34,7 +37,7 @@ from core.provenance import (authorized_attack_training_indices, trained_generat
 
 
 _NAMES = ("src2dst_bytes", "src2dst_max_ps")
-_FORMAT_VERSION = 2
+_FORMAT_VERSION = 3
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 _MAX_PACKETS_PER_FLOW = 100_000
 
@@ -374,40 +377,23 @@ def _validate_mutation(
         raise ValueError("Actual max packet size fails target objective")
 
 
-class _Surrogate(nn.Module):
-    """Local offline binary classifier; parameters remain frozen during GAN fitting."""
-
-    def __init__(self, width: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(width, 64), nn.ReLU(),
-                                 nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 2))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-
-
 class _Generator(nn.Module):
-    """Context-conditioned positive increments (paper-inspired adaptation).
+    """Fig3: Gaussian noise -> 64/128/256 BN/LeakyReLU -> positive replacements."""
 
-    DeepRed's paper uses dense layers 64/128/256, BN and LeakyReLU. Here the
-    preserved flow context accompanies Gaussian noise; a Softplus *followed
-    by* the monotone map v/(1+v) bounds physical increments in [0, budget).
-    Bounding deltas during learning avoids post-training feature projection.
-    """
-
-    def __init__(self, width: int, latent_dim: int, targets: int) -> None:
+    def __init__(self, latent_dim: int, targets: int) -> None:
         super().__init__()
+        if latent_dim < 1 or targets not in (1, 2):
+            raise ValueError("DeepRed generates one or two primary replacements")
         layers: list[nn.Module] = []
-        current = width + latent_dim
+        current = latent_dim
         for hidden in (64, 128, 256):
             layers += [nn.Linear(current, hidden), nn.BatchNorm1d(hidden), nn.LeakyReLU(0.2)]
             current = hidden
-        layers.append(nn.Linear(current, targets))
+        layers += [nn.Linear(current, targets), nn.Softplus()]
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, context: Tensor, noise: Tensor, budgets: Tensor) -> Tensor:
-        raw = F.softplus(self.layers(torch.cat((context, noise), dim=1)))
-        return budgets * (raw / (1.0 + raw))
+    def forward(self, noise: Tensor) -> Tensor:
+        return self.layers(noise)
 
 
 class _Discriminator(nn.Module):
@@ -430,27 +416,140 @@ def _normalized(x: Tensor, mean: Tensor, std: Tensor) -> Tensor:
     return (x - mean) / std
 
 
-def _create_candidate(x: Tensor, delta: Tensor, indices: tuple[int, ...]) -> Tensor:
-    """Assemble full feature context differentiably without in-place leaf writes."""
-    contributions = torch.zeros_like(x).scatter(1, torch.tensor(
-        indices, device=x.device, dtype=torch.long,
-    ).unsqueeze(0).expand(x.shape[0], -1), delta)
-    return x + contributions
+def _create_candidate(x: Tensor, replacements: Tensor, indices: tuple[int, ...]) -> Tensor:
+    """Fig3 reassembly replaces selected coordinates, with zero old-coordinate gradient."""
+    if (x.ndim != 2 or len(set(indices)) != len(indices) or not 1 <= len(indices) <= 2
+            or any(i < 0 or i >= x.shape[1] for i in indices)
+            or replacements.shape != (len(x), len(indices))
+            or not torch.isfinite(x).all() or not torch.isfinite(replacements).all()
+            or torch.any(replacements <= 0)):
+        raise ValueError("Invalid DeepRed replacement coordinates/values")
+    index = torch.tensor(indices, device=x.device).unsqueeze(0).expand(len(x), -1)
+    return x.scatter(1, index, replacements)
+
+
+def _post_modify(x: Tensor, feature_names: Sequence[str]) -> Tensor:
+    """Algorithm1's explicit byte-sum dependency; unsupported schemas fail closed.
+
+    The production pair has no derived aggregates. Synthetic source equations
+    may include both byte directions and their bidirectional sum, never a new
+    extractor or fabricated packet mapping.
+    """
+    names = tuple(feature_names)
+    supported = {*_NAMES, "dst2src_bytes", "bidirectional_bytes"}
+    if (x.ndim != 2 or x.shape[1] != len(names) or len(set(names)) != len(names)
+            or set(names) - supported or not torch.isfinite(x).all() or torch.any(x < 0)):
+        raise ValueError("Unsupported/nonfinite DeepRed dependency schema")
+    if "bidirectional_bytes" not in names:
+        return x
+    if not {"src2dst_bytes", "dst2src_bytes"}.issubset(names):
+        raise ValueError("Both byte directions are required for bidirectional_bytes")
+    result = x.clone()
+    result[:, names.index("bidirectional_bytes")] = x[:, names.index("src2dst_bytes")] + x[:, names.index("dst2src_bytes")]
+    return result
+
+
+def _discriminator_step(discriminator: nn.Module, optimizer: torch.optim.Optimizer,
+                        benign: Tensor, malicious: Tensor, crafted: Tensor) -> float:
+    discriminator.train()
+    values = [discriminator(batch) for batch in (benign, malicious, crafted.detach())]
+    loss = sum(F.binary_cross_entropy_with_logits(value, torch.full_like(value, label))
+               for value, label in zip(values, (0., 1., 1.), strict=True)) / 3.
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    return float(loss.detach())
+
+
+def _generator_step(generator: nn.Module, discriminator: nn.Module,
+                    optimizer: torch.optim.Optimizer, malicious: Tensor, noise: Tensor,
+                    indices: tuple[int, ...], mean: Tensor, std: Tensor,
+                    feature_names: Sequence[str] = _NAMES) -> float:
+    # Freeze both parameters and buffers, but retain gradients into crafted inputs.
+    flags = [p.requires_grad for p in discriminator.parameters()]
+    training = discriminator.training
+    discriminator.zero_grad(set_to_none=True)
+    discriminator.eval().requires_grad_(False)
+    generator.train()
+    try:
+        crafted = _post_modify(_create_candidate(malicious, generator(noise), indices), feature_names)
+        values = discriminator(_normalized(crafted, mean, std))
+        loss = F.binary_cross_entropy_with_logits(values, torch.zeros_like(values))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        return float(loss.detach())
+    finally:
+        for param, flag in zip(discriminator.parameters(), flags, strict=True):
+            param.requires_grad_(flag)
+        discriminator.train(training)
+
+
+def _gan_population_mask(truth: np.ndarray, oracle: np.ndarray) -> np.ndarray:
+    """Retain known source populations only when the authorized surrogate agrees.
+
+    Ground truth defines TRAIN population membership, not an extra oracle.
+    Incorrectly detected malicious records never become benign D examples.
+    """
+    truth, oracle = np.asarray(truth), np.asarray(oracle)
+    if (truth.ndim != 1 or truth.shape != oracle.shape or truth.dtype.kind not in "iu"
+            or oracle.dtype.kind not in "iu" or np.any(truth < 0) or np.any(oracle < 0)):
+        raise ValueError("Invalid DeepRed source population labels")
+    return (truth != 0) == (oracle != 0)
+
+
+def _fit_gan(physical: np.ndarray, labels: np.ndarray, *, latent_dim: int,
+             indices: tuple[int, ...], epochs: int, batch_size: int,
+             learning_rate: float, seed: int, device: torch.device,
+             feature_names: Sequence[str] = _NAMES) -> tuple[_Generator, np.ndarray, np.ndarray, float, float]:
+    """One D then G update per minibatch; no source/target classifier gradients."""
+    physical = np.asarray(physical)
+    labels = np.asarray(labels)
+    if (physical.dtype != np.float64 or physical.ndim != 2 or len(physical) != len(labels)
+            or not np.isfinite(physical).all() or np.any(physical < 0)
+            or not set(np.unique(labels)).issubset({0, 1}) or batch_size < 2 or epochs < 1
+            or not math.isfinite(learning_rate) or learning_rate <= 0):
+        raise ValueError("Invalid DeepRed training population/settings")
+    bad_ids, good_ids = np.flatnonzero(labels == 1), np.flatnonzero(labels == 0)
+    if len(bad_ids) < 2 or not len(good_ids):
+        raise ValueError("DeepRed requires benign and >=2 malicious TRAIN examples")
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    mean_np, std_np = physical.mean(0), np.maximum(physical.std(0), 1.)
+    data = torch.as_tensor(physical, dtype=torch.float32, device=device)
+    mean = torch.as_tensor(mean_np, dtype=torch.float32, device=device)
+    std = torch.as_tensor(std_np, dtype=torch.float32, device=device)
+    generator = _Generator(latent_dim, len(indices)).to(device)
+    discriminator = _Discriminator(physical.shape[1]).to(device)
+    go = torch.optim.Adam(generator.parameters(), lr=learning_rate)
+    do = torch.optim.Adam(discriminator.parameters(), lr=learning_rate)
+    final_d = final_g = 0.
+    for _ in range(epochs):
+        shuffled = rng.permutation(bad_ids)
+        # Merge a singleton tail so every TRAIN malicious row receives an update.
+        chunks = np.array_split(shuffled, max(1, len(shuffled)//batch_size))
+        for selection in chunks:
+            bad = data[torch.as_tensor(selection, device=device)]
+            good = data[torch.as_tensor(rng.choice(good_ids, len(selection)), device=device)]
+            generator.eval()
+            with torch.no_grad():
+                crafted = _post_modify(_create_candidate(
+                    bad, generator(torch.randn(len(bad), latent_dim, device=device)), indices), feature_names)
+            final_d = _discriminator_step(discriminator, do, _normalized(good, mean, std),
+                                         _normalized(bad, mean, std), _normalized(crafted, mean, std))
+            final_g = _generator_step(generator, discriminator, go, bad,
+                                     torch.randn(len(bad), latent_dim, device=device),
+                                     indices, mean, std, feature_names)
+    return generator.eval(), mean_np, std_np, final_g, final_d
 
 
 @register_attack("deepred")
 class DeepRed(ProblemSpaceAttack):
-    """Offline GAN-guided, topology-audited PCAP attack for controlled NIDS tests.
+    """Source-math replacement GAN with a limited offline src2dst action mapping.
 
-    Training input is a trusted NPZ with:
-      - ``features``: (N, 2) finite nonnegative float64 raw flow measurements;
-      - ``labels``: (N,) integer ground-truth labels, 0 for benign;
-      - ``feature_names``: (2,) strings, exactly in `_NAMES` order;
-      - optional ``oracle_labels``: independent integer labels for surrogate
-        training (otherwise the surrogate learns from local ground truth).
-
-    The file must contain *training-only* examples. The plugin deliberately
-    never queries the bound evaluation target, preventing oracle leakage.
+    Registered TRAIN canonical tensors supply independent surrogate labels.
+    Two separate physical aggregates supply GAN populations; neither is a
+    substitute for the source's eight NFStream features or full C2 semantics.
     """
 
     attack_name = "deepred"
@@ -471,12 +570,8 @@ class DeepRed(ProblemSpaceAttack):
         max_added_packets: int = 4,
         latent_dim: int = 200,
         batch_size: int = 64,
-        surrogate_epochs: int = 30,
         gan_epochs: int = 100,
         learning_rate: float = 2e-4,
-        surrogate_learning_rate: float = 1e-3,
-        lambda_surrogate: float = 1.0,
-        lambda_minimal: float = 0.05,
         seed: int = 42,
         device: str = "cpu",
         config: Mapping[str, Any] | None = None,
@@ -492,13 +587,10 @@ class DeepRed(ProblemSpaceAttack):
             raise ValueError("attacker_ip must be IPv4")
         if not 28 <= mtu <= 65535 or not 1 <= max_added_packets <= 64:
             raise ValueError("Invalid MTU or packet-injection budget")
-        if min(max_delta_bytes, max_delta_max_ps, latent_dim, batch_size,
-               surrogate_epochs, gan_epochs) <= 0:
+        if min(max_delta_bytes, max_delta_max_ps, latent_dim, gan_epochs) <= 0 or batch_size < 2:
             raise ValueError("GAN dimensions, training steps, and budgets must be positive")
-        if min(learning_rate, surrogate_learning_rate) <= 0:
-            raise ValueError("Learning rates must be positive")
-        if min(lambda_surrogate, lambda_minimal) < 0:
-            raise ValueError("Loss weights must be nonnegative")
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("Learning rate must be finite and positive")
         # Hydra may inject training_fraction/feature_names, but these never
         # change on-wire PCAP semantics; ignore only those known adapters.
         unknown = set(extra) - {"training_fraction", "feature_names", "immutable_features", "variant", "target_label"}
@@ -515,12 +607,8 @@ class DeepRed(ProblemSpaceAttack):
         self.max_added_packets = int(max_added_packets)
         self.latent_dim = int(latent_dim)
         self.batch_size = int(batch_size)
-        self.surrogate_epochs = int(surrogate_epochs)
         self.gan_epochs = int(gan_epochs)
         self.learning_rate = float(learning_rate)
-        self.surrogate_learning_rate = float(surrogate_learning_rate)
-        self.lambda_surrogate = float(lambda_surrogate)
-        self.lambda_minimal = float(lambda_minimal)
         self.seed = int(seed)
         self.device = torch.device("cuda" if device == "auto" and torch.cuda.is_available()
                                    else "cpu" if device == "auto" else device)
@@ -542,9 +630,9 @@ class DeepRed(ProblemSpaceAttack):
         """Fit on registered train-only PCAPs using only independent surrogate feedback.
 
         The pretrained authorized surrogate labels raw training flows through
-        the registered six-feature extractor; a small differentiable two-feature
-        proxy approximates that decision for GAN gradients. The frozen target
-        is never loaded, and PCAP aggregate scaling is generator-internal only.
+        canonical six-feature inputs. Their predicted labels define the GAN
+        populations; no target is loaded and no unrepresentable crafted flow
+        is submitted to the canonical surrogate. Aggregate scaling is internal.
         """
         attack_options = config.get("attack", {})
         if not isinstance(attack_options, Mapping):
@@ -603,10 +691,19 @@ class DeepRed(ProblemSpaceAttack):
         _load_checkpoint(source_wrapper, source_path, checkpoint_data=source_meta)
         if frozen_model_state_sha256(source_wrapper) != source_meta['model_state_sha256']:
             raise ValueError('DeepRed independent surrogate learned state mismatch')
-        model_input = np.asarray(norm.normalize(raw[indices]), dtype=np.float32)
+        from core.dual_representation import encode_normalized32
+        from models.wrapper import PyTorchModelWrapper
+        if raw.dtype != np.float64:
+            raise TypeError("DeepRed requires authoritative physical float64")
+        model_input = encode_normalized32(raw[indices], tuple(dataset.feature_names), norm.mean, norm.std)
+        valid = np.asarray(dataset.valid_mask)[indices]
         with ModelQueryMeter(source_wrapper) as query_meter:
-            oracle = np.asarray(source_wrapper.predict(model_input), dtype=np.int64).reshape(-1)
+            oracle = np.asarray(source_wrapper.predict(model_input, valid_mask=valid)
+                                if isinstance(source_wrapper, PyTorchModelWrapper)
+                                else source_wrapper.predict(model_input), dtype=np.int64).reshape(-1)
         oracle_records = int(query_meter.counts.inference_records)
+        if oracle_records != len(indices) or query_meter.counts.gradient_forward_records:
+            raise RuntimeError("DeepRed surrogate cost mismatch")
         del source_wrapper, raw, model_input
         if len(physical) < 4:
             raise ValueError('DeepRed requires at least four authorized training-only flows')
@@ -614,103 +711,15 @@ class DeepRed(ProblemSpaceAttack):
             raise ValueError("Training data must contain finite nonnegative physical measurements")
         if not np.issubdtype(labels.dtype, np.integer) or not np.issubdtype(oracle.dtype, np.integer):
             raise TypeError("Labels and oracle_labels must use integer types")
-        y = (labels.reshape(-1) != 0).astype(np.int64)
-        proxy_y = (oracle.reshape(-1) != 0).astype(np.int64)
-        if len(np.unique(y)) != 2 or np.count_nonzero(y) < 2:
-            raise ValueError("Registered train-only labels must contain both classes and malicious support")
-        # An authorized source model can legitimately predict only one class
-        # on difficult data. Record that limitation; never invent a second
-        # class by substituting test labels or target-oracle responses.
-        mean_np = physical.mean(axis=0)
-        std_np = np.maximum(physical.std(axis=0), 1.0)
-        # Seed everything in the seed-local worker. No target checkpoint needed.
-        torch.manual_seed(int(seed))
-        rng = np.random.default_rng(seed)
-        device = settings.device
-        data = torch.as_tensor(physical, dtype=torch.float32, device=device)
-        mean = torch.as_tensor(mean_np, dtype=torch.float32, device=device)
-        std = torch.as_tensor(std_np, dtype=torch.float32, device=device)
-        normalized = _normalized(data, mean, std)
-        true_labels = torch.as_tensor(y, dtype=torch.long, device=device)
-        oracle_labels = torch.as_tensor(proxy_y, dtype=torch.long, device=device)
-        proxy = _Surrogate(2).to(device)
-        optimizer_proxy = torch.optim.Adam(proxy.parameters(), lr=settings.surrogate_learning_rate)
-        for _ in range(settings.surrogate_epochs):
-            permutation = rng.permutation(len(data))
-            for start in range(0, len(data), settings.batch_size):
-                indices = permutation[start:start + settings.batch_size]
-                index = torch.as_tensor(indices, dtype=torch.long, device=device)
-                logits = proxy(normalized[index])
-                loss = F.cross_entropy(logits, oracle_labels[index])
-                optimizer_proxy.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer_proxy.step()
-        proxy.eval()
-        with torch.inference_mode():
-            surrogate_agreement = float((proxy(normalized).argmax(1) == oracle_labels).float().mean())
-        for param in proxy.parameters():
-            param.requires_grad_(False)
-
-        generator = _Generator(2, settings.latent_dim, len(settings.attack_features)).to(device)
-        discriminator = _Discriminator(2).to(device)
-        optimizer_g = torch.optim.Adam(generator.parameters(), lr=settings.learning_rate)
-        optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=settings.learning_rate)
-        bad_indices = np.flatnonzero(y == 1)
-        good_indices = np.flatnonzero(y == 0)
-        target_indices = tuple(_NAMES.index(name) for name in settings.attack_features)
-        budgets = torch.tensor([
-            settings.max_delta_bytes if index == 0 else settings.max_delta_max_ps
-            for index in target_indices
-        ], dtype=torch.float32, device=device)
-        final_d = final_g = 0.0
-        for epoch in range(settings.gan_epochs):
-            shuffled = rng.permutation(bad_indices)
-            for start in range(0, len(shuffled), settings.batch_size):
-                selection = shuffled[start:start + settings.batch_size]
-                if len(selection) < 2:  # BatchNorm requires at least two examples.
-                    continue
-                bad = data[torch.as_tensor(selection, device=device)]
-                benign_select = rng.choice(good_indices, size=len(selection), replace=True)
-                good = data[torch.as_tensor(benign_select, device=device)]
-                noise = torch.randn(len(selection), settings.latent_dim, device=device)
-                # D sees physically plausible *proposals*, not guaranteed wire
-                # realizations: the online PCAP planner provides the hard proof.
-                proposed_delta = generator(_normalized(bad, mean, std), noise, budgets)
-                crafted = _create_candidate(bad, proposed_delta, target_indices)
-                bad_norm = _normalized(bad, mean, std)
-                real_norm = _normalized(good, mean, std)
-                crafted_norm = _normalized(crafted, mean, std)
-                d_real = discriminator(real_norm)
-                d_bad = discriminator(bad_norm)
-                d_fake = discriminator(crafted_norm.detach())
-                d_loss = (F.binary_cross_entropy_with_logits(d_real, torch.ones_like(d_real))
-                          + F.binary_cross_entropy_with_logits(d_bad, torch.zeros_like(d_bad))
-                          + F.binary_cross_entropy_with_logits(d_fake, torch.zeros_like(d_fake))) / 3.0
-                optimizer_d.zero_grad(set_to_none=True)
-                d_loss.backward()
-                optimizer_d.step()
-                for param in discriminator.parameters():
-                    param.requires_grad_(False)
-                new_noise = torch.randn(len(selection), settings.latent_dim, device=device)
-                new_delta = generator(bad_norm, new_noise, budgets)
-                new_crafted = _normalized(_create_candidate(bad, new_delta, target_indices), mean, std)
-                logits = discriminator(new_crafted)
-                # Benign target is 0; frozen surrogate provides differentiable
-                # guidance independent of the evaluation victim model.
-                g_loss = (F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
-                          + settings.lambda_surrogate * F.cross_entropy(
-                              proxy(new_crafted), torch.zeros(len(selection), dtype=torch.long, device=device)
-                          )
-                          + settings.lambda_minimal * (new_delta / budgets).abs().mean())
-                optimizer_g.zero_grad(set_to_none=True)
-                g_loss.backward()
-                optimizer_g.step()
-                for param in discriminator.parameters():
-                    param.requires_grad_(True)
-                final_g, final_d = float(g_loss.detach()), float(d_loss.detach())
-            if logger and (epoch + 1) % max(1, settings.gan_epochs // 10) == 0:
-                logger.info("deepred.train epoch=%d/%d generator_loss=%.5f discriminator_loss=%.5f",
-                            epoch + 1, settings.gan_epochs, final_g, final_d)
+        if not set(oracle).issubset(set(dataset.class_mapping.values())):
+            raise ValueError("DeepRed surrogate class schema mismatch")
+        y = (oracle != 0).astype(np.int64)
+        population = _gan_population_mask(labels, oracle)
+        generator, mean_np, std_np, final_g, final_d = _fit_gan(
+            physical[population], y[population], latent_dim=settings.latent_dim,
+            indices=tuple(_NAMES.index(name) for name in settings.attack_features),
+            epochs=settings.gan_epochs, batch_size=settings.batch_size,
+            learning_rate=settings.learning_rate, seed=seed, device=settings.device)
 
         destination = Path(settings.checkpoint.format(seed=int(seed)))
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -728,10 +737,15 @@ class DeepRed(ProblemSpaceAttack):
             "latent_dim": settings.latent_dim,
             "max_delta_bytes": settings.max_delta_bytes,
             "max_delta_max_ps": settings.max_delta_max_ps,
-            "mean": mean.cpu().numpy().tolist(),
-            "std": std.cpu().numpy().tolist(),
+            "mean": mean_np.tolist(),
+            "std": std_np.tolist(),
+            "proposal_semantics": "noise_only_positive_replacement_v3",
+            "training_sample_ids": [str(dataset.sample_ids[i]) for i in indices],
+            "gan_training_sample_ids": [str(dataset.sample_ids[i]) for i in indices[population]],
+            "surrogate_inference_costs": [1] * len(indices),
+            "surrogate_gradient_forward_costs": [0] * len(indices),
+            "seed_roles": dict(config.get("seed_roles", {})),
             "generator": {key: val.detach().cpu() for key, val in generator.state_dict().items()},
-            "surrogate": {key: val.detach().cpu() for key, val in proxy.state_dict().items()},
         }
         fd, tmp = tempfile.mkstemp(prefix=".deepred-checkpoint-", suffix=".pt", dir=destination.parent)
         try:
@@ -744,15 +758,17 @@ class DeepRed(ProblemSpaceAttack):
             if os.path.exists(tmp):
                 os.unlink(tmp)
         if logger:
-            logger.info("deepred.train checkpoint=%s count=%d", destination, len(data))
+            logger.info("deepred.train checkpoint=%s count=%d", destination, len(physical))
         return {
-            "deepred_surrogate_training_samples": float(len(data)),
-            "deepred_surrogate_train_agreement": surrogate_agreement,
+            "deepred_surrogate_training_samples": float(len(physical)),
+            "deepred_gan_training_samples": float(population.sum()),
+            "surrogate_training_inference_records": float(oracle_records),
+            "surrogate_training_gradient_forward_records": 0.,
             "deepred_generator_loss": final_g,
             "deepred_discriminator_loss": final_d,
             "deepred_training_epochs": float(settings.gan_epochs),
             "deepred_independent_surrogate_oracle_records": float(oracle_records),
-            "deepred_source_prediction_class_count": float(len(np.unique(proxy_y))),
+            "deepred_source_prediction_class_count": float(len(np.unique(y))),
         }
 
     def _load(self, seed: int) -> None:
@@ -768,6 +784,7 @@ class DeepRed(ProblemSpaceAttack):
         verify_generator_artifact_provenance(checkpoint, getattr(self,'expected_provenance',None))
         if (checkpoint.get("format_version") != _FORMAT_VERSION
                 or checkpoint.get("attack") != "deepred"
+                or checkpoint.get("proposal_semantics") != "noise_only_positive_replacement_v3"
                 or checkpoint.get("seed") != seed
                 or tuple(checkpoint.get("feature_names", ())) != _NAMES
                 or tuple(checkpoint.get("attack_features", ())) != self.attack_features
@@ -775,37 +792,48 @@ class DeepRed(ProblemSpaceAttack):
                 or int(checkpoint.get("max_delta_bytes", -1)) != self.max_delta_bytes
                 or int(checkpoint.get("max_delta_max_ps", -1)) != self.max_delta_max_ps):
             raise ValueError("DeepRed checkpoint schema, budget, or seed mismatch")
-        generator = _Generator(2, self.latent_dim, len(self.attack_features)).to(self.device)
+        ids = checkpoint.get("training_sample_ids", [])
+        if (not ids or len(set(ids)) != len(ids)
+                or checkpoint.get("surrogate_inference_costs") != [1]*len(ids)
+                or checkpoint.get("surrogate_gradient_forward_costs") != [0]*len(ids)
+                or checkpoint.get("authorized_surrogate_inference_records") != len(ids)):
+            raise ValueError("DeepRed training cost/membership schema mismatch")
+        generator = _Generator(self.latent_dim, len(self.attack_features)).to(self.device)
         generator.load_state_dict(checkpoint["generator"], strict=True)
         generator.eval()
         self._mean = torch.tensor(checkpoint["mean"], device=self.device, dtype=torch.float32)
         self._std = torch.tensor(checkpoint["std"], device=self.device, dtype=torch.float32)
-        if self._mean.shape != (2,) or self._std.shape != (2,) or torch.any(self._std <= 0):
+        if (self._mean.shape != (2,) or self._std.shape != (2,)
+                or not torch.isfinite(self._mean).all() or not torch.isfinite(self._std).all()
+                or torch.any(self._std <= 0)):
             raise ValueError("Checkpoint contains invalid training statistics")
         self._generator = generator
         self._loaded_seed = seed
 
     def _delta(self, features: np.ndarray, seed: int) -> np.ndarray:
-        """Generate one bounded positive delta in *physical byte* units."""
+        """Round positive replacement targets, then prove bounded monotone actions."""
         # Checkpoint seed and noise seed are distinct: evaluation batches may
         # offset their RNG seed without changing the trained model identity.
         assert self._generator is not None and self._mean is not None and self._std is not None
-        budgets = torch.tensor([
-            self.max_delta_bytes if name == _NAMES[0] else self.max_delta_max_ps
-            for name in self.attack_features
-        ], dtype=torch.float32, device=self.device)
-        # Torch CPU Generator is independent of other workers' RNG streams.
+        truth = np.asarray(features)
+        if (truth.dtype != np.float64 or truth.shape != (2,) or not np.isfinite(truth).all()
+                or np.any(truth < 0) or np.any(truth != np.floor(truth))):
+            raise ValueError("DeepRed actions require authoritative finite float64 aggregates")
         random = torch.Generator(device="cpu").manual_seed(int(seed))
         noise = torch.randn(1, self.latent_dim, generator=random).to(self.device)
-        context = torch.as_tensor(features, device=self.device, dtype=torch.float32).reshape(1, 2)
         with torch.inference_mode():
-            output = self._generator(_normalized(context, self._mean, self._std),
-                                     noise, budgets).cpu().numpy()[0]
+            replacement = self._generator(noise).cpu().numpy()[0].astype(np.float64)
+        if replacement.shape != (len(self.attack_features),) or not np.isfinite(replacement).all() or np.any(replacement <= 0):
+            raise ValueError("GAN returned invalid positive replacement")
         deltas = np.zeros(2, dtype=np.float64)
-        for i, name in enumerate(self.attack_features):
-            deltas[_NAMES.index(name)] = float(output[i])
-        if not np.isfinite(deltas).all() or np.any(deltas < 0):
-            raise ValueError("GAN returned invalid physical perturbation")
+        for value, name in zip(replacement, self.attack_features, strict=True):
+            index = _NAMES.index(name)
+            delta = math.ceil(float(value)) - truth[index]
+            budget = self.max_delta_bytes if index == 0 else self.max_delta_max_ps
+            if delta <= 0 or delta > budget or (index == 1 and math.ceil(float(value)) > self.mtu):
+                raise ValueError("Replacement cannot satisfy monotone local action bounds")
+            deltas[index] = delta
+        _plan_sizes(truth, deltas, self.attack_features, self.mtu, self.max_added_packets)
         return deltas
 
     def generate_raw(self, traffic: Sequence[str | os.PathLike[str] | PcapFlow],

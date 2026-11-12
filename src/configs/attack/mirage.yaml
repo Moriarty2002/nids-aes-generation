@@ -9,6 +9,8 @@ params:
   max_payload: 1460
   max_history: 16
   time_scale: 1.0
+  # Local discretization; author bins are unavailable. First packet/count and
+  # endpoint times are fixed; next-state IAT is the realized causal interval.
   length_actions: [128, 256, 512, 768, 1024, 1460]
   time_factors: [0.5, 1.0, 2.0]
 training:

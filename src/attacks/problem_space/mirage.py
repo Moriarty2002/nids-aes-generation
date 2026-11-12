@@ -4,8 +4,10 @@ Original: class-specific BiLSTM DQN, encrypted-flow classifier simulator,
 ACK-scoped byte-preserving packet-block redistribution and confidence reward.
 NIDS adaptation: offline mapping-v1 TCP block replay, strict topology checks,
 train-only simulator, no frozen target queries and no wire-level claim.
-Deviation: finite packet-length/timing action grid and malicious-to-benign
-NIDS goal instead of the source's encrypted traffic privacy objective.
+Adaptation: local action discretization, payload rather than whole-packet lengths,
+fixed first packet/count/endpoints and causal anchored timing. Huber/replay, target
+sync, exploration, hidden width and history scaling are local DQN choices.
+The malicious-to-benign NIDS goal differs from the original privacy objective.
 Topology: raw mapping-v1 TCP flows or strict offline classic-PCAP IPv4/TCP
 (complete ACK blocks, valid checksums, no fragments or ambiguous retransmits).
 The global raw-to-canonical extractor and actual network delivery remain deferred.
@@ -35,7 +37,7 @@ from core.registry import DATASETS, register_attack
 from core.provenance import (authorized_attack_training_indices, trained_generator_provenance,
                              verify_generator_artifact_provenance)
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _FORBIDDEN_PACKET_KEYS = frozenset({"wire_bytes", "raw", "checksum", "ip_checksum", "tcp_checksum",
                                    "len", "packet_len", "packet_length", "payload_len",
                                    "payload_length", "ip_len", "total_length",
@@ -287,11 +289,11 @@ def _statistics(flow: Sequence[Mapping[str, Any]]) -> np.ndarray:
     features.extend([
         float(total), float(len(own_ids)), float(len(peer_ids)),
         len(own_ids) / max(1, total),
-        max(0.0, float(flow[-1]["timestamp"]) - float(flow[0]["timestamp"])),
+        max(0.0, float(flow[-1]["timestamp"]) - float(flow[0]["timestamp"])) if total else 0.,
         float(length_groups[0].sum()), float(length_groups[1].sum()),
         float(length_groups[2].sum()),
     ])
-    return np.asarray(features, dtype=np.float32)
+    return np.asarray(features, dtype=np.float64)
 
 
 def _select_twenty(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -339,6 +341,9 @@ class _BiLSTMQ(nn.Module):
 
 
 def _to_batch(histories: Sequence[np.ndarray], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    if not histories or any(np.asarray(s).ndim != 2 or np.asarray(s).shape[1] != 3
+                            or not len(s) or not np.isfinite(s).all() for s in histories):
+        raise ValueError("DQN histories must be nonempty finite (T,3) sequences")
     lengths = torch.tensor([len(s) for s in histories], dtype=torch.int64)
     longest = int(lengths.max().item())
     batch = torch.zeros((len(histories), longest, 3), dtype=torch.float32, device=device)
@@ -349,6 +354,10 @@ def _to_batch(histories: Sequence[np.ndarray], device: torch.device) -> tuple[to
 
 def _encode_state(length: int, dt: float, remaining: int, max_payload: int,
                   time_scale: float, max_history: int, history: list[list[float]]) -> np.ndarray:
+    if (not math.isfinite(dt) or dt < 0 or length < 0 or remaining < 0
+            or max_payload < 1 or not math.isfinite(time_scale) or time_scale <= 0
+            or max_history < 1):
+        raise ValueError("Invalid physical DQN state")
     history.append([length / max_payload,
                     math.log1p(max(0.0, dt)) / max(1e-8, math.log1p(time_scale)),
                     remaining / max_payload])
@@ -367,97 +376,101 @@ def _propose_lengths(total: int, slots_left: int, desired: int,
     return int(max(lower, min(upper, desired)))
 
 
+def _planning_blocks(blocks: Sequence[Sequence[int]], valid_mask: Any = None) -> list[tuple[int, ...]]:
+    limit = 20
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask)
+        if (valid.dtype != np.bool_ or valid.shape != (20,)
+                or not np.array_equal(valid, np.arange(20) < valid.sum())):
+            raise ValueError("Mirage requires an authoritative first-20 prefix mask")
+        limit = int(valid.sum())
+    return [tuple(block) for block in blocks if len(block) >= 2
+            and all(0 <= index < limit for index in block)]
+
+
 def _reconstruct_flow(
     flow: Sequence[Mapping[str, Any]], blocks: Sequence[Sequence[int]],
     qnet: _BiLSTMQ, *, length_actions: tuple[int, ...], time_factors: tuple[float, ...],
     min_payload: int, max_payload: int, max_history: int, time_scale: float,
     rng: random.Random | None = None, explore: float = 0.0,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = torch.device("cpu"), valid_mask: Any = None,
 ) -> tuple[list[dict[str, Any]] | None, list[tuple[np.ndarray, int, np.ndarray, bool]]]:
-    """Construct complete PB candidates transactionally; never edit victim packets.
+    """Eq1-3 next-packet actions; first packet and endpoint/count anchors are local.
 
-    For each PB, sum(payload lengths) and concatenated bytes are invariants.
-    The final segment is the exact residual; earlier choices are clamped to
-    reserve both minimum and maximum capacities of later packets. First/last
-    times anchor the block so that a frozen ACK never moves in time.
+    Causal timing spends only the remaining block span. Later choices never
+    revise a state already observed by the policy. A straddling block is frozen.
     """
-    output: list[dict[str, Any]] = list(flow)  # untouched victim objects remain identical
-    trace: list[tuple[np.ndarray, int, np.ndarray, bool]] = []
-    for block in blocks:
-        if len(block) < 2:
-            return None, []
-        segments = [flow[i]["payload"] for i in block]
-        pooled = b"".join(segments)
-        sizes = [len(p) for p in segments]
+    if (not length_actions or not time_factors or not 0 <= explore <= 1
+            or any(not math.isfinite(f) or f <= 0 for f in time_factors)
+            or any(not min_payload <= length <= max_payload for length in length_actions)):
+        raise ValueError("Invalid Mirage action domain")
+    output = list(flow)
+    trace = []
+    for block in _planning_blocks(blocks, valid_mask):
+        pooled = b"".join(flow[i]["payload"] for i in block)
+        sizes = [len(flow[i]["payload"]) for i in block]
+        times = [float(flow[i]["timestamp"]) for i in block]
         n, total = len(block), len(pooled)
         if not n * min_payload <= total <= n * max_payload:
-            del pooled, segments
             return None, []
-        original_times = [float(flow[i]["timestamp"]) for i in block]
-        original_iats = [max(0.0, original_times[i] - original_times[i-1])
-                         for i in range(1, n)]
-        next_sizes: list[int] = []
-        weights: list[float] = []
-        choices: list[tuple[np.ndarray, int, np.ndarray, bool]] = []
+        gaps = np.diff(np.asarray(times, dtype=np.float64))
+        if not np.isfinite(times).all() or np.any(gaps < 0):
+            return None, []
+        remaining = total - sizes[0]
         history: list[list[float]] = []
-        remaining = total
-        state = _encode_state(sizes[0], 0.0, remaining, max_payload, time_scale,
-                              max_history, history)
-        for i in range(n - 1):
+        state = _encode_state(sizes[0], 0., remaining, max_payload, time_scale, max_history, history)
+        cursor = sizes[0]
+        previous_time = times[0]
+        for i in range(1, n):
             obs, lens = _to_batch([state], device)
             with torch.inference_mode():
-                quality = qnet(obs, lens)[0]
-                action = int(torch.argmax(quality).item())
-            del obs, lens, quality
+                quality = qnet(obs, lens)
+            if quality.shape != (1, len(length_actions)*len(time_factors)) or not torch.isfinite(quality).all():
+                raise ValueError("Invalid Mirage Q action vector")
+            action = int(quality[0].argmax().item())
             if rng is not None and rng.random() < explore:
-                action = rng.randrange(len(length_actions) * len(time_factors))
+                action = rng.randrange(len(length_actions)*len(time_factors))
             length_index, time_index = divmod(action, len(time_factors))
-            proposed = _propose_lengths(total=remaining,
-                                        slots_left=n-i, desired=length_actions[length_index],
-                                        minimum=min_payload, maximum=max_payload)
-            if proposed is None:
-                del pooled, segments
+            length = _propose_lengths(remaining, n-i, length_actions[length_index], min_payload, max_payload)
+            if length is None:
                 return None, []
-            next_sizes.append(proposed)
-            remaining -= proposed
-            weights.append(max(1e-9, original_iats[i]) * time_factors[time_index])
-            next_state = _encode_state(proposed, original_iats[i], remaining,
-                                       max_payload, time_scale, max_history, history)
-            choices.append((state, action, next_state, i == n - 2))
-            state = next_state
-        if not min_payload <= remaining <= max_payload:
-            del pooled, segments
-            return None, []
-        next_sizes.append(remaining)
-        span = original_times[-1] - original_times[0]
-        weight_sum = sum(weights)
-        proposed_times = [original_times[0]]
-        partial = 0.0
-        for weight in weights[:-1]:
-            partial += weight
-            proposed_times.append(original_times[0] + span * partial / weight_sum)
-        proposed_times.append(original_times[-1])
-
-        cursor = 0
-        start_seq = int(flow[block[0]]["seq"])
-        for i, length, timestamp in zip(block, next_sizes, proposed_times):
-            packet = dict(flow[i])
-            payload = pooled[cursor:cursor + length]
-            if len(payload) != length:
-                del pooled, segments
-                return None, []
-            packet["payload"] = payload
-            packet["seq"] = (start_seq + cursor) % (2**32)
-            packet["timestamp"] = timestamp
-            output[i] = packet
+            factor = time_factors[time_index]
+            if i == n-1:
+                timestamp = times[-1]
+            elif factor == 1. and previous_time == times[i-1]:
+                timestamp = times[i]
+            else:
+                weight = float(gaps[i-1]) * factor
+                future = float(gaps[i:].sum())
+                denominator = weight + future
+                if not math.isfinite(denominator):
+                    raise ValueError("Nonfinite Mirage timing weight")
+                dt = (times[-1]-previous_time)*(weight/denominator) if denominator else 0.
+                timestamp = previous_time + dt
+            packet = dict(flow[block[i]])
+            packet.update(payload=pooled[cursor:cursor+length],
+                          seq=(int(flow[block[0]]["seq"])+cursor) % 2**32,
+                          timestamp=timestamp)
+            output[block[i]] = packet
             cursor += length
-        if cursor != total:
-            del pooled, segments
+            remaining -= length
+            future_state = _encode_state(length, timestamp-previous_time, remaining,
+                                         max_payload, time_scale, max_history, history)
+            trace.append((state, action, future_state, i == n-1))
+            state, previous_time = future_state, timestamp
+        if cursor != total or remaining:
             return None, []
-        trace.extend(choices)
-        del pooled, segments, sizes, next_sizes, weights, choices
-
     return output, trace
+
+
+def _rewarded_transitions(flow: Sequence[Mapping[str, Any]], blocks: Sequence[Sequence[int]],
+                         trace: Sequence[tuple], reward: Any) -> list[tuple]:
+    """Eq3/5 score reconstructed prefixes; each PB terminates its own episode."""
+    endpoints = [index+1 for block in blocks for index in block[1:]]
+    if len(endpoints) != len(trace):
+        raise ValueError("Mirage replay/prefix trajectory mismatch")
+    return [(state, action, reward(flow[:end]), future, bool(done))
+            for end, (state, action, future, done) in zip(endpoints, trace, strict=True)]
 
 
 def _topology_verified(original: Sequence[Mapping[str, Any]], changed: Sequence[Mapping[str, Any]],
@@ -488,16 +501,27 @@ def _topology_verified(original: Sequence[Mapping[str, Any]], changed: Sequence[
 
 def _transform_statistics(values: np.ndarray, selected: Sequence[int],
                           mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    x = np.log1p(np.maximum(values[np.asarray(selected, dtype=np.int64)], 0.0))
+    values, mean, scale = np.asarray(values), np.asarray(mean), np.asarray(scale)
+    selected = np.asarray(selected)
+    if (values.shape != (len(_STAT_NAMES),) or not np.isfinite(values).all() or np.any(values < 0)
+            or selected.shape != (20,) or selected.dtype.kind not in "iu"
+            or len(np.unique(selected)) != 20 or np.any(selected < 0) or np.any(selected >= len(values))
+            or mean.shape != (20,) or scale.shape != (20,)
+            or not np.isfinite(mean).all() or not np.isfinite(scale).all() or np.any(scale <= 0)):
+        raise ValueError("Invalid simulator selected-feature transform")
+    x = np.log1p(values[selected].astype(np.float64))
     return np.asarray((x - mean) / scale, dtype=np.float32)
 
 
 def _fit_simulator(x: np.ndarray, y: np.ndarray, selected: np.ndarray, labels: list[int],
                    *, epochs: int, batch_size: int, lr: float, seed: int) -> tuple[_Simulator, np.ndarray, np.ndarray, float]:
-    indexed = np.log1p(np.maximum(x[:, selected], 0.0)).astype(np.float32)
+    if (epochs < 1 or batch_size < 1 or not math.isfinite(lr) or lr <= 0
+            or not np.isfinite(x).all() or len(labels) < 2 or len(set(labels)) != len(labels)):
+        raise ValueError("Invalid simulator training domain")
+    indexed = np.log1p(np.maximum(x[:, selected], 0.0)).astype(np.float64)
     mean, std = indexed.mean(axis=0), indexed.std(axis=0)
     std = np.maximum(std, 1e-6)
-    indexed = (indexed - mean) / std
+    indexed = np.asarray((indexed - mean) / std, dtype=np.float32)
     mapping = {label: i for i, label in enumerate(labels)}
     targets = np.asarray([mapping[int(v)] for v in y], dtype=np.int64)
     net = _Simulator(len(labels))
@@ -520,9 +544,16 @@ def _fit_simulator(x: np.ndarray, y: np.ndarray, selected: np.ndarray, labels: l
             logits = net(torch.from_numpy(indexed[start:start+batch_size]))
             correct += int((logits.argmax(dim=1).numpy() == targets[start:start+batch_size]).sum())
             del logits
+    net.requires_grad_(False)
     accuracy = correct / max(1, len(x))
     del indexed, targets
     return net, mean, std, float(accuracy)
+
+
+def _confidence_reward(probability: float) -> float:
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise ValueError("Simulator probability must lie in [0,1]")
+    return 2.0 / (1.0 + math.exp(1.0 - probability)) - 1.0
 
 
 def _reward(simulator: _Simulator, flow: Sequence[Mapping[str, Any]], target_col: int,
@@ -533,11 +564,13 @@ def _reward(simulator: _Simulator, flow: Sequence[Mapping[str, Any]], target_col
         probability = float(simulator(torch.from_numpy(scaled).view(1, -1)).softmax(-1)[0, target_col].item())
     del features, scaled
     # Paper Eq. (5): reward is in [2/(1+e)-1, 0], increasing in target confidence.
-    return 2.0 / (1.0 + math.exp(1.0 - probability)) - 1.0
+    return _confidence_reward(probability)
 
 
 def _dqn_update(online: _BiLSTMQ, target: _BiLSTMQ, optimizer: torch.optim.Optimizer,
                 replay: deque, rng: random.Random, batch_size: int, gamma: float) -> float:
+    if not replay or batch_size < 1 or not math.isfinite(gamma) or not 0 <= gamma < 1:
+        raise ValueError("Invalid Bellman replay settings")
     examples = rng.sample(list(replay), min(batch_size, len(replay)))
     states, actions, rewards, next_states, terminals = zip(*examples)
     values, lengths = _to_batch(states, torch.device("cpu"))
@@ -556,6 +589,47 @@ def _dqn_update(online: _BiLSTMQ, target: _BiLSTMQ, optimizer: torch.optim.Optim
     result = float(loss.item())
     del examples, values, lengths, future, future_lengths, chosen, rhs, loss
     return result
+
+
+def _surrogate_labels(dataset: Any, physical: np.ndarray, indices: Sequence[int],
+                      config: Mapping[str, Any], seed: int) -> tuple[np.ndarray, np.ndarray]:
+    from workflow.factory import _build_model
+    from workflow.io import _load_checkpoint, _load_checkpoint_metadata, _normalization_from_checkpoint
+    from workflow.seeds import role_seed
+    from core.dual_representation import encode_normalized32
+    from core.provenance import frozen_model_state_sha256
+    from core.query_meter import ModelQueryMeter
+    from models.wrapper import PyTorchModelWrapper
+
+    source = dict(config.get("surrogate_model") or {})
+    if not source.get("enabled", True) or not source.get("checkpoint"):
+        raise ValueError("Mirage requires an independently pretrained surrogate")
+    source_seed = role_seed(config, "surrogate", seed)
+    path = Path(str(source["checkpoint"]).format(seed=source_seed))
+    meta = _load_checkpoint_metadata(path)
+    if tuple(meta["input_shape"]) != tuple(physical.shape[1:]) or physical.dtype != np.float64:
+        raise ValueError("Mirage surrogate physical topology/dtype mismatch")
+    norm = _normalization_from_checkpoint(meta, tuple(dataset.feature_names), role="Mirage surrogate")
+    wrapper = _build_model(source, physical.shape, device=torch.device("cpu"),
+                           num_classes=int(meta["num_classes"]), seed=source_seed)
+    _load_checkpoint(wrapper, path, checkpoint_data=meta)
+    if frozen_model_state_sha256(wrapper) != meta["model_state_sha256"]:
+        raise ValueError("Mirage surrogate learned state mismatch")
+    valid = np.asarray(dataset.valid_mask)[list(indices)]
+    inputs = encode_normalized32(physical[list(indices)], tuple(dataset.feature_names), norm.mean, norm.std)
+    labels, costs = [], np.zeros(len(indices), dtype=np.int64)
+    with ModelQueryMeter(wrapper) as meter:
+        for start in range(0, len(indices), 64):
+            stop = min(start+64, len(indices))
+            prediction = (wrapper.predict(inputs[start:stop], valid_mask=valid[start:stop])
+                          if isinstance(wrapper, PyTorchModelWrapper) else wrapper.predict(inputs[start:stop]))
+            labels.extend(np.asarray(prediction, dtype=np.int64).tolist())
+            costs[start:stop] += 1
+    if meter.counts.inference_records != int(costs.sum()) or meter.counts.gradient_forward_records:
+        raise RuntimeError("Mirage surrogate cost mismatch")
+    if not set(labels).issubset(set(dataset.class_mapping.values())):
+        raise ValueError("Mirage surrogate class schema mismatch")
+    return np.asarray(labels, dtype=np.int64), costs
 
 
 @register_attack("mirage")
@@ -588,7 +662,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         self.length_actions = tuple(int(x) for x in length_actions)
         self.time_factors = tuple(float(x) for x in time_factors)
         if (self.min_payload < 1 or self.max_payload < self.min_payload or self.max_history < 1
-                or self.time_scale <= 0 or not self.length_actions or not self.time_factors
+                or not math.isfinite(self.time_scale) or self.time_scale <= 0 or not self.length_actions or not self.time_factors
                 or any(x < self.min_payload or x > self.max_payload for x in self.length_actions)
                 or any(not math.isfinite(x) or x <= 0 for x in self.time_factors)):
             raise ValueError("Invalid MIRAGE payload/time/action constraints")
@@ -604,8 +678,20 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
             raise FileNotFoundError(f"MIRAGE checkpoint missing: {path}; first run train_attack")
         data = torch.load(path, map_location="cpu", weights_only=True)
         verify_generator_artifact_provenance(data, getattr(self, 'expected_provenance', None))
-        if data.get("attack_name") != self.attack_name or data.get("format_version") != _FORMAT_VERSION:
-            raise ValueError("Unsupported MIRAGE composite checkpoint")
+        if (data.get("attack_name") != self.attack_name or data.get("format_version") != _FORMAT_VERSION
+                or data.get("seed") != seed
+                or data.get("action_semantics") != "next_packet_local_discretization_causal_anchored_v2"):
+            raise ValueError("Unsupported MIRAGE composite checkpoint/seed/semantics")
+        classes = sorted(int(v) for v in data["artifact_provenance"]["class_mapping"].values())
+        ids = data.get("training_sample_ids", [])
+        if (data.get("simulator_labels") != classes
+                or set(data.get("q_networks", {})) != {str(v) for v in classes}
+                or not ids or len(set(ids)) != len(ids)
+                or data.get("surrogate_inference_costs") != [1]*len(ids)
+                or data.get("surrogate_gradient_forward_costs") != [0]*len(ids)):
+            raise ValueError("MIRAGE class/training-cost schema mismatch")
+        _transform_statistics(np.zeros(len(_STAT_NAMES)), np.asarray(data["selected_indices"]),
+                              np.asarray(data["simulator_mean"]), np.asarray(data["simulator_std"]))
         for name in ("min_payload", "max_payload", "max_history", "time_scale"):
             if data[name] != getattr(self, name):
                 raise ValueError(f"MIRAGE checkpoint constraint mismatch: {name}")
@@ -670,6 +756,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                         time_factors=self.time_factors, min_payload=self.min_payload,
                         max_payload=self.max_payload, max_history=self.max_history,
                         time_scale=self.time_scale, device=self.device,
+                        valid_mask=None if kwargs.get("valid_mask") is None else kwargs["valid_mask"][i],
                     )
                     if constructed is not None and _topology_verified(
                             flow, constructed, blocks, self.min_payload, self.max_payload):
@@ -707,11 +794,9 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
               logger: Any = None) -> Mapping[str, float]:
         """Deterministic, decoupled E -> DQN pipeline on raw training-only flows.
 
-        Phase A selects 20 statistical features on the *raw* packet dataset,
-        then fits E. Phase B freezes E, trains one Bellman Q-network per
-        destination class using episodes over offline flows, and serializes
-        every model into a single state-only .pt checkpoint. No target NIDS
-        queries/gradients are used, preserving independent benchmark scoring.
+        TRAIN-only statistical features teach E from registered pretrained
+        surrogate labels. Frozen E supplies Eq5 prefix rewards to separate
+        class Q policies. No evaluation target is loaded or queried.
         """
         del gpu  # CPU is deliberate: repeatable BiLSTM behavior across workers.
         torch.manual_seed(seed)
@@ -733,7 +818,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         dataset = DATASETS.get(str(dataset_cfg["name"]))(**dict(dataset_cfg.get("params", {})))
         raw_features, raw_labels = dataset.raw_arrays()
         raw_features_shape = raw_features.shape[1:]
-        del raw_features  # never retain a second corpus-sized feature tensor
+
         labels = np.asarray(raw_labels, dtype=np.int64).reshape(-1)
         raw_flows = getattr(dataset, "raw_traffic", None)
         if raw_flows is None or len(raw_flows) != len(labels):
@@ -754,7 +839,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         if len(indices) > cap:
             indices = np.sort(rng.choice(indices, size=cap, replace=False))
         accepted_flows: list[Any] = []
-        accepted_labels: list[int] = []
+        accepted_indices: list[int] = []
         stats: list[np.ndarray] = []
         from attacks.problem_space.deepred import PcapFlow, _read_pcap
         for idx in indices:
@@ -765,13 +850,15 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
             if _parse_blocks(flow, defaults.min_payload, defaults.max_payload) is None:
                 continue
             accepted_flows.append(flow)
-            accepted_labels.append(int(labels[idx]))
-            stats.append(_statistics(flow))
-        if len(stats) < 2 or len(set(accepted_labels)) < 2:
-            raise ValueError("Insufficient ACK-anchored training flows across >=2 classes")
+            accepted_indices.append(int(idx))
+            limit = min(20, int(np.asarray(dataset.valid_mask)[idx].sum()))
+            stats.append(_statistics(flow[:limit]))
+        if len(stats) < 2:
+            raise ValueError("Insufficient ACK-anchored training flows")
+        y, inference_costs = _surrogate_labels(dataset, raw_features, accepted_indices, config, seed)
+        del raw_features
         x = np.stack(stats, axis=0)
-        y = np.asarray(accepted_labels, dtype=np.int64)
-        observed_labels = sorted(int(v) for v in np.unique(y))
+        observed_labels = sorted(int(v) for v in dataset.class_mapping.values())
         selected = _select_twenty(x, y)
         simulator, mean, std, sim_accuracy = _fit_simulator(
             x, y, selected, observed_labels,
@@ -785,6 +872,7 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         n_actions = len(defaults.length_actions) * len(defaults.time_factors)
         q_states: dict[str, dict[str, torch.Tensor]] = {}
         losses: list[float] = []
+        simulator_costs = np.zeros(len(accepted_indices), dtype=np.int64)
         episodes = int(training.get("episodes_per_class", 128))
         replay_cap = int(training.get("replay_capacity", 2048))
         batch_size = int(training.get("dqn_batch_size", 16))
@@ -805,6 +893,8 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                 flow = accepted_flows[index]
                 blocks = _parse_blocks(flow, defaults.min_payload, defaults.max_payload)
                 assert blocks is not None
+                valid = np.asarray(dataset.valid_mask)[accepted_indices[index]]
+                blocks = _planning_blocks(blocks, valid)
                 epsilon = max(float(training.get("epsilon_final", 0.05)),
                               float(training.get("epsilon_initial", 0.3)) * (1.0 - episode / episodes))
                 online.eval()
@@ -816,12 +906,12 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
                         time_scale=defaults.time_scale, rng=episode_rng, explore=epsilon,
                     )
                 if changed is not None and trace and _topology_verified(
-                        flow, changed, blocks, defaults.min_payload, defaults.max_payload):
-                    score = _reward(simulator, changed, target_column, selected, mean, std)
-                    # Only the completed, physically conserved episode earns E's reward.
-                    for j, (s, action, s_next, done) in enumerate(trace):
-                        replay.append((s, action, score if j == len(trace)-1 else 0.0,
-                                       s_next, float(j == len(trace)-1)))
+                        flow, changed, _parse_blocks(flow, defaults.min_payload, defaults.max_payload),
+                        defaults.min_payload, defaults.max_payload):
+                    replay.extend(_rewarded_transitions(
+                        changed, blocks, trace,
+                        lambda prefix: _reward(simulator, prefix, target_column, selected, mean, std)))
+                    simulator_costs[index] += len(trace)
                 del changed, trace
                 if len(replay) >= batch_size:
                     online.train()
@@ -854,6 +944,12 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
             "simulator_state": {k: v.detach().cpu().clone()
                                 for k, v in simulator.state_dict().items()},
             "q_networks": q_states,
+            "action_semantics": "next_packet_local_discretization_causal_anchored_v2",
+            "training_sample_ids": [str(dataset.sample_ids[i]) for i in accepted_indices],
+            "surrogate_inference_costs": inference_costs.tolist(),
+            "simulator_reward_inference_costs": simulator_costs.tolist(),
+            "surrogate_gradient_forward_costs": [0] * len(accepted_indices),
+            "seed_roles": dict(config.get("seed_roles", {})),
         }
         checkpoint_template = settings.get("checkpoint") or str(
             Path(str(config.get("output_dir", "runs"))) / "checkpoints" / "mirage_seed{seed}.pt")
@@ -869,9 +965,12 @@ class MirageProblemSpaceAttack(ProblemSpaceAttack):
         metrics = {"mirage_train_flows": float(len(accepted_flows)),
                    "mirage_trained_classes": float(len(q_states)),
                    "mirage_simulator_accuracy": sim_accuracy,
+                   "surrogate_training_inference_records": float(inference_costs.sum()),
+                   "surrogate_training_gradient_forward_records": 0.,
+                   "mirage_simulator_reward_inference_records": float(simulator_costs.sum()),
                    "mirage_mean_dqn_loss": float(np.mean(losses)) if losses else 0.0}
         if logger:
             logger.info("mirage.train checkpoint=%s metrics=%s", path, metrics)
-        del accepted_flows, accepted_labels, simulator, q_states, payload
+        del accepted_flows, accepted_indices, simulator, q_states, payload
         gc.collect()
         return metrics

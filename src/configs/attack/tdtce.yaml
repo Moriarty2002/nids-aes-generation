@@ -32,4 +32,4 @@ mahalanobis_ridge: 1e-3
 gradient_clip_norm: 1.0
 # The evaluation workflow formats {seed} when it constructs the attack.
 checkpoint: "${experiment_dir}/checkpoints/generators/${attack.name}/${attack.variant}/seed{seed}.pt"
-variant: "pktGI_n${.num_blocks}_p${.patch_size}_t${.timesteps}_z${.latent_dim}_r${.weight_rec}_k${.weight_kl}_a${.weight_adv}_q${.weight_pre}_m${.weight_mahal}"
+variant: "pktGI_v3_gru_records_n${.num_blocks}_p${.patch_size}_t${.timesteps}_z${.latent_dim}_r${.weight_rec}_k${.weight_kl}_a${.weight_adv}_q${.weight_pre}_m${.weight_mahal}"

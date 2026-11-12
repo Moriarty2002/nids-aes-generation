@@ -5,7 +5,9 @@ Original: adversarial classification loss plus α-weighted GAN realism and
 Mandatory NIDS adaptation: authorized independently trained surrogate,
 fixed T=20 masks, strict physical finalizer/budget gate and no target oracle.
 Source experiment: Table 3 reports 800 training epochs on CICIDS/NSL-KDD;
-other architecture and loss-setting values remain declared native choices.
+Table-3 alpha/beta and Adam settings are retained. Architecture, packet batch
+size and critic cadence are local choices. E2 clips to TRAIN class ranges;
+Eq8 remains a soft hinge, with independent final-budget acceptance.
 Transfer access is not the paper's direct-query case; 800 is not a
 demonstrated CICIoMT-optimal value. Research YAML is authoritative and
 smoke budget may override epochs to one for CPU tests.
@@ -24,7 +26,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 
 from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import DATASETS, register_attack
@@ -66,18 +68,6 @@ class _Critic(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x.reshape(x.shape[0], -1)).reshape(-1)
-
-
-def _radially_bounded(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """Scale each sample onto/inside the L2 ball, never clip any feature.
-
-    Unlike the hinge penalty (a soft constraint), this guarantees a hard L2
-    bound on the *masked* perturbation during both training and inference.
-    The scale factor is in (0, 1]; a zero perturbation remains exactly zero.
-    """
-    norm = torch.linalg.vector_norm(delta.reshape(delta.shape[0], -1), ord=2, dim=1)
-    factor = (epsilon / norm.clamp_min(torch.finfo(delta.dtype).tiny)).clamp(max=1.0)
-    return delta * factor.reshape((-1,) + (1,) * (delta.ndim - 1))
 
 
 def _gradient_penalty(
@@ -145,6 +135,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
     checkpoint: str = "checkpoints/nids_gan/seed_{seed}.pt"
     surrogate_requires_flatten: bool | None = None
 
+    _class_bounds: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict, init=False, repr=False)
     _generator: _Generator | None = field(default=None, init=False, repr=False)
     _loaded_seed: int | None = field(default=None, init=False, repr=False)
     _input_shape: tuple[int, ...] | None = field(default=None, init=False, repr=False)
@@ -240,6 +231,14 @@ class NIDSGANAttack(FeatureSpaceAttack):
             raise TypeError("Surrogate must return class logits with shape (B, C)")
         return logits
 
+    def _constrained_candidate(self, x: torch.Tensor, delta: torch.Tensor,
+                               mask: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Eq4 E1 then source E2; the L2 hinge is not a radial projection."""
+        proposal = x + delta * mask
+        lower = torch.stack([self._class_bounds[int(label)][0].to(x) for label in labels])
+        upper = torch.stack([self._class_bounds[int(label)][1].to(x) for label in labels])
+        return torch.where(mask.bool(), torch.maximum(torch.minimum(proposal, upper), lower), x)
+
     def _critic_step(
         self,
         generator: _Generator,
@@ -247,12 +246,14 @@ class NIDSGANAttack(FeatureSpaceAttack):
         optimizer: torch.optim.Optimizer,
         x: torch.Tensor,
         mask: torch.Tensor,
+        labels: torch.Tensor,
     ) -> torch.Tensor:
         """Train only the critic; the fake branch contains no generator graph."""
+        critic.requires_grad_(True)
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             masked = generator(x) * mask
-            fake = x + _radially_bounded(masked, self.epsilon)
+            fake = self._constrained_candidate(x, masked, mask, labels)
         real_scores = critic(x)
         fake_scores = critic(fake)
         gp = _gradient_penalty(critic, x.detach(), fake.detach())
@@ -271,20 +272,23 @@ class NIDSGANAttack(FeatureSpaceAttack):
         x: torch.Tensor,
         mask: torch.Tensor,
         valid_mask: torch.Tensor | None,
+        labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint targeted CE + Wasserstein fooling + masked L2 hinge loss."""
+        critic.requires_grad_(False)
+        critic.zero_grad(set_to_none=True)
         optimizer.zero_grad(set_to_none=True)
         raw_delta = generator(x)
         masked_delta = raw_delta * mask
         norms = torch.linalg.vector_norm(masked_delta.reshape(len(x), -1), ord=2, dim=1)
         perturbation_loss = F.relu(norms - self.epsilon).mean()
-        bounded_delta = _radially_bounded(masked_delta, self.epsilon)
-        adversarial = x + bounded_delta
+        adversarial = self._constrained_candidate(x, masked_delta, mask, labels)
         logits = self._surrogate_logits(adversarial, valid_mask)
         target = torch.full(
             (len(x),), self.target_label, dtype=torch.long, device=x.device,
         )
-        adversarial_loss = F.cross_entropy(logits, target)
+        adversarial_loss = (F.binary_cross_entropy_with_logits(logits.reshape(-1), target.to(logits.dtype))
+                            if logits.shape[-1] == 1 else F.cross_entropy(logits, target))
         wgan_loss = -critic(adversarial).mean()
         total = adversarial_loss + self.alpha * wgan_loss + self.beta * perturbation_loss
         total.backward()
@@ -293,7 +297,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
             total.detach(), adversarial_loss.detach(),
             wgan_loss.detach(), perturbation_loss.detach(),
         )
-        del raw_delta, masked_delta, norms, bounded_delta, adversarial
+        del raw_delta, masked_delta, norms, adversarial
         del logits, target, adversarial_loss, wgan_loss, perturbation_loss, total
         return metrics
 
@@ -382,6 +386,8 @@ class NIDSGANAttack(FeatureSpaceAttack):
             raise TypeError('NIDSGAN requires original pre-normalization float64 features')
         # Encode only permitted training records, never test/validation data.
         x_physical = x_physical[malicious_indices]
+        training_ids = [str(dataset.sample_ids[i]) for i in malicious_indices]
+        training_labels = labels[malicious_indices].copy()
         normalized = encode_normalized32(x_physical, feature_names, normalization.mean, normalization.std)
         x_tensor = torch.from_numpy(np.ascontiguousarray(normalized))
         valid = getattr(dataset, "valid_mask", None)
@@ -389,13 +395,38 @@ class NIDSGANAttack(FeatureSpaceAttack):
         if valid_tensor is not None:
             if valid_tensor.shape[0] != len(x_tensor) or valid_tensor.ndim != 2:
                 raise ValueError("dataset.valid_mask must be a (N,T) packet mask")
-            training_samples = TensorDataset(x_tensor, valid_tensor)
+            training_samples = TensorDataset(x_tensor, torch.from_numpy(training_labels), torch.arange(len(x_tensor)), valid_tensor)
         else:
-            training_samples = TensorDataset(x_tensor)
+            training_samples = TensorDataset(x_tensor, torch.from_numpy(training_labels), torch.arange(len(x_tensor)))
         attack_params = cls._configured_parameters(cfg)
         attack_params["feature_names"] = feature_names
         attack_params["surrogate_requires_flatten"] = _model_requires_flatten(surrogate_cfg)
         attack = cls(**attack_params)
+        packet_truth = x_physical.reshape(len(x_physical), -1, len(feature_names))
+        if valid_tensor is None:
+            raise ValueError('NIDSGAN requires authoritative packet occupancy')
+        if packet_truth.shape[1] > 20:
+            raise ValueError('NIDSGAN supports the first 20 packets')
+        class_bounds = {}
+        for label in np.unique(training_labels):
+            selected = training_labels == label
+            observations = packet_truth[selected][np.asarray(valid)[malicious_indices][selected]]
+            if not len(observations):
+                raise ValueError('NIDSGAN class lacks real TRAIN packet support')
+            lower, upper = observations.min(0), observations.max(0)
+            for j, name in enumerate(feature_names):
+                if name in attack.clip_ranges:
+                    lo, hi = map(float, attack.clip_ranges[name])
+                    if not np.isfinite([lo, hi]).all() or lo > hi:
+                        raise ValueError('Invalid declared physical range')
+                    lower[j], upper[j] = max(lower[j], lo), min(upper[j], hi)
+            if not np.isfinite([lower, upper]).all() or np.any(lower > upper):
+                raise ValueError('Empty or nonfinite class/physical range intersection')
+            def encode_bound(bound):
+                physical = np.broadcast_to(bound, packet_truth[:1].shape).copy().reshape(x_physical[:1].shape)
+                return torch.from_numpy(encode_normalized32(physical, feature_names, normalization.mean, normalization.std)[0])
+            class_bounds[int(label)] = (encode_bound(lower), encode_bound(upper))
+        attack._class_bounds = class_bounds
         num_classes = int(surrogate_metadata["num_classes"])
         if not 0 <= attack.target_label < num_classes:
             raise ValueError("NIDSGAN target_label is outside surrogate class indices")
@@ -458,12 +489,17 @@ class NIDSGANAttack(FeatureSpaceAttack):
         aggregate = {"loss": 0.0, "adversarial_loss": 0.0,
                      "wgan_loss": 0.0, "perturbation_loss": 0.0, "critic_loss": 0.0}
         steps = 0
+        gradient_costs = np.zeros(len(x_tensor), dtype=np.int64)
+        inference_costs = np.zeros(len(x_tensor), dtype=np.int64)
+        completed_epochs = 0
         for _epoch in range(attack.epochs):
             generator.train()
             critic.train()
             for sample in training_loader:
                 x = sample[0].to(device=device, dtype=torch.float32, non_blocking=True)
-                batch_valid = None if len(sample) == 1 else sample[1].to(device, non_blocking=True)
+                batch_labels = sample[1].to(device)
+                record_indices = sample[2].numpy()
+                batch_valid = None if len(sample) == 3 else sample[3].to(device, non_blocking=True)
                 mask = attack._mask(
                     x, feature_names,
                     normalization_mean=normalization.mean,
@@ -473,11 +509,11 @@ class NIDSGANAttack(FeatureSpaceAttack):
                 critic.requires_grad_(True)
                 for _ in range(attack.critic_steps):
                     critic_value = attack._critic_step(
-                        generator, critic, critic_optimizer, x, mask,
+                        generator, critic, critic_optimizer, x, mask, batch_labels,
                     )
                 critic.requires_grad_(False)
                 losses = attack._generator_step(
-                    generator, critic, generator_optimizer, x, mask, batch_valid,
+                    generator, critic, generator_optimizer, x, mask, batch_valid, batch_labels,
                 )
                 for name, value in zip(
                     ("loss", "adversarial_loss", "wgan_loss", "perturbation_loss"),
@@ -486,11 +522,30 @@ class NIDSGANAttack(FeatureSpaceAttack):
                     aggregate[name] += float(value.item())
                 aggregate["critic_loss"] += float(critic_value.item())
                 steps += 1
+                gradient_costs[record_indices] += 1
                 # Keep no live graph, logits or batch on the attack object.
                 del x, batch_valid, mask, critic_value, losses, sample
                 generator_optimizer.zero_grad(set_to_none=True)
                 critic_optimizer.zero_grad(set_to_none=True)
             critic.requires_grad_(True)
+
+            completed_epochs += 1
+            all_success = True
+            with torch.no_grad():
+                for start in range(0, len(x_tensor), attack.batch_size):
+                    stop = min(start + attack.batch_size, len(x_tensor))
+                    clean = x_tensor[start:stop].to(device)
+                    occupancy = valid_tensor[start:stop].to(device)
+                    cls_labels = torch.from_numpy(training_labels[start:stop]).to(device)
+                    allowed = attack._mask(clean, feature_names, normalization_mean=normalization.mean,
+                                           normalization_std=normalization.std, valid_mask=occupancy)
+                    candidate = attack._constrained_candidate(clean, generator(clean), allowed, cls_labels)
+                    logits = attack._surrogate_logits(candidate, occupancy)
+                    prediction = ((logits.reshape(-1) >= 0).long() if logits.shape[-1] == 1 else logits.argmax(1))
+                    all_success &= bool((prediction == attack.target_label).all())
+                    inference_costs[start:stop] += 1
+            if all_success:
+                break
 
         checkpoint = store.generator_path(
             cls.attack_name, str(cfg["attack"].get("variant", "default")), seed,
@@ -500,6 +555,11 @@ class NIDSGANAttack(FeatureSpaceAttack):
         payload = {
             "artifact_provenance": artifact_provenance,
             "attack_name": cls.attack_name,
+            "format_version": 2,
+            "class_bounds": class_bounds,
+            "training_sample_ids": training_ids,
+            "surrogate_gradient_forward_costs": gradient_costs.tolist(),
+            "surrogate_inference_costs": inference_costs.tolist(),
             "seed": int(seed),
             "generator_state": {key: tensor.detach().cpu()
                                 for key, tensor in generator.state_dict().items()},
@@ -523,6 +583,9 @@ class NIDSGANAttack(FeatureSpaceAttack):
         return {
             **{key: value / max(1, steps) for key, value in aggregate.items()},
             "training_steps": float(steps),
+            "completed_epochs": float(completed_epochs),
+            "surrogate_training_gradient_forward_records": float(gradient_costs.sum()),
+            "surrogate_training_inference_records": float(inference_costs.sum()),
             "training_samples": float(len(malicious_indices)),
         }
 
@@ -536,7 +599,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
         if not checkpoint.is_file():
             raise FileNotFoundError(f"NIDSGAN generator checkpoint not found: {checkpoint}")
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        if payload.get("attack_name") != self.attack_name or int(payload.get("seed", -1)) != seed:
+        if payload.get("format_version") != 2 or payload.get("attack_name") != self.attack_name or int(payload.get("seed", -1)) != seed:
             raise ValueError("NIDSGAN checkpoint attack or seed mismatch")
         from core.provenance import verify_generator_artifact_provenance
         verify_generator_artifact_provenance(payload, getattr(self, 'expected_provenance', None))
@@ -556,6 +619,7 @@ class NIDSGANAttack(FeatureSpaceAttack):
         generator.load_state_dict(payload["generator_state"], strict=True)
         generator.to(device=device, dtype=torch.float32).eval()
         generator.requires_grad_(False)
+        self._class_bounds = payload["class_bounds"]
         self._generator = generator
         self._loaded_seed = seed
         self._input_shape = shape
@@ -563,7 +627,6 @@ class NIDSGANAttack(FeatureSpaceAttack):
 
     def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
         """Deterministic inference in float32; base class handles float64 finality."""
-        del y  # Targets are learned in train(); generation never queries models.
         seed = kwargs.get("seed")
         if self._generator is None and seed is None:
             raise ValueError("First NIDSGAN generation batch requires the worker seed")
@@ -588,7 +651,15 @@ class NIDSGANAttack(FeatureSpaceAttack):
                 valid_mask=kwargs.get("valid_mask"),
             )
             delta = generator(normalized) * mask
-            delta = _radially_bounded(delta, self.epsilon)
-            adversarial = (normalized + delta).detach()
+            labels = torch.as_tensor(y, device=device, dtype=torch.long).reshape(-1)
+            if len(labels) != len(normalized): raise ValueError("NIDSGAN label shape mismatch")
+            # Benign rows are ineligible and remain clean; unknown attack classes fail closed.
+            adversarial = normalized.clone()
+            active = labels != self.target_label
+            if bool(active.any()):
+                if any(int(label) not in self._class_bounds for label in labels[active]):
+                    raise ValueError("Unknown NIDSGAN attack class")
+                adversarial[active] = self._constrained_candidate(normalized[active], delta[active], mask[active], labels[active])
+            adversarial = adversarial.detach()
         del delta, mask, normalized
         return AttackResult(adversarial=adversarial, feature_names=names)

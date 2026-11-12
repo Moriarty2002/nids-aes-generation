@@ -2,13 +2,12 @@
 
 Original: class-decoupled adaptive WGAN-GP generation for imbalance repair,
 TSTR augmentation, and distributional/volumetric NIDS stress testing.
-Mandatory adaptation: CICIoMT packet feature types and immutable DIR/FLG,
-train-only physical float64 states, normalized float32 target input and gate.
-Checkpoint v6: source Table-2 regime changes require newly trained specialists.
-Remaining deviation: this plugin still repurposes class synthesis into per-flow
-benign-conditioned evasion. Although Table-2 source training regimes are now
-reproduced, original TSTR/volumetric-stress evaluation is NOT integrated;
-therefore exclude this method from per-flow original-attack publications.
+Mandatory adaptation: immutable-stratified physical float64 packet specialists,
+exact integer codebooks, registered TRAIN membership and independent source
+identity. Checkpoint v7 uses the author prefit noisy-copy densification; source
+paper width-scaled regime thresholds replace dataset-specific script cutoffs.
+Registered TSTR and owner-defined A-D populations use separate packet diagnostic
+protocols. Per-record evasion is prohibited; no flow-volume efficacy is claimed.
 Topology: flat physical packet features or masked (B,T,F); no raw PCAP.
 """
 
@@ -37,6 +36,57 @@ from attacks.base import AttackResult, FeatureSpaceAttack
 from core.registry import DATASETS, register_attack
 from core.provenance import authorized_attack_training_indices, trained_generator_provenance, verify_generator_artifact_provenance
 from orchestrator.device import configure_process_device
+
+
+def _densify(values: np.ndarray, *, factor: int, sigma: float,
+             rng: np.random.Generator) -> np.ndarray:
+    """Author oversample_with_noise: original + factor-1 clipped noisy copies."""
+    if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1 or not np.isfinite(sigma) or sigma < 0:
+        raise ValueError('Invalid densification factor/sigma')
+    if factor == 1 and sigma == 0:
+        return values.copy()
+    copies = [values.copy()]
+    for _ in range(factor-1):
+        copies.append(np.clip(values + rng.normal(0., sigma, values.shape), -1., 1.).astype(values.dtype))
+    result = np.concatenate(copies)
+    rng.shuffle(result)
+    return result
+
+
+def ciciomt_scenarios() -> dict[str, dict[str, int]]:
+    """Owner-approved packet recipe, source-guided A-D roles; not paper settings."""
+    attacks = ('mitm-arpspoof', 'dos-mqtt-conn', 'dos-mqtt-publ', 'dos-mqtt-malf',
+               'infog-scan-os', 'infog-scan-host', 'infog-scan-port', 'infog-scan-vuln',
+               'dos-icmp', 'dos-tcp-syn', 'dos-tcp', 'dos-udp')
+    return {
+        'Scenario_A': {name: 1000 for name in ('benign', *attacks)},
+        'Scenario_B': {'benign': 5000, 'dos-mqtt-conn': 50000},
+        'Scenario_C': {'benign': 5000, **{name: 20000 for name in ('dos-icmp','dos-tcp-syn','dos-tcp','dos-udp')}},
+        'Scenario_D': {'benign': 1000, **{name: 5000 for name in attacks}},
+    }
+
+
+def plan_class_populations(populations: Mapping[str, Mapping[str, int]],
+                           class_mapping: Mapping[str, int], *, scale: float = 1.) -> dict[str, dict[int, int]]:
+    """Resolve explicit names; round scaled counts half-up, retaining positive support."""
+    if not np.isfinite(scale) or not 0 < scale <= 1 or not populations:
+        raise ValueError('Population scale must be finite in (0,1]')
+    if (not class_mapping or len(set(class_mapping.values())) != len(class_mapping)
+            or any(isinstance(v,bool) or not isinstance(v,(int,np.integer)) or v<0 for v in class_mapping.values())):
+        raise ValueError('Invalid registered class mapping')
+    result = {}
+    for scenario, named in populations.items():
+        if not named:
+            raise ValueError('Empty scenario population')
+        resolved = {}
+        for name, count in named.items():
+            if name not in class_mapping:
+                raise ValueError(f'Unknown scenario class {name}')
+            if isinstance(count,bool) or not isinstance(count,(int,np.integer)) or count < 1:
+                raise ValueError('Population counts must be positive integers')
+            resolved[int(class_mapping[name])] = max(1, int(np.floor(count*scale + .5)))
+        result[str(scenario)] = resolved
+    return result
 
 
 @dataclass(frozen=True)
@@ -350,9 +400,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         return result
 
     def _regime(self, n: int) -> _Regime:
-        if n >= 126:
+        if n >= math.ceil(3.5 * self.width**2):
             return self._regimes[0]
-        return self._regimes[1] if n >= 29 else self._regimes[2]
+        return self._regimes[1] if n >= math.ceil(.8 * self.width**2) else self._regimes[2]
 
     @staticmethod
     def _numpy(value: Any) -> np.ndarray:
@@ -571,7 +621,7 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             minimum = class_data.min(axis=0)
             maximum = class_data.max(axis=0)
             span = maximum - minimum
-            constant = span <= 1e-12
+            constant = span == 0.
             safe_span = np.where(constant, 1.0, span)
             if not np.isfinite(safe_span).all():
                 raise ValueError("Physical feature range cannot be scaled safely")
@@ -599,10 +649,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
             opt_d = torch.optim.Adam(
                 critic.parameters(), lr=regime.learning_rate, betas=(0.0, 0.9)
             )
-            cpu_training = torch.from_numpy(np.ascontiguousarray(scaled))
-            population = np.arange(n)
-            if regime.oversample > 1:
-                population = rng.choice(population, n * regime.oversample, replace=True)
+            augmented = _densify(scaled, factor=regime.oversample, sigma=regime.noise_sigma, rng=rng)
+            cpu_training = torch.from_numpy(np.ascontiguousarray(augmented))
+            population = np.arange(len(augmented))
 
             last_g_loss = float("nan")
             last_d_loss = float("nan")
@@ -611,10 +660,6 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                     for _ in range(regime.critic_steps):
                         selected = rng.choice(population, regime.batch_size, replace=True)
                         real = cpu_training[selected].to(device)
-                        if regime.noise_sigma:
-                            # Author source clips minority Gaussian densification
-                            # in the GAN's scaled [-1,1] domain; NOT physical truth.
-                            real = (real + torch.randn_like(real) * regime.noise_sigma).clamp(-1.,1.)
                         latent = torch.randn(regime.batch_size, self.latent_dim, device=device)
                         with torch.no_grad():
                             fake = generator(latent)
@@ -779,9 +824,9 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         # Explicit checkpoint schema: no live Modules, only CPU tensors and
         # small immutable metadata. Composite keys remain exact tuple keys.
         payload: dict[str, Any] = {
-            # Version 6 freezes the source Table-2 specialist regimes; prior
-            # v5 physical states used different critic/noise policies.
-            "format_version": 6,
+            # Version 7 binds prefit source densification and deterministic
+            # categorical sampling; older training identities are incompatible.
+            "format_version": 7,
             "data_domain": "physical_float64",
             "continuous_transform": "log1p_expm1",
             "attack_name": "amd_gan",
@@ -869,7 +914,7 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         verify_generator_artifact_provenance(payload, getattr(self, 'expected_provenance', None))
         if (
             payload.get("attack_name") != "amd_gan"
-            or payload.get("format_version") != 6
+            or payload.get("format_version") != 7
             or payload.get("data_domain") != "physical_float64"
             or payload.get("continuous_transform") != "log1p_expm1"
         ):
@@ -904,7 +949,18 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
         self._checkpoint_input_shape = tuple(int(value) for value in payload["input_shape"])
         self._loaded_path = path
 
-    def sample_class_distribution(self, *, class_label: int, count: int,
+    def sample_class_distribution(self, *, class_label: int, count: int, seed: int) -> np.ndarray:
+        # Gumbel heads and module construction also consume torch RNG, beyond
+        # the explicit latent Generator. Fork/restore the complete sampling state.
+        device = self._device()
+        devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == 'cuda' else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(seed))
+            if devices:
+                torch.cuda.manual_seed_all(int(seed))
+            return self._sample_class_distribution(class_label=class_label,count=count,seed=seed)
+
+    def _sample_class_distribution(self, *, class_label: int, count: int,
                                   seed: int) -> np.ndarray:
         """Sample the *learned class distribution*, not per-flow benign evasion.
 
@@ -1033,139 +1089,93 @@ class AMDGANFeatureAttack(FeatureSpaceAttack):
                      'per-record feasible ASR, or equal-budget attack comparison is implied.'),
         }
 
-    def generate(
-        self,
-        x: np.ndarray | torch.Tensor,
-        y: np.ndarray | torch.Tensor,
-        target_label: int | None = None,
-        **kwargs: Any,
-    ) -> AttackResult:
-        """Generate float64 physical candidates without projecting constraints.
+    def distribution_stress(self, *, train_packets: np.ndarray, train_labels: np.ndarray,
+                            train_valid_mask: np.ndarray, train_sample_ids: Sequence[str],
+                            test_packets: np.ndarray, test_labels: np.ndarray,
+                            test_valid_mask: np.ndarray, test_sample_ids: Sequence[str],
+                            class_mapping: Mapping[str, int], populations: Mapping[str, Mapping[str, int]],
+                            scale: float, seed: int, classifier_trees: int = 100) -> dict[str, Any]:
+        """Frozen real-TRAIN packet diagnostic, post-generation scoring only.
 
-        The wrapper owns victim/immutable/padding restoration, range clipping,
-        lattice projection, and normalized float32 encoding. This generator
-        only conditions on physical class/protocol states and samples entire
-        packet vectors from accepted WGAN-GP specialists. Rows without a
-        trained specialist are left unchanged, not synthesized arbitrarily.
+        The registered sequence target is never used as a generator oracle or
+        coerced to classify fabricated flows. This independent in-memory RF is
+        a packet-level robustness diagnostic, distinct from TSTR and feasible ASR.
         """
-        input_shape = self._numpy(x).shape
-        original = self._packets(x)
-        batch_size, packet_count, _ = original.shape
-        if len(self._numpy(y)) != batch_size:
-            raise ValueError("generate() feature/label batch size mismatch")
+        import hashlib
+        import pickle
+        from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support
+        if (not train_sample_ids or not test_sample_ids or
+                len(set(train_sample_ids)) != len(train_sample_ids) or
+                len(set(test_sample_ids)) != len(test_sample_ids) or
+                set(train_sample_ids) & set(test_sample_ids)):
+            raise ValueError('Stress study requires unique disjoint TRAIN/TEST IDs')
+        plan = plan_class_populations(populations, class_mapping, scale=scale)
+        self._load_generator(self._device(), seed)
+        needed = set(label for counts in plan.values() for label in counts)
+        available = {key[0] for key in self._checkpoints}
+        if needed - available:
+            raise ValueError(f'Missing required class specialists: {sorted(needed-available)}')
+        def packet_population(raw, labels, valid, ids):
+            x = self._packets(raw)
+            labels = np.asarray(labels)
+            valid = np.asarray(valid, dtype=bool)
+            if valid.shape != x.shape[:2] or labels.shape != (len(x),) or len(ids) != len(x):
+                raise ValueError('Packet population labels/occupancy/IDs disagree')
+            rows = x[valid]
+            y = np.broadcast_to(labels[:, None], valid.shape)[valid]
+            if not len(rows) or not np.isfinite(rows).all() or not set(np.unique(y)).issubset(class_mapping.values()):
+                raise ValueError('Invalid packet population support')
+            return rows, y
+        real_train, train_y = packet_population(train_packets,train_labels,train_valid_mask,train_sample_ids)
+        real_test, test_y = packet_population(test_packets,test_labels,test_valid_mask,test_sample_ids)
+        if needed - set(np.unique(train_y)) or needed - set(np.unique(test_y)):
+            raise ValueError('Missing registered real TRAIN/TEST class support')
+        labels = sorted(map(int,class_mapping.values()))
+        if isinstance(classifier_trees,bool) or classifier_trees < 1:
+            raise ValueError('Invalid diagnostic classifier size')
+        classifier = RandomForestClassifier(n_estimators=classifier_trees, random_state=seed, n_jobs=1)
+        classifier.fit(real_train,train_y)
+        classifier_identity = hashlib.sha256(pickle.dumps(classifier,protocol=5)).hexdigest()
+        def score(values, truth):
+            predictions = classifier.predict(values)
+            observed_labels = sorted(map(int,np.unique(truth)))
+            # Present classes determine macro metrics; all registered classes
+            # remain visible in per-class support/confusion tables.
+            precision,recall,f1,_ = precision_recall_fscore_support(truth,predictions,labels=observed_labels,average='macro',zero_division=0)
+            return dict(accuracy=float(accuracy_score(truth,predictions)),
+                        macro_precision=float(precision),macro_recall=float(recall),macro_f1=float(f1),
+                        per_class=classification_report(truth,predictions,labels=labels,output_dict=True,zero_division=0),
+                        confusion_matrix=confusion_matrix(truth,predictions,labels=labels).tolist(),
+                        class_support={str(label):int(np.sum(truth==label)) for label in labels},
+                        packet_count=int(len(truth)))
+        baseline = score(real_test,test_y)
+        scenarios = {}
+        for index,(name, counts) in enumerate(plan.items()):
+            values=[]
+            truth=[]
+            for label,count in sorted(counts.items()):
+                generated = self.sample_class_distribution(class_label=label,count=count,seed=seed+104729*(index+1)+label)
+                if generated.shape != (count,self.width) or generated.dtype != np.float64 or not np.isfinite(generated).all():
+                    raise ValueError('Generator class support/output differs from planned population')
+                values.append(generated)
+                truth.append(np.full(count,label,dtype=np.int64))
+            scenarios[name]=score(np.concatenate(values),np.concatenate(truth))
+            for metric in ('accuracy','macro_precision','macro_recall','macro_f1'):
+                scenarios[name][f'delta_{metric}_vs_real_test']=scenarios[name][metric]-baseline[metric]
+        a=scenarios.get('Scenario_A')
+        if a is not None:
+            for outcome in scenarios.values():
+                for metric in ('accuracy','macro_precision','macro_recall','macro_f1'):
+                    outcome[f'delta_{metric}_vs_scenario_a']=outcome[metric]-a[metric]
+        return dict(study_role='amd_gan_packet_distribution_stress',sample_unit='physical_packet',
+                    class_mapping=dict(class_mapping),named_populations=populations,count_scale=scale,
+                    effective_populations={k:{str(label):count for label,count in v.items()} for k,v in plan.items()},
+                    diagnostic_training_sample_ids=list(train_sample_ids),diagnostic_test_sample_ids=list(test_sample_ids),
+                    diagnostic_state_sha256=classifier_identity,diagnostic_training_packet_count=len(train_y),
+                    real_test_baseline=baseline,stress_scenarios=scenarios,
+                    macro_population='classes with positive true support; all classes shown in support/confusion tables',
+                    diagnostic_seed=seed,surrogate_oracle_queries=0,target_oracle_queries=0,
+                    original_paper_equivalence='packet-level adaptation; no original flow-volume/on-wire certification')
 
-        requested_label = self.target_label if target_label is None else int(target_label)
-        seed = int(kwargs.get("seed", self.seed))
-        device = self._device()
-        self._load_generator(device, seed)
-        if tuple(input_shape[1:]) != self._checkpoint_input_shape:
-            raise ValueError("AMD-GAN generation shape differs from trained input shape")
-
-        names = tuple(self.feature_names)
-        immutable_idx = self._immutable_indices(names)
-        flat = original.reshape(-1, self.width)
-        groups: dict[ClusterKey, list[int]] = {}
-        missing_cluster_count = 0
-        missing_keys: set[ClusterKey] = set()
-        for row_id in range(len(flat)):
-            key = self._cluster_key(requested_label, flat[row_id], immutable_idx)
-            if key not in self._checkpoints:
-                missing_cluster_count += 1
-                missing_keys.add(key)
-                continue
-            groups.setdefault(key, []).append(row_id)
-
-        # Detached physical candidate. Never alias the baseline that the
-        # interceptor needs for exact protected-coordinate restoration.
-        candidate = np.array(original, dtype=np.float64, copy=True, order="C")
-        output_rows = candidate.reshape(-1, self.width)
-        sampler = torch.Generator(device=device)
-        sampler.manual_seed(seed)
-        generated_packet_count = 0
-
-        for key, row_ids in sorted(groups.items()):
-            info = self._checkpoints[key]
-            generator = _Generator(
-                self.latent_dim, self.width, info["hidden"],
-                self.continuous_idx, info["categories"], self.gumbel_tau,
-            ).to(device)
-            try:
-                generator.load_state_dict(info["state"], strict=True)
-                generator.eval()
-                with torch.inference_mode():
-                    latent = torch.randn(
-                        len(row_ids), self.latent_dim,
-                        generator=sampler, device=device,
-                    )
-                    scaled = generator(latent)
-                    minimum = torch.as_tensor(
-                        info["min"], dtype=torch.float64, device=device,
-                    )
-                    span = torch.as_tensor(
-                        info["span"], dtype=torch.float64, device=device,
-                    )
-                    proposals = (
-                        (scaled.to(torch.float64) + 1.0) * (span / 2.0)
-                        + minimum
-                    )
-                    constant = torch.as_tensor(
-                        info["constant"], dtype=torch.bool, device=device,
-                    )
-                    proposals[:, constant] = minimum[constant]
-                    if self.continuous_idx:
-                        cols = list(self.continuous_idx)
-                        proposals[:, cols] = torch.expm1(proposals[:, cols])
-
-                    # Never treat categorical codes as continuous measurements.
-                    # Map Gumbel-selected GAN tokens to exact physical float64
-                    # states, without log/exp or float32 quantization.
-                    for j in self.categorical_idx:
-                        codes = torch.as_tensor(
-                            info["categories"][j],
-                            dtype=torch.float32, device=device,
-                        )
-                        states = torch.as_tensor(
-                            info["physical_categories"][j],
-                            dtype=torch.float64, device=device,
-                        )
-                        indices = torch.abs(
-                            scaled[:, j, None] - codes[None, :]
-                        ).argmin(dim=1)
-                        proposals[:, j] = states[indices]
-
-                    if not torch.isfinite(proposals).all():
-                        raise RuntimeError(
-                            f"Generator {key} emitted non-finite physical proposals"
-                        )
-                    output_rows[row_ids] = proposals.cpu().numpy()
-                    generated_packet_count += len(row_ids)
-            finally:
-                del generator
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-        if generated_packet_count + missing_cluster_count != batch_size * packet_count:
-            raise RuntimeError("AMD-GAN packet accounting invariant failed")
-
-        return AttackResult(
-            adversarial=candidate.reshape(input_shape),
-            success_mask=np.zeros(batch_size, dtype=bool),
-            queries=np.zeros(batch_size, dtype=np.int64),
-            feature_names=names,
-            metadata={
-                "generator_class": requested_label,
-                "composite_keys": tuple(sorted(groups)),
-                "per_cluster_xai_rho": {
-                    key: self.training_summary.get(key, {}).get("xai_spearman_rho")
-                    for key in groups
-                },
-                "generated_packet_count": generated_packet_count,
-                "missing_cluster_count": missing_cluster_count,
-                "missing_cluster_keys": tuple(sorted(missing_keys)),
-                "synthesis_domain": "physical_float64",
-                "source_feature_blending": False,
-                "packet_independent_synthesis": True,
-                "continuous_transform": "log1p_expm1",
-                "checkpoint_path": str(self._loaded_path),
-            },
-        )
+    def generate(self, x: Any, y: Any, **kwargs: Any) -> AttackResult:
+        raise NotImplementedError('AMD-GAN is distribution synthesis; use evaluate_distribution_stress, not per-record evasion')

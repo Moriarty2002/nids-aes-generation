@@ -5,7 +5,7 @@
 # feedback ONLY from independently registered pretrained surrogate weights.
 # The old external NPZ/oracle-label path is forbidden on clean-restart runs.
 name: deepred
-variant: offline_udp_sfp
+variant: source_replacement_udp_adapted
 
 # This adaptation supports one or two src2dst primary measurements.
 # Use [src2dst_max_ps] for one-packet SPSF; pair selection often fails closed
@@ -15,15 +15,13 @@ attack_features: [src2dst_bytes]
 # Source endpoint of the flow's first packet. Must be set explicitly.
 attacker_ip: null
 
+# Fig3 noise-only positive replacements; Adam/lr/epochs/BN slope are local.
+# No extra proxy CE/minimality. Infeasible replacements are rejected, not clipped.
 # Training: no queries to the evaluation target model.
 latent_dim: 200
 batch_size: 64
-surrogate_epochs: 30
 gan_epochs: 100
 learning_rate: 0.0002
-surrogate_learning_rate: 0.001
-lambda_surrogate: 1.0
-lambda_minimal: 0.05
 
 device: auto
 max_delta_bytes: 512

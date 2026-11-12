@@ -2,7 +2,7 @@
 # action=train_attack -> AMDGANFeatureAttack.train(config=..., seed=..., gpu=...)
 # action=evaluate_attack -> registry constructs AMDGANFeatureAttack from settings.
 name: amd_gan
-variant: "classwise_wgangp_table2_v6_xai"
+variant: "classwise_wgangp_table2_v7_densified_xai"
 
 # Active packet order: PL,IAT,DIR,WIN,FLG,TTL. IAT has a continuous
 # log-scaled head. Integer-valued PL/WIN/TTL use observed-state categorical

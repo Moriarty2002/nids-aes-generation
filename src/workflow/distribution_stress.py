@@ -2,8 +2,8 @@
 
 The original AMD-GAN is a class-decoupled WGAN-GP for distribution synthesis,
 minority-class TSTR and volumetric stress, not per-record benign-target ASR.
-This CICIoMT2024 adaptation samples physical packet-feature rows from the
-registered train-only specialists and measures TSTR on *held-out real packets*.
+This packet adaptation runs separate TSTR and fixed real-TRAIN diagnostic
+scoring of held-out real packets versus source-guided class populations.
 Its declared sample unit differs from the paper's source flow representation;
 no target or surrogate classifier is queried by the distribution sampler.
 The deferred raw-PCAP bridge is not implied by a valid packet-feature sample.
@@ -127,6 +127,15 @@ def distribution_stress_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     classifier_trees = int(study_cfg.get('classifier_trees', 100))
     if samples_per_class < 1 or classifier_trees < 1:
         raise ConfigurationError('Distribution study size and diagnostic classifier trees must be positive')
+    from attacks.feature_space.amd_gan import ciciomt_scenarios, plan_class_populations
+    populations = study_cfg.get('populations') or ciciomt_scenarios()
+    count_scale = float(study_cfg.get('count_scale', .001 if str(cfg.get('budget',{}).get('name','smoke')) == 'smoke' else 1.))
+    planned = plan_class_populations(populations, target_meta['class_mapping'], scale=count_scale)
+    attack._load_generator(attack._device(), attack_seed)
+    needed = {label for counts in planned.values() for label in counts}
+    available = {key[0] for key in attack._checkpoints}
+    if needed - available:
+        raise ConfigurationError(f'Missing required AMD class specialists: {sorted(needed-available)}')
     classes = tuple(sorted(map(int, np.unique(labels))))
     if progress is not None:
         progress('amd_registered_class_sampling_tstr')
@@ -137,6 +146,18 @@ def distribution_stress_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         samples_per_class=samples_per_class, seed=attack_seed,
         classifier_trees=classifier_trees,
     )
+    train_indices = split_indices(manifest, dataset, 'train')
+    if progress is not None:
+        progress('amd_registered_population_stress')
+    stress = attack.distribution_stress(
+        train_packets=physical[train_indices], train_labels=labels[train_indices],
+        train_valid_mask=mask[train_indices], train_sample_ids=train_ids,
+        test_packets=physical[selected], test_labels=labels[selected],
+        test_valid_mask=mask[selected], test_sample_ids=test_ids,
+        class_mapping=target_meta['class_mapping'], populations=populations,
+        scale=count_scale, seed=attack_seed, classifier_trees=classifier_trees,
+    )
+    report['population_stress'] = stress
     report.update({
         'source_revision_sha256': store.read()['source_revision_sha256'],
         'experiment_id': store.read()['experiment_id'],
@@ -149,7 +170,7 @@ def distribution_stress_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         'effective_target_seed_identity_only': target_seed,
         'source_attacker_target_oracle_queries': 0,
         'paper_stress_volume_certified': False,
-        'original_paper_equivalence': 'packet-record TSTR adaptation, not original volumetric/capture study',
+        'original_paper_equivalence': 'packet-level TSTR and population-stress adaptation, not original volumetric/capture study',
     })
     output_dir = cfg.get('output_dir')
     if output_dir:
@@ -163,5 +184,6 @@ def distribution_stress_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         'amd_tstr_real_accuracy': float(report['tstr_real_accuracy']),
         'amd_tstr_real_macro_f1': float(report['tstr_real_macro_f1']),
         'amd_heldout_real_packet_count': float(report['heldout_real_packet_count']),
+        **{f'amd_{name.lower()}_macro_f1': float(outcome['macro_f1']) for name,outcome in stress['stress_scenarios'].items()},
         'amd_target_oracle_queries': 0.,
     }

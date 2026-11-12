@@ -4,9 +4,10 @@
 # The train_attack action requires surrogate_model.name and
 # surrogate_model.checkpoint (with {seed} where applicable) to be configured.
 name: nids_gan
-variant: "eps${.params.epsilon}_hidDim${.params.hidden_dim}_depth${.params.depth}_ep${.params.epochs}_critic${.params.critic_steps}_a${.params.alpha}_b${.params.beta}"
+variant: "sourceE2_v2_eps${.params.epsilon}_hidDim${.params.hidden_dim}_depth${.params.depth}_ep${.params.epochs}_critic${.params.critic_steps}_a${.params.alpha}_b${.params.beta}"
 params:
-  # Normalized float32 sample-level L2 budget; no per-feature clipping here.
+  # Source soft L2 hinge; independent post-finalization L2 acceptance.
+  # E2 uses TRAIN class extrema intersected with declared physical ranges.
   epsilon: 0.3
   target_label: 0
 
