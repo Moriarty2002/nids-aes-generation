@@ -29,6 +29,7 @@ from core.provenance import (
 )
 from core.query_meter import ModelQueryMeter
 from defenses.multilayer_mahalanobis import LeeMultilayerMahalanobis
+from defenses.empirical_at import _validated_packet_mask
 from models.wrapper import PyTorchModelWrapper
 from orchestrator.device import configure_process_device
 from orchestrator.runner import seed_everything
@@ -112,6 +113,11 @@ def calibrate_detector_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     names = tuple(dataset.feature_names)
     if x_raw.dtype != np.float64:
         raise ConfigurationError('Lee calibration requires authoritative float64 physical inputs')
+    # Reject the original bitmap before any checkpoint/model/normalizer access;
+    # Boolean coercion here would erase evidence of corrupt authoritative input.
+    mask = _validated_packet_mask(getattr(dataset, 'valid_mask', None),
+        sample_count=len(labels), input_shape=tuple(x_raw.shape),
+        feature_count=len(names)).cpu().numpy()
     store = ExperimentStore(cfg.get('experiment_dir'), dataset=cfg['dataset']['name'])
     model_cfg = dict(cfg['model'])
     target_path = store.model_path(model_cfg['name'], model_cfg.get('training', {}).get('defense_mode', 'none'), target_seed)
@@ -136,6 +142,8 @@ def calibrate_detector_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     if source_path == target_path:
         raise ConfigurationError('Lee calibration cannot train an attack with its frozen target')
     saved_source = _load_checkpoint_metadata(source_path)
+    if saved_source.get('model_state_sha256') == saved_target['model_state_sha256']:
+        raise ConfigurationError('Lee calibration source has identical target weights; independent source required')
     if (saved_source.get('split_manifest_sha256') != saved_target.get('split_manifest_sha256')
             or saved_source.get('class_mapping') != saved_target.get('class_mapping')
             or saved_source.get('dataset_identity') != saved_target.get('dataset_identity')):
@@ -161,8 +169,6 @@ def calibrate_detector_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         raise ConfigurationError('Detector train/validation/test memberships overlap')
     tr = _ordered_indices(dataset, train_ids)
     va = _ordered_indices(dataset, val_ids)
-    raw_mask = getattr(dataset, 'valid_mask', None)
-    mask = (np.ones((len(labels), 1), dtype=bool) if raw_mask is None else np.asarray(raw_mask, dtype=bool))
     immutable = tuple(cfg['dataset'].get('immutable_features', ('DIR', 'FLG')))
     batch_size = int(dc.get('score_batch_size', 1024))
     norm_train = target_norm.normalize(x_raw[tr])

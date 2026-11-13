@@ -13,20 +13,17 @@ from .base import BaseDetector
 
 @register_detector("mahalanobis")
 class MahalanobisDetector(BaseDetector):
-    """Class-conditional Gaussian detector over penultimate NIDS features.
+    """Diagnostic single-layer Gaussian distance over penultimate features.
 
     Fits empirical class means and a tied pooled within-class covariance, then
-    returns each sample's minimum squared Mahalanobis distance to any class mean.
+    returns each sample's minimum Mahalanobis distance to any class mean.
     Larger values therefore indicate more anomalous traffic and can be passed
     directly to AUROC with adversarial samples as the positive class.
 
-    Reference paper: Lee et al., *A Simple Unified Framework for Detecting
-    Out-of-Distribution Samples and Adversarial Attacks*, NeurIPS 2018.
-    Original research code: https://github.com/pokaxpoka/deep_Mahalanobis_detector
-
-    This is a typed reimplementation suitable for variable-shaped NIDS tensors;
-    it does not copy code from the original repository. A small diagonal ridge
-    regularizer stabilizes the empirical covariance when dimensions are collinear.
+    This separately retained diagnostic has no multilayer validation ensemble
+    and must not stand for original Lee. The source-supported detector is
+    mahalanobis_multilayer_val_calibrated. A local diagonal ridge stabilizes
+    covariance; this baseline is excluded from source-faithful method claims.
     """
 
     REGISTRY_NAME = "mahalanobis"
@@ -215,7 +212,7 @@ class MahalanobisDetector(BaseDetector):
         return self
 
     def score(self, x: Any, wrapper: ModelWrapper, valid_mask: Any = None) -> np.ndarray:
-        """Return nearest-class squared Mahalanobis distance (higher = anomaly)."""
+        """Return diagnostic nearest-class Mahalanobis distance (higher = anomaly)."""
         if self.class_means_ is None or self.precision_ is None or self.class_labels_ is None:
             raise RuntimeError("MahalanobisDetector must be fitted or loaded before score()")
         if isinstance(x, torch.Tensor):

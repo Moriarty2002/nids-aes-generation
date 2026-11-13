@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 import logging
+import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -13,6 +14,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from attacks.base import FeatureSpaceAttack
 from constraints.gatekeeper import UniversalConstraintGatekeeper
 from core.exceptions import ConfigurationError
+from core.provenance import _digest_strings, _file_sha256, manifest_hash, frozen_model_state_sha256
+from core.query_meter import ModelQueryMeter, ModelQueryCounts
 from models.trainer import train_classifier
 from models.wrapper import PyTorchModelWrapper
 from workflow.factory import _build_model, _instantiate_attack, _model_requires_flatten
@@ -46,10 +49,8 @@ def _make_endpoint_perturbation_mask_fn(
     if not names:
         raise ConfigurationError("Asymmetric robust training requires feature_names")
     immutable = tuple(dict.fromkeys(
-        [str(name).upper() for name in (
-            immutable_features if immutable_features is not None
-            else (name for name in ("DIR", "FLG") if name in names)
-        )] + (["FEAT_PAD_MASK"] if "FEAT_PAD_MASK" in names else [])
+        [str(name).upper() for name in (immutable_features or ())]
+        + [name for name in ("DIR", "FLG", "FEAT_PAD_MASK") if name in names]
     ))
     unknown = set(immutable).difference(names)
     if unknown:
@@ -80,8 +81,12 @@ def _make_endpoint_perturbation_mask_fn(
     return endpoint_mask
 
 
+class _PacketMaskError(ConfigurationError, ValueError):
+    """Invalid occupancy is both an input-value and workflow-configuration error."""
+
+
 def _validated_packet_mask(
-    value: np.ndarray | torch.Tensor,
+    value: np.ndarray | torch.Tensor | None,
     *,
     sample_count: int,
     input_shape: Sequence[int],
@@ -91,29 +96,40 @@ def _validated_packet_mask(
 
     The only authoritative source of padding is the dataset's explicit bitmap;
     inspecting zero-valued normalized inputs cannot distinguish empty padding
-    from legitimate zero-valued protocol features.
+    from legitimate zero-valued protocol features. Canonical NIDS occupancy is
+    a first-20 prefix, including length zero. Exact numeric 0/1 representations
+    are explicitly converted only after value, layout and prefix checks.
     """
-    packet_mask = torch.as_tensor(value, dtype=torch.bool)
+    if value is None:
+        raise _PacketMaskError('Authoritative dataset.valid_mask is required')
+    raw_mask = torch.as_tensor(value)
+    if not bool(((raw_mask == 0) | (raw_mask == 1)).all()):
+        raise _PacketMaskError('dataset.valid_mask must be binary')
     if len(input_shape) not in (2, 3):
-        raise ConfigurationError("Packet masking requires flattened or sequence inputs")
-    if packet_mask.ndim != 2 or int(packet_mask.shape[0]) != sample_count:
-        raise ConfigurationError("dataset.valid_mask must have shape (N,T)")
+        raise _PacketMaskError("Packet masking requires flattened or sequence inputs")
+    if raw_mask.ndim != 2 or int(raw_mask.shape[0]) != sample_count:
+        raise _PacketMaskError("dataset.valid_mask must have shape (N,T)")
+    if raw_mask.shape[1] != 20:
+        raise _PacketMaskError('dataset.valid_mask must describe the first 20 packet positions')
     if input_shape[0] != sample_count:
-        raise ConfigurationError("Input/packet-mask sample counts differ")
+        raise _PacketMaskError("Input/packet-mask sample counts differ")
     if len(input_shape) == 3:
-        if int(packet_mask.shape[1]) != int(input_shape[1]):
-            raise ConfigurationError("dataset.valid_mask T disagrees with sequence shape")
-    elif (int(packet_mask.shape[1]) < 1 or
-          int(input_shape[1]) % int(packet_mask.shape[1]) != 0):
-        raise ConfigurationError("Flattened feature width must be divisible by dataset.valid_mask T")
+        if int(raw_mask.shape[1]) != int(input_shape[1]):
+            raise _PacketMaskError("dataset.valid_mask T disagrees with sequence shape")
+    elif (int(raw_mask.shape[1]) < 1 or
+          int(input_shape[1]) % int(raw_mask.shape[1]) != 0):
+        raise _PacketMaskError("Flattened feature width must be divisible by dataset.valid_mask T")
     if feature_count is not None:
         if feature_count < 1:
-            raise ConfigurationError("feature_count must be positive")
+            raise _PacketMaskError("feature_count must be positive")
         if len(input_shape) == 3 and input_shape[2] != feature_count:
-            raise ConfigurationError("Sequence width differs from feature_names")
-        if len(input_shape) == 2 and input_shape[1] != packet_mask.shape[1] * feature_count:
-            raise ConfigurationError("Flattened width differs from T times feature_names")
-    return packet_mask
+            raise _PacketMaskError("Sequence width differs from feature_names")
+        if len(input_shape) == 2 and input_shape[1] != raw_mask.shape[1] * feature_count:
+            raise _PacketMaskError("Flattened width differs from T times feature_names")
+    positions = torch.arange(20, device=raw_mask.device)[None, :]
+    if not torch.equal(raw_mask, positions < raw_mask.sum(dim=1, keepdim=True)):
+        raise _PacketMaskError('dataset.valid_mask must be contiguous prefix occupancy')
+    return raw_mask.bool()
 
 
 def _run_empirical_at(
@@ -132,6 +148,10 @@ def _run_empirical_at(
     checkpoint_dir: Path,
     logger: logging.Logger | None,
     x_physical: np.ndarray,
+    sample_ids: Sequence[str],
+    split_manifest: Mapping[str, Any],
+    class_mapping: Mapping[str, int],
+    seed_roles: Mapping[str, int],
     padding_values: Mapping[str, float] | None = None,
     padding_indicator_name: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
@@ -144,6 +164,30 @@ def _run_empirical_at(
     layout. Normalization statistics are unchanged (F or T*F entries), and
     attack batches remain bounded at most 256 samples for memory safety.
     """
+    # Custom TRAIN-only augmentation, not the TRADES defender objective. Bind
+    # observed rows to the existing manifest before fitting or querying a source.
+    ids = tuple(map(str, sample_ids))
+    if len(ids) != len(x_tensor) or len(set(ids)) != len(ids):
+        raise ConfigurationError('EAT requires unique registered sample IDs')
+    partitions = [tuple(map(str, split_manifest[key])) for key in
+                  ('train_ids', 'validation_ids', 'test_ids')]
+    combined = sum(partitions, ())
+    if len(combined) != len(ids) or len(set(combined)) != len(ids) or set(combined) != set(ids):
+        raise ConfigurationError('EAT registered train/validation/test memberships overlap or differ')
+    for indices, expected in zip((train_idx, val_idx), partitions[:2]):
+        if (np.asarray(indices).dtype.kind not in 'iu' or np.any(indices < 0)
+                or np.any(indices >= len(ids)) or tuple(ids[int(i)] for i in indices) != expected):
+            raise ConfigurationError('EAT observed indices differ from registered membership')
+    if (tuple(split_manifest['identity']['feature_names']) != feature_names
+            or split_manifest['identity']['sample_ids_sha256'] != _digest_strings(ids)):
+        raise ConfigurationError('EAT registered feature/sample identity differs')
+    if x_physical.dtype != np.float64 or x_physical.shape != tuple(x_tensor.shape):
+        raise ConfigurationError('EAT requires pristine physical float64 in the normalized input layout')
+    if valid_mask_full is None:
+        raise ConfigurationError('EAT requires authoritative packet valid_mask')
+    source_seed = int(seed_roles['surrogate'])
+    attack_seed = int(seed_roles['attack'])
+    torch.manual_seed(source_seed)
     surrogate_cfg_raw = eat_cfg.get("surrogate", eat_cfg.get("surrogate_model", {}))
     if not isinstance(surrogate_cfg_raw, Mapping):
         raise ConfigurationError("empirical_at.surrogate must be a mapping with a registered model name")
@@ -182,7 +226,7 @@ def _run_empirical_at(
         tuple(surrogate_input.shape),
         device=device,
         num_classes=num_classes,
-        seed=seed,
+        seed=source_seed,
     )
     if not isinstance(surrogate_wrapper, PyTorchModelWrapper) or not surrogate_wrapper.capabilities.differentiable:
         raise ConfigurationError(
@@ -196,7 +240,7 @@ def _run_empirical_at(
     if s_batch_size < 1:
         raise ConfigurationError("empirical_at.surrogate.training.batch_size must be >= 1")
     pin = device.type == "cuda"
-    generator = torch.Generator().manual_seed(int(seed))
+    generator = torch.Generator().manual_seed(source_seed)
     surrogate_train_x = surrogate_input[train_idx]
     surrogate_val_x = surrogate_input[val_idx]
     surrogate_train_y = torch.as_tensor(y_np[train_idx], dtype=torch.long)
@@ -256,7 +300,7 @@ def _run_empirical_at(
         early_stopping_min_delta=early_stopping_min_delta,
         early_stopping_monitor=early_stopping_monitor,
         output_dir=surrogate_output,
-        seed=seed,
+        seed=source_seed,
         logger=logger,
         perturbation_mask_fn=surrogate_mask_fn,
     )
@@ -274,12 +318,21 @@ def _run_empirical_at(
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
             "normalization_version": getattr(normalization, "version", "unknown"),
-            "seed": int(seed),
+            "seed": source_seed,
+            "seed_roles": dict(seed_roles),
+            "training_sample_ids": list(partitions[0]),
+            "validation_sample_ids": list(partitions[1]),
+            "split_manifest_sha256": manifest_hash(split_manifest),
+            "dataset_identity": dict(split_manifest['identity']),
+            "class_mapping": dict(class_mapping),
+            "model_state_sha256": frozen_model_state_sha256(surrogate_wrapper),
             "training_purpose": "empirical_at_surrogate",
         },
         surrogate_checkpoint,
     )
     surrogate_wrapper.model.eval()
+    for parameter in surrogate_wrapper.model.parameters():
+        parameter.requires_grad_(False)
 
     augmentation_cfg = dict(eat_cfg.get("augmentation", {}))
     ratio = float(augmentation_cfg.get("ratio", 0.5))
@@ -304,7 +357,7 @@ def _run_empirical_at(
     malicious_idx = train_idx[train_labels != benign_label]
     requested_count = int(np.ceil(len(malicious_idx) * ratio)) if ratio > 0 else 0
     requested_count = min(requested_count, len(malicious_idx))
-    selection_rng = np.random.default_rng(int(seed))
+    selection_rng = np.random.default_rng(attack_seed)
     selected_idx = (
         np.sort(selection_rng.choice(malicious_idx, size=requested_count, replace=False)).astype(np.int64)
         if requested_count else np.empty((0,), dtype=np.int64)
@@ -338,7 +391,7 @@ def _run_empirical_at(
             )
 
     gatekeeper = UniversalConstraintGatekeeper(
-        strict=False,
+        strict=True,
         normalization_mean=np.asarray(normalization.mean, dtype=np.float32),
         normalization_std=np.asarray(normalization.std, dtype=np.float32),
         padding_values=padding_values,
@@ -350,6 +403,10 @@ def _run_empirical_at(
     accepted_count = 0
     attack_success_count = 0
     violation_counts: dict[str, int] = {}
+    generation_counts = ModelQueryCounts()
+    inference_costs: list[int] = []
+    gradient_costs: list[int] = []
+    admitted_ids: list[str] = []
     if logger:
         logger.info(
             "eat.start seed=%d surrogate=%s attack=%s selected=%d batch_size=%d "
@@ -377,11 +434,13 @@ def _run_empirical_at(
         )
         y_clean = y_np[batch_indices].astype(np.int64, copy=False)
         batch_kwargs: dict[str, Any] = {
-            "seed": int(seed + b_start),
+            "seed": int(attack_seed + b_start),
             "target_label": benign_label,
             "normalization_mean": normalization.mean,
             "normalization_std": normalization.std,
-            "_clean_authoritative_physical": x_attack_phys,
+            # The gate's pristine reference is never lent to an attack. This
+            # bounded physical64 copy prevents a plugin redefining clean truth.
+            "_clean_authoritative_physical": x_attack_phys.copy(),
         }
         batch_valid_mask = None
         if valid_mask_full is not None:
@@ -401,8 +460,24 @@ def _run_empirical_at(
             else x_attack
         )    
         
-        with surrogate_wrapper.attack_mask_context(batch_valid_mask):
-            result = attack.generate(attack_generation_input, y_clean, **batch_kwargs)
+        observed_sizes: list[int] = []
+        handle = surrogate_wrapper.model.register_forward_pre_hook(
+            lambda _module, args: observed_sizes.append(len(args[0])))
+        try:
+            with ModelQueryMeter(surrogate_wrapper) as meter, surrogate_wrapper.attack_mask_context(batch_valid_mask):
+                result = attack.generate(attack_generation_input, y_clean, **batch_kwargs)
+        finally:
+            handle.remove()
+        # Full-population forwards have an observed equal cost for every row.
+        # Adaptive sub-batch queries lack an ID association here: reject rather
+        # than fabricate per-record accounting from an attack's own telemetry.
+        if (any(size != len(batch_indices) for size in observed_sizes)
+                or sum(observed_sizes) != meter.counts.inference_records + meter.counts.gradient_forward_records
+                or meter.counts.feature_records):
+            raise ConfigurationError('EAT cannot attribute adaptive sub-batch source costs to registered records')
+        generation_counts.add(meter.counts)
+        inference_costs.extend([meter.counts.inference_records // len(batch_indices)] * len(batch_indices))
+        gradient_costs.extend([meter.counts.gradient_forward_records // len(batch_indices)] * len(batch_indices))
         if result.adversarial is None or result.raw_adversarial is not None:
             raise ConfigurationError("EAT feature-space attack must return result.adversarial")
         x_adv = _as_numpy(result.adversarial).astype(np.float32, copy=False)
@@ -443,6 +518,7 @@ def _run_empirical_at(
                 len(np.unique(np.asarray(violation.indices, dtype=np.int64)))
             )
         if accepted.any():
+            admitted_ids.extend(ids[int(i)] for i in batch_indices[accepted])
             # The sklearn target ONLY receives (N,T*F). Reshape after oracle
             # validation, preserving the exact float32 coordinate encoding.
             # Boolean indexing already allocates its necessary output buffer.
@@ -481,6 +557,19 @@ def _run_empirical_at(
         "eat_surrogate_fit_loss": float(surrogate_summary.train_loss),
         "eat_surrogate_validation_loss": float(surrogate_summary.validation_loss or 0.0),
     }
+    stats.update(generation_counts.metrics('eat_surrogate_generation'))
+    evidence = {
+        'method': 'custom_empirical_augmentation', 'seed_roles': dict(seed_roles),
+        'split_manifest_sha256': manifest_hash(split_manifest),
+        'training_sample_ids': list(partitions[0]), 'validation_sample_ids': list(partitions[1]),
+        'selected_sample_ids': [ids[int(i)] for i in selected_idx],
+        'accepted_sample_ids': admitted_ids,
+        'surrogate_checkpoint_sha256': _file_sha256(surrogate_checkpoint),
+        'surrogate_inference_costs': inference_costs,
+        'surrogate_gradient_forward_costs': gradient_costs,
+        'generation_counts': generation_counts.metrics('surrogate'),
+    }
+    (checkpoint_dir / 'empirical_at_provenance.json').write_text(json.dumps(evidence, indent=2))
     for rule, count in sorted(violation_counts.items()):
         stats[f"eat_violation_{rule}"] = float(count)
     if logger:

@@ -1,4 +1,7 @@
 # configs/model/random_forest.yaml
+defaults:
+  - training: sklearn
+
 name: random_forest
 requires_flatten: true
 checkpoint: null

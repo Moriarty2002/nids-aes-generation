@@ -77,6 +77,21 @@ def _train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     if len(y_np) < 10:
         raise ConfigurationError("Training requires at least 10 samples")
 
+    training_options = dict(cfg['model'].get('training', {}))
+    mask_required = (
+        str(training_options.get('defense_mode', 'none') or 'none').strip().lower()
+        in {'pgd', 'trades', 'empirical_at'}
+        or bool(training_options.get('adversarial_training', False))
+    )
+    # Admit the original topology before normalization or model construction.
+    # Sequence-capable wrappers and flat defenders must share this boundary.
+    checked_packet_mask = (
+        _validated_packet_mask(getattr(dataset, 'valid_mask', None),
+            sample_count=len(y_np), input_shape=tuple(x_raw.shape),
+            feature_count=len(dataset.feature_names))
+        if mask_required else None
+    )
+
     if progress is not None:
         progress('validate_and_split')
     # One immutable partition shared with evaluation and every attack trainer.
@@ -119,7 +134,8 @@ def _train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     if hasattr(dataset, "valid_mask"):
         normalization = dataset.fit_normalization(
             x_raw[train_idx],
-            valid_mask=np.asarray(dataset.valid_mask)[train_idx],
+            valid_mask=np.asarray(dataset.valid_mask if checked_packet_mask is None
+                                  else checked_packet_mask.cpu().numpy())[train_idx],
         )
     else:
         normalization = dataset.fit_normalization(x_raw[train_idx])
@@ -161,7 +177,8 @@ def _train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         raise ConfigurationError("model.training.batch_size must be >= 1")
     pin = device_info.torch_device.type == "cuda"
     packet_mask_for_model = (
-        torch.as_tensor(dataset.valid_mask, dtype=torch.bool)
+        (checked_packet_mask if checked_packet_mask is not None
+         else torch.as_tensor(dataset.valid_mask, dtype=torch.bool))
         if isinstance(wrapper, PyTorchModelWrapper) and getattr(wrapper, "_supports_valid_mask", False)
         else None
     )
@@ -174,13 +191,10 @@ def _train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         and (configured_mode in {"pgd", "trades"} or bool(tcfg.get("adversarial_training", False)))
     )
     train_defense_ds = train_ds
-    if robust_training and packet_mask_for_model is None and hasattr(dataset, "valid_mask") and dataset.valid_mask is not None:
-        packet_mask = _validated_packet_mask(
-            dataset.valid_mask, sample_count=len(x_tensor), input_shape=tuple(x_tensor.shape),
-            feature_count=len(dataset.feature_names),
-        )
+    if robust_training and packet_mask_for_model is None:
+        assert checked_packet_mask is not None
         train_defense_ds = TensorDataset(
-            train_ds.tensors[0], train_ds.tensors[1], packet_mask[train_idx]
+            train_ds.tensors[0], train_ds.tensors[1], checked_packet_mask[train_idx]
         )
 
     train_loader = cast(
@@ -238,10 +252,15 @@ def _train_nids_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
             )
         adversarial_x, adversarial_y, eat_stats = _run_empirical_at(
             eat_cfg=eat_cfg, x_tensor=x_tensor, y_np=y_np, train_idx=train_idx, val_idx=val_idx,
-            valid_mask_full=getattr(dataset, "valid_mask", None),
+            valid_mask_full=checked_packet_mask.cpu().numpy(),
             feature_names=tuple(dataset.feature_names), normalization=normalization,
             num_classes=num_classes, device=device_info.torch_device, seed=seed,
             checkpoint_dir=checkpoint_dir, logger=logger, x_physical=x_raw,
+            sample_ids=dataset.sample_ids, split_manifest=manifest,
+            class_mapping=dataset.class_mapping,
+            seed_roles={'split': int(split_seed), 'target': int(seed),
+                        'surrogate': role_seed(cfg, 'surrogate', seed),
+                        'attack': role_seed(cfg, 'attack', seed)},
             padding_values={**getattr(dataset, "pad_values", {}), **(
                 {str(getattr(dataset, "padding_indicator_name")): 1.0}
                 if getattr(dataset, "include_padding_indicator", False) else {}

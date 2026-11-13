@@ -1,4 +1,7 @@
 # configs/model/mlp.yaml
+defaults:
+  - training: default
+
 name: mlp
 requires_flatten: true
 checkpoint: "${experiment_dir}/checkpoints/targets/mlp/${model.training.defense_mode}/seed{seed}/nids.pt"

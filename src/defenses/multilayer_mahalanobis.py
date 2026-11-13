@@ -8,8 +8,8 @@ post-generation evaluation, never in attack generation. Calibration requires
 separately authorized held-out *validation* clean/attack scores, not test data.
 Original Algorithm 1 per-layer confidence-gradient preprocessing is available
 only as optional masked *detector scoring*, never as a physical attack mutation.
-Not yet registered: authorized adversarial-validation generation, target/split
-registry orchestration and evaluation-time cost attribution are outstanding.
+The existing registered calibration workflow verifies source and target
+checkpoints, split membership and evaluation-time cost attribution.
 No deployed traffic-blocking threshold or original-equivalence claim.
 """
 from __future__ import annotations
@@ -205,6 +205,13 @@ class LeeMultilayerMahalanobis(BaseDetector):
         """
         wrapper = self._validate_wrapper(wrapper)
         self._check_target(wrapper)
+        if valid_mask is not None:
+            valid = np.asarray(valid_mask.detach().cpu() if isinstance(valid_mask, torch.Tensor) else valid_mask)
+            if (valid.ndim != 2 or valid.shape[0] != len(x) or valid.shape[1] < 1
+                    or not np.isin(valid, (0, 1)).all()
+                    or (x.ndim == 3 and valid.shape[1] != x.shape[1])
+                    or (x.ndim == 2 and x.shape[1] % valid.shape[1])):
+                raise ValueError('Detector valid_mask must match input packet topology and be binary')
         if not self.layers_ or self.class_labels_ is None:
             raise RuntimeError('Fit clean training Gaussians before scoring')
         if self.preprocessing_magnitude:
@@ -237,13 +244,18 @@ class LeeMultilayerMahalanobis(BaseDetector):
         source = wrapper._tensor(x).detach()
         if allowed_mask is None:
             raise ValueError('Lee gradient preprocessing requires an externally validated edit mask')
-        permitted = torch.as_tensor(allowed_mask, device=source.device, dtype=torch.bool)
-        if permitted.shape != source.shape:
-            raise ValueError('Lee edit mask shape must exactly match detector input')
-        if source.ndim == 3:
+        raw_allowed = torch.as_tensor(allowed_mask, device=source.device)
+        if raw_allowed.shape != source.shape or not bool(((raw_allowed == 0) | (raw_allowed == 1)).all()):
+            raise ValueError('Lee edit mask must be binary and exactly match detector input shape')
+        permitted = raw_allowed.bool()
+        if valid_mask is not None:
             valid = torch.as_tensor(valid_mask,device=source.device,dtype=torch.bool)
-            if valid.shape != source.shape[:2] or bool((permitted & ~valid[:,:,None]).any()):
+            features = source.shape[-1] if source.ndim == 3 else source.shape[1] // valid.shape[1]
+            occupied = valid[:, :, None].expand(-1, -1, features).reshape_as(source)
+            if bool((permitted & ~occupied).any()):
                 raise ValueError('Lee detector preprocessing cannot modify padded packet features')
+        elif source.ndim == 3:
+            raise ValueError('Lee sequence preprocessing requires valid_mask')
         output: list[np.ndarray] = []
         for name in self.layers_:
             variable = source.detach().clone().requires_grad_(True)
@@ -273,6 +285,16 @@ class LeeMultilayerMahalanobis(BaseDetector):
     def _sha_valid(value: Any) -> bool:
         return (isinstance(value, str) and len(value) == 64
                 and all(c in '0123456789abcdef' for c in value))
+
+    @classmethod
+    def _source_valid(cls, value: Any) -> bool:
+        # The registered workflow verifies this checkpoint against ExperimentStore
+        # before constructing the receipt. A bare caller claim is insufficient.
+        if not isinstance(value, str):
+            return False
+        parts = value.split(':', 3)
+        return (len(parts) == 4 and parts[0] == 'registered_independent_surrogate'
+                and bool(parts[1]) and cls._sha_valid(parts[2]) and bool(parts[3]))
 
     @staticmethod
     def _batch_ids(batch: Any, partition: str) -> tuple[str,...]:
@@ -313,8 +335,8 @@ class LeeMultilayerMahalanobis(BaseDetector):
                 or set(expected).intersection(self._registered_train_ids)
                 or _digest_strings(expected) != membership_sha256):
             raise ValueError('Registered validation membership is missing, overlapping train, or mismatched')
-        if not isinstance(attack_source, str) or not attack_source.strip():
-            raise ValueError('Calibration requires a documented independent-surrogate attack source')
+        if not self._source_valid(attack_source):
+            raise ValueError('Calibration requires a registered independent-surrogate attack source receipt')
         self._validate_wrapper(wrapper)
         self._check_target(wrapper)
         groups = []
@@ -401,7 +423,13 @@ class LeeMultilayerMahalanobis(BaseDetector):
         names = list(state['layers'])
         means = {k: np.asarray(state['means'][k], dtype=np.float64).copy() for k in names}
         precisions = {k: np.asarray(state['precisions'][k], dtype=np.float64).copy() for k in names}
-        classes = np.asarray(state['class_labels'], dtype=np.int64).copy()
+        raw_classes = np.asarray(state['class_labels'])
+        if raw_classes.dtype.kind not in 'iu':
+            raise ValueError('Fitted class labels must be integers')
+        classes = raw_classes.astype(np.int64, copy=True)
+        if (classes.ndim != 1 or len(classes) < 2 or not np.array_equal(classes, np.unique(classes))
+                or int(state['n_fit_samples']) < len(classes)):
+            raise ValueError('Invalid fitted class labels or population count')
         if len(names) < 2 or len(names) != len(set(names)):
             raise ValueError('Invalid hidden-layer identities in calibration state')
         for name in names:
@@ -410,19 +438,31 @@ class LeeMultilayerMahalanobis(BaseDetector):
                 raise ValueError('Invalid fitted Gaussian layer shape')
             if not np.isfinite(mu).all() or not np.isfinite(p).all():
                 raise ValueError('Nonfinite fitted Gaussian statistics')
+            # A tied covariance pseudoinverse is symmetric positive semidefinite;
+            # a negative precision would reverse the meaning of confidence.
+            if (not np.allclose(p, p.T, rtol=1e-10, atol=1e-12)
+                    or np.linalg.eigvalsh(p).min() < -1e-10 * max(np.finfo(np.float64).tiny, np.abs(p).max())):
+                raise ValueError('Invalid Gaussian precision domain')
         coef = state.get('calibration_coef')
         if coef is not None:
             coef = np.asarray(coef, dtype=np.float64).copy()
             if coef.shape != (len(names),) or not np.isfinite(coef).all():
                 raise ValueError('Invalid calibration coefficient dimensions')
-            if state.get('calibration_intercept') is None or state.get('calibration_membership_sha256') is None:
+            if (state.get('calibration_intercept') is None
+                    or not np.isfinite(state['calibration_intercept'])
+                    or not self._sha_valid(state.get('calibration_membership_sha256'))):
                 raise ValueError('Incomplete calibrated detector membership')
         if not self._sha_valid(state.get('target_model_state_sha256')):
             raise ValueError('Lee state lacks fitted target checkpoint fingerprint')
         if coef is not None and (not self._sha_valid(state.get('train_membership_sha256'))
                 or not self._sha_valid(state.get('split_manifest_sha256'))
-                or not state.get('calibration_attack_source')):
+                or not self._source_valid(state.get('calibration_attack_source'))):
             raise ValueError('Calibrated Lee state lacks registered training/validation provenance')
+        if (not np.isfinite(state['covariance_ridge']) or state['covariance_ridge'] <= 0
+                or isinstance(state['score_batch_size'], bool)
+                or int(state['score_batch_size']) != state['score_batch_size']
+                or state['score_batch_size'] < 1):
+            raise ValueError('Invalid Lee covariance ridge or score batch size')
         self.covariance_ridge = float(state['covariance_ridge'])
         self.score_batch_size = int(state['score_batch_size'])
         self.preprocessing_magnitude = float(state['preprocessing_magnitude'])

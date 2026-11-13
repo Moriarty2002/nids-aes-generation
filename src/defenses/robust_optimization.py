@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Integral
 from typing import Callable, Literal
 
 import torch
@@ -38,8 +40,10 @@ def _resolve_perturbation_mask(
 
 
 def _classification_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if not torch.isfinite(logits).all():
+        raise ValueError('Classification requires finite logits')
     if logits.ndim == 1 or logits.shape[-1] == 1:
-        return nn.functional.binary_cross_entropy_with_logits(logits.reshape(-1), y.float().reshape(-1))
+        return nn.functional.binary_cross_entropy_with_logits(logits.reshape(-1), y.to(logits.dtype).reshape(-1))
     return nn.functional.cross_entropy(logits, y.long())
 
 
@@ -51,9 +55,31 @@ def _class_probabilities(logits: torch.Tensor) -> torch.Tensor:
 
 
 def _kl_from_logits(clean_logits: torch.Tensor, other_logits: torch.Tensor) -> torch.Tensor:
-    clean_prob = _class_probabilities(clean_logits).detach().clamp_min(1e-12)
-    other_prob = _class_probabilities(other_logits).clamp_min(1e-12)
-    return nn.functional.kl_div(other_prob.log(), clean_prob, reduction="batchmean")
+    """TRADES outer KL: both distributions differentiate; only inputs detach.
+
+    A Bernoulli head is represented by equivalent [0,z] logits. Log-softmax
+    avoids probability clipping changing the objective at confident logits.
+    """
+    if not torch.isfinite(clean_logits).all() or not torch.isfinite(other_logits).all():
+        raise ValueError('TRADES requires finite clean and adversarial logits')
+    def log_probabilities(logits: torch.Tensor) -> torch.Tensor:
+        if logits.ndim == 1 or logits.shape[-1] == 1:
+            positive = logits.reshape(-1, 1)
+            logits = torch.cat((torch.zeros_like(positive), positive), dim=1)
+        return nn.functional.log_softmax(logits, dim=-1)
+    clean_log = log_probabilities(clean_logits)
+    other_log = log_probabilities(other_logits)
+    return (clean_log.exp() * (clean_log - other_log)).sum(dim=-1).mean()
+
+
+def _validate_robust_parameters(epsilon: float, alpha: float, steps: int,
+                                beta: float = 0.) -> None:
+    if (not math.isfinite(epsilon) or epsilon < 0
+            or not math.isfinite(alpha) or alpha <= 0
+            or isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 1
+            or not math.isfinite(beta) or beta < 0):
+        raise ValueError('Robust training requires finite epsilon >= 0, alpha > 0, '
+                         'integer steps >= 1 and finite beta >= 0')
 
 
 def _pgd_delta(
@@ -66,8 +92,12 @@ def _pgd_delta(
     perturbation_mask_fn: PerturbationMaskFn | None = None,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if epsilon < 0 or alpha <= 0 or steps < 1:
-        raise ValueError("PGD requires epsilon >= 0, alpha > 0, and steps >= 1")
+    """Madry inner CE ascent with detached proposals for the defender update.
+
+    NIDS uses a normalized masked Linf training neighborhood rather than image
+    pixel bounds. Physical realization remains a separate gatekeeper decision.
+    """
+    _validate_robust_parameters(epsilon, alpha, steps)
     was_training = model.training
     edit_mask = _resolve_perturbation_mask(x, y, perturbation_mask_fn)
     delta = torch.empty_like(x).uniform_(-epsilon, epsilon)
@@ -80,6 +110,8 @@ def _pgd_delta(
             logits = forward_model(model, x + delta, valid_mask)
             loss = _classification_loss(logits, y)
             grad = torch.autograd.grad(loss, delta, only_inputs=True)[0]
+            if not torch.isfinite(grad).all():
+                raise ValueError('PGD requires finite input gradients')
             with torch.no_grad():
                 delta = (delta + alpha * grad.sign()).clamp(-epsilon, epsilon)
                 if edit_mask is not None:
@@ -101,8 +133,7 @@ def _trades_loss_and_logits(
     perturbation_mask_fn: PerturbationMaskFn | None = None,
     valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if epsilon < 0 or step_size <= 0 or steps < 1 or beta < 0:
-        raise ValueError("TRADES requires epsilon >= 0, step_size > 0, steps >= 1, and beta >= 0")
+    _validate_robust_parameters(epsilon, step_size, steps, beta)
 
     model = wrapper.model
     x = x.to(wrapper.device, dtype=torch.float32)
@@ -110,7 +141,6 @@ def _trades_loss_and_logits(
     was_training = model.training
     edit_mask = _resolve_perturbation_mask(x, y, perturbation_mask_fn)
     # TRADES Algorithm 1: Gaussian .001 start, masked/projected for NIDS.
-    # Only the inner search is aligned here; outer-loss fidelity belongs to F4.
     delta = (.001 * torch.randn_like(x)).clamp(-epsilon, epsilon)
     if edit_mask is not None:
         delta.mul_(edit_mask)
@@ -126,6 +156,8 @@ def _trades_loss_and_logits(
             adv_prob = _class_probabilities(adv_logits).clamp_min(1e-12)
             inner_kl = nn.functional.kl_div(adv_prob.log(), clean_reference_prob, reduction="batchmean")
             gradient = torch.autograd.grad(inner_kl, delta, only_inputs=True)[0]
+            if not torch.isfinite(gradient).all():
+                raise ValueError('TRADES requires finite input gradients')
             with torch.no_grad():
                 delta = (delta + step_size * gradient.sign()).clamp(-epsilon, epsilon)
                 if edit_mask is not None:
@@ -134,11 +166,14 @@ def _trades_loss_and_logits(
         model.train(was_training)
 
     adversarial = (x + delta.detach()).detach()
-    joint_mask = None if valid_mask is None else torch.cat((valid_mask, valid_mask), dim=0)
-    joint_logits = forward_model(model, torch.cat((x, adversarial), dim=0), joint_mask)
-    natural_logits, adversarial_logits = joint_logits.split(x.shape[0], dim=0)
+    # Author trades.py evaluates CE(clean), KL-adversarial, then KL-clean
+    # separately: concatenation or reuse changes BN buffers and dropout draws.
+    # Packet masks replace the source image box; these are training views only.
+    natural_logits = forward_model(model, x, valid_mask)
     natural_loss = _classification_loss(natural_logits, y)
-    robust_loss = _kl_from_logits(natural_logits, adversarial_logits)
+    adversarial_logits = forward_model(model, adversarial, valid_mask)
+    outer_clean_logits = forward_model(model, x, valid_mask)
+    robust_loss = _kl_from_logits(outer_clean_logits, adversarial_logits)
     return natural_loss + beta * robust_loss, natural_logits
 
 

@@ -1,7 +1,6 @@
 defaults:
   - dataset: ciciomt2024
   - model: mlp
-  - model/training: default
   - attack: pgd
   - budget: research
   - preprocessing: sota_extractor
