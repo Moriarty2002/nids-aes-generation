@@ -97,6 +97,11 @@ class TRADESAttack(FeatureSpaceAttack):
 
                     with torch.no_grad():
                         delta = (delta + self.alpha * grad.sign()).clamp(-self.epsilon, self.epsilon) * mask
+                        
+                        # Added cleanup to prevent VRAM graph exhaustion during EAT
+                        adv_logits = adv_logits.detach()
+                        adv_log_probs = adv_log_probs.detach()
+                        loss = loss.detach()
         finally:
             restore_saved_modes(saved_modes)
 

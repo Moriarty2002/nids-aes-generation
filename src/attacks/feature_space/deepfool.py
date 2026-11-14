@@ -123,6 +123,12 @@ class DeepFoolAttack(FeatureSpaceAttack):
                     with torch.no_grad():
                         total = project_box_delta(x0, (proposed - x0) * mask, mask, lower, upper)
                         current = (x0 + total * mask).detach()
+                        
+                        candidate = candidate.detach()
+                        scores = scores.detach()
+                        base_scores = base_scores.detach()
+                        del candidate, scores, base_scores, base_grad
+                        
             with torch.no_grad():
                 final_predictions = input_predictions(model.forward_differentiable(
                     current, valid_mask=kwargs.get('valid_mask')))

@@ -302,6 +302,36 @@ def split_indices(manifest: Mapping[str, Any], dataset: Any, partition: str) -> 
         raise ConfigurationError(f'Split contains unknown sample ID {exc}') from exc
 
 
+def validate_registered_split_protocol(manifest: Mapping[str, Any],
+                                       config: Mapping[str, Any], worker_seed: int) -> None:
+    """Check caller claims against an identity-verified checkpoint split."""
+    from workflow.seeds import role_seed
+    saved = manifest['split_policy']
+    options = dict(config.get('data_split') or {})
+    budget = str((config.get('budget') or {}).get('name', 'smoke'))
+    research = saved.get('policy') == 'research' or budget == 'research'
+    if (budget not in {'research', 'smoke'} or options.get('policy', budget) != budget
+            or (research and budget != saved.get('policy'))):
+        raise ConfigurationError('Caller budget/data_split.policy disagrees with registered split policy')
+    # Research claims include resolved defaults. Smoke retains its existing
+    # explicit-only diagnostic overrides, without being relabeled research.
+    if research or (config.get('seed_roles') or {}).get('split') is not None:
+        if role_seed(config, 'split', worker_seed) != int(manifest['seed']):
+            raise ConfigurationError('Configured split seed disagrees with registered split manifest')
+    for name in ('test_fraction', 'validation_fraction'):
+        if not research and name not in options:
+            continue
+        try:
+            effective = float(options.get(name, .2))
+            recorded = float(saved[name])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ConfigurationError(f'Invalid split fraction {name}; expected a number strictly between 0 and 1') from exc
+        if not 0 < effective < 1 or not 0 < recorded < 1:
+            raise ConfigurationError(f'Split fraction {name} must be finite and strictly between 0 and 1')
+        if effective != recorded:
+            raise ConfigurationError(f'Effective {name} disagrees with registered split manifest')
+
+
 def authorized_attack_training_indices(dataset: Any, labels: np.ndarray,
                                        config: Mapping[str, Any], seed: int,
                                        *, role: str = 'model') -> np.ndarray:
@@ -337,6 +367,9 @@ def authorized_attack_training_indices(dataset: Any, labels: np.ndarray,
     )
     if metadata.get('dataset_identity') != manifest['identity']:
         raise ConfigurationError('Classifier training provenance dataset identity mismatch')
+    validate_registered_split_protocol(manifest, config, seed)
+    if manifest['split_policy']['policy'] == 'research':
+        validate_research_split_manifest(manifest, labels, dataset)
     return split_indices(manifest, dataset, 'train')
 
 

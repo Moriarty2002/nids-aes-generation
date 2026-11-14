@@ -10,6 +10,7 @@ realized attacks. The held-out test partition is never read for calibration.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -25,7 +26,8 @@ from core.dual_representation import encode_normalized32
 from core.exceptions import ConfigurationError
 from core.provenance import (
     _digest_strings, _file_sha256, frozen_model_state_sha256,
-    load_split_manifest, manifest_hash, split_indices,
+    load_split_manifest, manifest_hash, split_indices, validate_research_split_manifest,
+    validate_registered_split_protocol,
 )
 from core.query_meter import ModelQueryMeter
 from defenses.multilayer_mahalanobis import LeeMultilayerMahalanobis
@@ -133,6 +135,9 @@ def calibrate_detector_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
         raise ConfigurationError('Detector training dataset/split differs from the target checkpoint')
     if manifest_hash(manifest) != saved_target['split_manifest_sha256']:
         raise ConfigurationError('Detector split hash differs from target checkpoint')
+    validate_registered_split_protocol(manifest, cfg, seed)
+    if manifest['split_policy']['policy'] == 'research':
+        validate_research_split_manifest(manifest, labels, dataset)
     surrogate_cfg = dict(cfg.get('surrogate_model') or {})
     if not surrogate_cfg or not surrogate_cfg.get('enabled', True):
         raise ConfigurationError('Lee calibration needs independently registered surrogate')
@@ -144,10 +149,16 @@ def calibrate_detector_seed(*, config: Mapping[str, Any], seed: int, gpu: str,
     saved_source = _load_checkpoint_metadata(source_path)
     if saved_source.get('model_state_sha256') == saved_target['model_state_sha256']:
         raise ConfigurationError('Lee calibration source has identical target weights; independent source required')
-    if (saved_source.get('split_manifest_sha256') != saved_target.get('split_manifest_sha256')
+    # Lee's original TRAIN/VAL roles are unchanged. The mandatory NIDS shape
+    # adaptation permits only flattening of the same ordered physical coordinates;
+    # each checkpoint retains its own signed layout-specific split manifest.
+    source_manifest = json.loads((source_path.parent / 'split_manifest.json').read_text(encoding='utf-8'))
+    if (manifest_hash(source_manifest) != saved_source.get('split_manifest_sha256')
+            or saved_source.get('dataset_identity') != source_manifest.get('identity')
             or saved_source.get('class_mapping') != saved_target.get('class_mapping')
-            or saved_source.get('dataset_identity') != saved_target.get('dataset_identity')):
+            or store._canonical_split(source_manifest) != store._canonical_split(manifest)):
         raise ConfigurationError('Surrogate and target memberships/schema must share this registered split')
+    validate_registered_split_protocol(source_manifest, cfg, seed)
     target_norm = _normalization_from_checkpoint(saved_target, names, role='Lee target')
     source_norm = _normalization_from_checkpoint(saved_source, names, role='Lee surrogate')
     target = _build_model(model_cfg, (len(labels), *saved_target['input_shape']),
